@@ -241,6 +241,63 @@ mod tests {
     }
 
     #[test]
+    fn multiple_references_in_one_string() {
+        let s = store();
+        let mut missing = Vec::new();
+        // Two present refs and a literal between them all resolve in one pass.
+        let out = s.substitute(
+            "ephpm/other",
+            "${secret.some_key}::${secret.shared}",
+            &mut missing,
+        );
+        assert_eq!(out, "default-value::d");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn missing_refs_accumulate_in_order() {
+        let s = store();
+        let mut missing = Vec::new();
+        let out = s.substitute("ephpm/other", "${secret.a}-${secret.b}", &mut missing);
+        assert_eq!(out, "-");
+        assert_eq!(missing, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn repo_scope_falls_back_to_default_for_unlisted_name() {
+        // The repo scope overrides `some_key` but not `shared`; `shared` must
+        // still resolve from the default scope for that repo.
+        let s = store();
+        assert_eq!(s.get("ephpm/wordpress-sample", "shared"), Some("d"));
+        assert_eq!(
+            s.get("ephpm/wordpress-sample", "some_key"),
+            Some("repo-value")
+        );
+        // A totally unknown name is absent in both scopes.
+        assert_eq!(s.get("ephpm/wordpress-sample", "unknown"), None);
+    }
+
+    #[test]
+    fn env_fold_skips_empty_suffix_and_lowercases() {
+        let mut s = Secrets::default();
+        s.fold_env(vec![
+            // Bare prefix with no name — must be skipped, not stored under "".
+            ("SWITCHBOARD_SECRET_".to_string(), "orphan".to_string()),
+            ("SWITCHBOARD_SECRET_MixedCase".to_string(), "v".to_string()),
+            // Unrelated var is ignored entirely.
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ]);
+        let mut missing = Vec::new();
+        assert_eq!(
+            s.substitute("any/repo", "${secret.mixedcase}", &mut missing),
+            "v"
+        );
+        assert!(missing.is_empty());
+        // The empty-suffix var did not create a "" secret.
+        assert_eq!(s.get("any/repo", ""), None);
+    }
+
+    #[test]
     fn file_wins_over_env() {
         let mut default = BTreeMap::new();
         default.insert("shared".to_string(), "from-file".to_string());

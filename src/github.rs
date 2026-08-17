@@ -55,9 +55,8 @@ impl GitHubClient {
         let pr_number = event.number;
 
         if let Some(comment_id) = self.find_existing_comment(owner, repo, pr_number).await? {
-            let body = "**ePHPm Preview** — removed\n\n\
-                        Preview deployment has been torn down.";
-            self.update_comment(owner, repo, comment_id, body).await?;
+            self.update_comment(owner, repo, comment_id, teardown_comment_body())
+                .await?;
         }
 
         Ok(())
@@ -205,6 +204,15 @@ impl GitHubClient {
     }
 }
 
+/// The PR comment body posted when a preview is torn down. Kept as its own
+/// pure function (rather than inlined in the async network path) so the exact
+/// rendered markdown is unit-testable and still carries the `**ePHPm Preview**`
+/// marker that [`GitHubClient::find_existing_comment`] matches on.
+fn teardown_comment_body() -> &'static str {
+    "**ePHPm Preview** — removed\n\n\
+     Preview deployment has been torn down."
+}
+
 /// Format the PR comment body for a successful deploy.
 fn format_deploy_comment(result: &DeployResult) -> String {
     let url = crate::deployer::preview_url(&result.hostname, result.php_version.as_deref());
@@ -270,5 +278,54 @@ mod tests {
         assert!(comment.contains("health check pending"));
         assert!(comment.contains("Laravel"));
         assert!(comment.contains("8.4"));
+    }
+
+    #[test]
+    fn comment_carries_marker_and_table() {
+        // The marker is load-bearing: find_existing_comment matches on it to
+        // decide update-vs-create, so it must always be present.
+        let result = DeployResult {
+            hostname: "pr-1.app.preview.ephpm.dev".into(),
+            framework: Framework::Symfony,
+            duration: Duration::from_millis(3_000),
+            php_version: Some("8.3".into()),
+            healthy: true,
+        };
+        let comment = format_deploy_comment(&result);
+        assert!(comment.contains("**ePHPm Preview**"));
+        assert!(comment.contains("| URL |"));
+        assert!(comment.contains("| Framework |"));
+        assert!(comment.contains("| PHP |"));
+        assert!(comment.contains("Symfony"));
+        assert!(comment.contains(":8083"), "PHP 8.3 should use port 8083");
+        // Auto-update footer is present so reviewers know pushes refresh it.
+        assert!(comment.contains("updates automatically"));
+    }
+
+    #[test]
+    fn comment_duration_rounds_to_one_decimal() {
+        // 2_449ms rounds to 2.4s (one decimal), not 2s or 2.449s.
+        let result = DeployResult {
+            hostname: "h".into(),
+            framework: Framework::Drupal,
+            duration: Duration::from_millis(2_449),
+            php_version: Some("8.5".into()),
+            healthy: true,
+        };
+        let comment = format_deploy_comment(&result);
+        assert!(comment.contains("2.4s"), "got: {comment}");
+        assert!(comment.contains("Drupal"));
+        // 8.5 is the default port-less URL — no explicit port in the link.
+        assert!(!comment.contains(":8085"));
+    }
+
+    #[test]
+    fn teardown_body_is_marked_and_removed() {
+        let body = teardown_comment_body();
+        // Must keep the marker so the existing comment is found and updated in
+        // place rather than a fresh "removed" comment being appended.
+        assert!(body.contains("**ePHPm Preview**"));
+        assert!(body.contains("removed"));
+        assert!(body.contains("torn down"));
     }
 }

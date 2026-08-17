@@ -276,3 +276,40 @@ fn base64_url_encode(input: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64url_encodes_without_padding() {
+        // "hello" is standard base64 "aGVsbG8=" — the JWT encoding must drop
+        // the '=' padding (a padded segment is not a valid JWS part).
+        assert_eq!(base64_url_encode(b"hello"), "aGVsbG8");
+        assert!(!base64_url_encode(b"hello").contains('='));
+        // Empty input is the empty string, not "=".
+        assert_eq!(base64_url_encode(b""), "");
+    }
+
+    #[test]
+    fn base64url_uses_url_safe_alphabet() {
+        // These bytes encode to "+/8" in the standard alphabet; the URL-safe
+        // JWT encoding must instead emit '-' and '_' and never '+' or '/',
+        // otherwise the token breaks when placed in an Authorization header.
+        let encoded = base64_url_encode(&[0xfb, 0xff]);
+        assert_eq!(encoded, "-_8");
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+    }
+
+    #[test]
+    fn base64url_roundtrips_via_decode() {
+        use base64::Engine;
+        let original = b"the quick brown fox \x00\x01\xff";
+        let encoded = base64_url_encode(original);
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&encoded)
+            .expect("url-safe no-pad output must decode");
+        assert_eq!(decoded, original);
+    }
+}

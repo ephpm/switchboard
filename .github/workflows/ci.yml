@@ -1,0 +1,60 @@
+name: CI
+
+# switchboard is a small pure-Rust crate — no PHP, no SDK, no Docker. The
+# gate is just: does it format, lint clean, and pass its tests. Runs on the
+# ephpm org's self-hosted (ephemerd) fleet, same `[self-hosted, linux, x64]`
+# label ephpm/ephpm's ci.yml uses so the fleet picks these jobs up.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # `main` plus long-lived feature branches other PRs stack onto — without
+    # the glob a PR targeting e.g. feat/deploy-pipeline gets no checks at all.
+    branches: [main, "feat/**"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      # No rustfmt.toml in this repo — no nightly-only options (group_imports /
+      # imports_granularity), so stable rustfmt is sufficient and correct.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test (linux-x64)
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  msrv:
+    name: MSRV (cargo check)
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to the crate's declared rust-version (Cargo.toml). A build that
+      # needs a newer toolchain than we advertise is a bug in the manifest.
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
