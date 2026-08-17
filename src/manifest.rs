@@ -446,6 +446,57 @@ ini:
     }
 
     #[test]
+    fn framework_default_symfony() {
+        let m = AppManifest::from_framework(Framework::Symfony);
+        assert_eq!(m.docroot, "public");
+        assert!(m.build.iter().any(|c| c.contains("composer install")));
+        // Symfony has no framework-supplied seed step.
+        assert!(m.seed.is_empty());
+    }
+
+    #[test]
+    fn framework_default_drupal() {
+        let m = AppManifest::from_framework(Framework::Drupal);
+        assert_eq!(m.docroot, "web");
+        assert!(m.build.iter().any(|c| c.contains("composer install")));
+    }
+
+    #[test]
+    fn database_none_string_disables() {
+        // The DatabaseService deserializer accepts the string "none" as an
+        // alias for disabled, alongside the bool `false`.
+        let m = AppManifest::from_yaml_str("version: 1\nservices:\n  database: none\n").unwrap();
+        assert_eq!(m.services.database, DatabaseService::Disabled);
+        assert_eq!(m.services.database.as_str(), "disabled");
+    }
+
+    #[test]
+    fn database_turso_string_case_insensitive() {
+        let m = AppManifest::from_yaml_str("version: 1\nservices:\n  database: TURSO\n").unwrap();
+        assert_eq!(m.services.database, DatabaseService::Turso);
+        assert_eq!(m.services.database.as_str(), "turso");
+    }
+
+    #[test]
+    fn websocket_explicit_true_parses() {
+        let m = AppManifest::from_yaml_str("version: 1\nservices:\n  websocket: true\n").unwrap();
+        assert_eq!(m.services.websocket, Some(true));
+        // Explicit true wins with no file present on disk.
+        assert!(m.websocket_enabled(Path::new("/nonexistent")));
+    }
+
+    #[test]
+    fn legacy_json_without_overrides_keeps_framework_defaults() {
+        // A legacy config with neither php nor seed set must leave the
+        // framework-synthesized values (WordPress seed, default php) intact.
+        let legacy = LegacyEphpmConfig::default();
+        let m = AppManifest::from_legacy_json(&legacy, Framework::WordPress);
+        assert_eq!(m.php, "8.5");
+        assert_eq!(m.seed.len(), 1);
+        assert!(m.seed[0].contains("wp core install"));
+    }
+
+    #[test]
     fn legacy_json_preserves_seed_and_php() {
         let legacy = LegacyEphpmConfig {
             seed: Some("scripts/seed.sh".to_string()),

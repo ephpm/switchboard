@@ -59,3 +59,95 @@ pub struct Config {
     #[arg(long, default_value_t = 2, env = "SWITCHBOARD_HEALTH_INTERVAL_SECS")]
     pub health_interval_secs: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three flags with no default and no `Option` — a parse must supply
+    /// them or fail. Kept as a helper so each test states only what it varies.
+    const REQUIRED: &[&str] = &[
+        "switchboard",
+        "--webhook-secret",
+        "s3cr3t",
+        "--app-key",
+        "/etc/switchboard/app.pem",
+        "--app-id",
+        "12345",
+    ];
+
+    fn parse(extra: &[&str]) -> Config {
+        let args = REQUIRED.iter().chain(extra.iter());
+        Config::try_parse_from(args).expect("expected a valid config parse")
+    }
+
+    #[test]
+    fn defaults_applied_when_only_required_given() {
+        let c = parse(&[]);
+        assert_eq!(c.listen, "0.0.0.0:9090");
+        assert_eq!(c.sites_dir, PathBuf::from("/var/www/sites"));
+        assert_eq!(c.preview_domain, "preview.ephpm.dev");
+        assert_eq!(c.composer, "composer");
+        assert_eq!(c.health_timeout_secs, 60);
+        assert_eq!(c.health_interval_secs, 2);
+        // Optional-with-no-default stays None.
+        assert!(c.secrets_file.is_none());
+        // Required values round-trip.
+        assert_eq!(c.webhook_secret, "s3cr3t");
+        assert_eq!(c.app_key, PathBuf::from("/etc/switchboard/app.pem"));
+        assert_eq!(c.app_id, 12345);
+    }
+
+    #[test]
+    fn explicit_flags_override_defaults() {
+        let c = parse(&[
+            "--listen",
+            "127.0.0.1:1234",
+            "--sites-dir",
+            "/srv/previews",
+            "--preview-domain",
+            "pr.example.com",
+            "--composer",
+            "/usr/local/bin/composer",
+            "--secrets-file",
+            "/etc/switchboard/secrets.yaml",
+            "--health-timeout-secs",
+            "5",
+            "--health-interval-secs",
+            "1",
+        ]);
+        assert_eq!(c.listen, "127.0.0.1:1234");
+        assert_eq!(c.sites_dir, PathBuf::from("/srv/previews"));
+        assert_eq!(c.preview_domain, "pr.example.com");
+        assert_eq!(c.composer, "/usr/local/bin/composer");
+        assert_eq!(
+            c.secrets_file,
+            Some(PathBuf::from("/etc/switchboard/secrets.yaml"))
+        );
+        assert_eq!(c.health_timeout_secs, 5);
+        assert_eq!(c.health_interval_secs, 1);
+    }
+
+    #[test]
+    fn missing_required_flag_is_an_error() {
+        // Drop --app-id (and its value) — parsing must fail rather than
+        // silently defaulting a security-relevant field.
+        let args = ["switchboard", "--webhook-secret", "x", "--app-key", "/k"];
+        assert!(Config::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn non_numeric_app_id_is_rejected() {
+        // app_id is a u64; a non-numeric value must fail parsing, not truncate.
+        let args = [
+            "switchboard",
+            "--webhook-secret",
+            "x",
+            "--app-key",
+            "/k",
+            "--app-id",
+            "not-a-number",
+        ];
+        assert!(Config::try_parse_from(args).is_err());
+    }
+}
