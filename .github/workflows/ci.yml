@@ -4,6 +4,15 @@ name: CI
 # gate is just: does it format, lint clean, and pass its tests. Runs on the
 # ephpm org's self-hosted (ephemerd) fleet, same `[self-hosted, linux, x64]`
 # label ephpm/ephpm's ci.yml uses so the fleet picks these jobs up.
+#
+# NOTE: "pure Rust" does NOT mean "no C toolchain". The ephemerd runner images
+# ship without a compiler, and several unavoidable transitive deps have build
+# scripts (proc-macro2, libc) or compile C (ring, via reqwest's rustls stack).
+# Without `cc` on PATH every compile job dies at "linker `cc` not found" before
+# a single crate of ours is checked — which is exactly what the first run of
+# this workflow did. So every job that COMPILES installs build-essential first,
+# mirroring ephpm/ephpm's ci.yml. The fmt job is the one exception: it parses,
+# never compiles, so it needs no toolchain beyond rustfmt.
 on:
   push:
     branches: [main]
@@ -33,6 +42,29 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
+      - name: Install build prerequisites
+        # switchboard needs only a C compiler/linker (`cc`) — no bindgen, no
+        # openssl-sys (reqwest uses rustls). Some fleet runners come up as root
+        # without `sudo`, others as non-root with it; a bare `sudo apt-get`
+        # exits 127 on the former and reds the job for reasons unrelated to the
+        # change. Resolve the escalation method at run time. (Pattern lifted
+        # from ephpm/ephpm's ci.yml.)
+        run: |
+          set -eu
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "apt-get unavailable; assuming the image already provides build prerequisites"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "::error::not running as root and sudo is unavailable"
+            exit 1
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends build-essential pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -44,6 +76,23 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
+      - name: Install build prerequisites
+        run: |
+          set -eu
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "apt-get unavailable; assuming the image already provides build prerequisites"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "::error::not running as root and sudo is unavailable"
+            exit 1
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends build-essential pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
@@ -53,6 +102,23 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
+      - name: Install build prerequisites
+        run: |
+          set -eu
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "apt-get unavailable; assuming the image already provides build prerequisites"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "::error::not running as root and sudo is unavailable"
+            exit 1
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends build-essential pkg-config
       # Pinned to the crate's declared rust-version (Cargo.toml). A build that
       # needs a newer toolchain than we advertise is a bug in the manifest.
       - uses: dtolnay/rust-toolchain@1.85
