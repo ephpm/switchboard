@@ -33,10 +33,29 @@ pub struct Config {
 
     /// Preview domain suffix (e.g., "preview.ephpm.dev").
     /// PR previews get: `pr-{number}.{repo}.{suffix}`
-    #[arg(long, default_value = "preview.ephpm.dev", env = "SWITCHBOARD_PREVIEW_DOMAIN")]
+    #[arg(
+        long,
+        default_value = "preview.ephpm.dev",
+        env = "SWITCHBOARD_PREVIEW_DOMAIN"
+    )]
     pub preview_domain: String,
 
     /// Composer command (or path to binary).
     #[arg(long, default_value = "composer", env = "SWITCHBOARD_COMPOSER")]
     pub composer: String,
+
+    /// Path to switchboard's secrets file (YAML) for resolving `${secret.NAME}`
+    /// references in an app manifest's `env:` map. Optional — secrets can also
+    /// come from `SWITCHBOARD_SECRET_*` environment variables.
+    #[arg(long, env = "SWITCHBOARD_SECRETS_FILE")]
+    pub secrets_file: Option<PathBuf>,
+
+    /// Seconds to poll a preview's `health:` path for HTTP 200 before reporting
+    /// the deploy ready. Zero disables the health gate.
+    #[arg(long, default_value_t = 60, env = "SWITCHBOARD_HEALTH_TIMEOUT_SECS")]
+    pub health_timeout_secs: u64,
+
+    /// Seconds between health-check poll attempts.
+    #[arg(long, default_value_t = 2, env = "SWITCHBOARD_HEALTH_INTERVAL_SECS")]
+    pub health_interval_secs: u64,
 }
