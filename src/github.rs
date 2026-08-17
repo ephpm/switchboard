@@ -49,10 +49,7 @@ impl GitHubClient {
     }
 
     /// Update the PR comment to show the preview was removed.
-    pub async fn post_teardown_comment(
-        &self,
-        event: &PullRequestEvent,
-    ) -> anyhow::Result<()> {
+    pub async fn post_teardown_comment(&self, event: &PullRequestEvent) -> anyhow::Result<()> {
         let owner = &event.repository.owner.login;
         let repo = &event.repository.name;
         let pr_number = event.number;
@@ -79,9 +76,7 @@ impl GitHubClient {
         let url = format!("https://{}", result.hostname);
 
         // Create deployment.
-        let deploy_url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/deployments"
-        );
+        let deploy_url = format!("https://api.github.com/repos/{owner}/{repo}/deployments");
         let resp = self
             .client
             .post(&deploy_url)
@@ -139,9 +134,8 @@ impl GitHubClient {
         repo: &str,
         pr_number: u64,
     ) -> anyhow::Result<Option<u64>> {
-        let url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
-        );
+        let url =
+            format!("https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments");
         let resp = self
             .client
             .get(&url)
@@ -175,9 +169,8 @@ impl GitHubClient {
         pr_number: u64,
         body: &str,
     ) -> anyhow::Result<()> {
-        let url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
-        );
+        let url =
+            format!("https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments");
         self.client
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
@@ -197,9 +190,8 @@ impl GitHubClient {
         comment_id: u64,
         body: &str,
     ) -> anyhow::Result<()> {
-        let url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/issues/comments/{comment_id}"
-        );
+        let url =
+            format!("https://api.github.com/repos/{owner}/{repo}/issues/comments/{comment_id}");
         self.client
             .patch(&url)
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
@@ -216,13 +208,15 @@ impl GitHubClient {
 /// Format the PR comment body for a successful deploy.
 fn format_deploy_comment(result: &DeployResult) -> String {
     let url = crate::deployer::preview_url(&result.hostname, result.php_version.as_deref());
-    let php_display = result
-        .php_version
-        .as_deref()
-        .unwrap_or("latest");
+    let php_display = result.php_version.as_deref().unwrap_or("latest");
+    let status = if result.healthy {
+        "ready"
+    } else {
+        "deployed (health check pending)"
+    };
 
     format!(
-        "**ePHPm Preview** — deployed\n\n\
+        "**ePHPm Preview** — {status}\n\n\
          | | |\n\
          |---|---|\n\
          | URL | {url} |\n\
@@ -248,13 +242,18 @@ mod tests {
             framework: Framework::WordPress,
             duration: Duration::from_millis(14_320),
             php_version: None,
+            healthy: true,
         };
         let comment = format_deploy_comment(&result);
         assert!(comment.contains("https://pr-42.my-blog.preview.ephpm.dev"));
-        assert!(!comment.contains(":80"), "default PHP should not have a port");
+        assert!(
+            !comment.contains(":80"),
+            "default PHP should not have a port"
+        );
         assert!(comment.contains("WordPress"));
         assert!(comment.contains("latest"));
         assert!(comment.contains("14.3s"));
+        assert!(comment.contains("ready"));
     }
 
     #[test]
@@ -264,9 +263,11 @@ mod tests {
             framework: Framework::Laravel,
             duration: Duration::from_millis(9_500),
             php_version: Some("8.4".into()),
+            healthy: false,
         };
         let comment = format_deploy_comment(&result);
         assert!(comment.contains(":8084"), "PHP 8.4 should use port 8084");
+        assert!(comment.contains("health check pending"));
         assert!(comment.contains("Laravel"));
         assert!(comment.contains("8.4"));
     }

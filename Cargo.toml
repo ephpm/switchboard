@@ -17,6 +17,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# YAML (ephpm.yaml app manifest + switchboard secrets file). serde_yml is the
+# actively-maintained fork of the archived serde_yaml — chosen to avoid the
+# RUSTSEC-2024-0320 "unmaintained" advisory if switchboard is open-sourced.
+serde_yml = "0.0.12"
 
 # Crypto (webhook signature verification)
 hmac = "0.12"

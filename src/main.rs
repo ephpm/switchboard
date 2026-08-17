@@ -7,6 +7,8 @@
 mod config;
 mod deployer;
 mod github;
+mod manifest;
+mod secrets;
 mod webhook;
 
 use std::sync::Arc;
@@ -20,10 +22,12 @@ use clap::Parser;
 use tracing::info;
 
 use config::Config;
+use secrets::Secrets;
 
 /// Shared application state.
 struct AppState {
     config: Config,
+    secrets: Secrets,
 }
 
 #[tokio::main]
@@ -50,8 +54,11 @@ async fn main() -> anyhow::Result<()> {
     // Ensure sites_dir exists.
     tokio::fs::create_dir_all(&config.sites_dir).await?;
 
+    // Load switchboard's own secret store (file + SWITCHBOARD_SECRET_* env).
+    let secrets = Secrets::load(config.secrets_file.as_deref())?;
+
     let listen = config.listen.clone();
-    let state = Arc::new(AppState { config });
+    let state = Arc::new(AppState { config, secrets });
 
     let app = axum::Router::new()
         .route("/webhook", post(handle_webhook))
@@ -73,7 +80,10 @@ async fn handle_webhook(
     body: Bytes,
 ) -> impl IntoResponse {
     // Verify webhook signature.
-    let signature = match headers.get("x-hub-signature-256").and_then(|v| v.to_str().ok()) {
+    let signature = match headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(sig) => sig,
         None => {
             tracing::warn!("webhook missing signature header");
@@ -127,32 +137,32 @@ async fn handle_webhook(
 
 /// Deploy a preview and post a comment.
 async fn handle_deploy(state: &AppState, event: &webhook::PullRequestEvent) {
-    let result = deployer::deploy_preview(
-        event,
-        &state.config.sites_dir,
-        &state.config.preview_domain,
-        &state.config.composer,
-    )
-    .await;
+    let ctx = deployer::DeployContext {
+        sites_dir: &state.config.sites_dir,
+        preview_domain: &state.config.preview_domain,
+        composer: &state.config.composer,
+        secrets: &state.secrets,
+        health_timeout: std::time::Duration::from_secs(state.config.health_timeout_secs),
+        health_interval: std::time::Duration::from_secs(state.config.health_interval_secs),
+    };
+    let result = deployer::deploy_preview(event, &ctx).await;
 
     match result {
-        Ok(deploy_result) => {
-            match get_installation_token(state, event).await {
-                Ok(token) => {
-                    let client = github::GitHubClient::new(token);
+        Ok(deploy_result) => match get_installation_token(state, event).await {
+            Ok(token) => {
+                let client = github::GitHubClient::new(token);
 
-                    if let Err(e) = client.post_preview_comment(event, &deploy_result).await {
-                        tracing::error!(%e, "failed to post PR comment");
-                    }
-                    if let Err(e) = client.create_deployment_status(event, &deploy_result).await {
-                        tracing::error!(%e, "failed to set deployment status");
-                    }
+                if let Err(e) = client.post_preview_comment(event, &deploy_result).await {
+                    tracing::error!(%e, "failed to post PR comment");
                 }
-                Err(e) => {
-                    tracing::error!(%e, "failed to get installation token");
+                if let Err(e) = client.create_deployment_status(event, &deploy_result).await {
+                    tracing::error!(%e, "failed to set deployment status");
                 }
             }
-        }
+            Err(e) => {
+                tracing::error!(%e, "failed to get installation token");
+            }
+        },
         Err(e) => {
             tracing::error!(
                 repo = %event.repository.full_name,
@@ -166,12 +176,9 @@ async fn handle_deploy(state: &AppState, event: &webhook::PullRequestEvent) {
 
 /// Tear down a preview and update the comment.
 async fn handle_teardown(state: &AppState, event: &webhook::PullRequestEvent) {
-    if let Err(e) = deployer::teardown_preview(
-        event,
-        &state.config.sites_dir,
-        &state.config.preview_domain,
-    )
-    .await
+    if let Err(e) =
+        deployer::teardown_preview(event, &state.config.sites_dir, &state.config.preview_domain)
+            .await
     {
         tracing::error!(%e, "preview teardown failed");
     }
@@ -242,9 +249,7 @@ async fn get_installation_token(
     let jwt = format!("{signing_input}.{signature}");
 
     // Exchange JWT for installation token.
-    let url = format!(
-        "https://api.github.com/app/installations/{installation_id}/access_tokens"
-    );
+    let url = format!("https://api.github.com/app/installations/{installation_id}/access_tokens");
     let resp = reqwest::Client::new()
         .post(&url)
         .header("Authorization", format!("Bearer {jwt}"))
