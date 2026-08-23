@@ -363,9 +363,12 @@ async fn run_git(
 
 /// Run `build:` in order, or an implicit `composer install` when none declared.
 ///
-/// The build runs the SYSTEM composer/PHP (`ctx.composer`), not `ephpm php`:
-/// Composer is broken under the embedded SAPI (issue #400). Failures are logged
-/// and the deploy continues so the PR still gets a (broken) preview to inspect.
+/// The build runs the SYSTEM composer/PHP (`ctx.composer`), not `ephpm php`.
+/// Issue #400 (Composer aborting under `ephpm php`) is Windows-only, so the
+/// Linux daemon is not actually bitten — but the daemon deliberately has no
+/// `ephpm php` build path, so builds can never regress into it. Failures are
+/// logged and the deploy continues so the PR still gets a (broken) preview to
+/// inspect.
 async fn run_build(manifest: &AppManifest, checkout: &Path, composer: &str, site_key: &str) {
     if manifest.build.is_empty() {
         if checkout.join("composer.json").exists() {

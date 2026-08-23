@@ -83,8 +83,11 @@ pub struct Config {
     pub vhost_temp_base: Option<PathBuf>,
 
     /// Composer command (or path). Used for the implicit `composer install`
-    /// when a manifest declares no `build:` steps. This runs the SYSTEM PHP, not
-    /// `ephpm php` (issue #400 — Composer is broken under the embedded SAPI).
+    /// when a manifest declares no `build:` steps. This runs the SYSTEM
+    /// composer/PHP, not `ephpm php`: issue #400 (Composer aborting under
+    /// `ephpm php`) is a Windows-only php-sdk problem (Schannel-linked curl), so
+    /// the Linux daemon is unaffected — but building against the system PHP keeps
+    /// it that way and avoids coupling builds to the embedded SAPI.
     #[arg(long, default_value = "composer", env = "SWITCHBOARD_COMPOSER")]
     pub composer: String,
 

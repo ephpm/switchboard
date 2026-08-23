@@ -134,11 +134,13 @@ no gate at all. Now:
 
 ### `build:` uses system PHP, not `ephpm php` (issue #400)
 
-Composer is currently broken under ePHPm's embedded SAPI (its `PlatformRepository`
-mis-parses `phpinfo()` output). The implicit `composer install` and any `build:`
-step therefore run against the **system** `composer`/PHP (`--composer`), never
-`ephpm php`. If you point `--composer` at a wrapper that shells `ephpm php`,
-builds will fail until #400 is fixed.
+The implicit `composer install` and any `build:` step run against the **system**
+`composer`/PHP (`--composer`), never `ephpm php`. Issue #400 (Composer aborting
+under `ephpm php`) is a **Windows-only** php-sdk problem — the Windows build links
+curl against Schannel, which trips an upstream Composer platform-parser regex — so
+the Linux daemon is not actually bitten. The daemon nonetheless has **no**
+`ephpm php` build path by design, so builds can't regress into it; if you point
+`--composer` at a wrapper that shells `ephpm php`, that guarantee is on you.
 
 ### `seed:` cannot reach the database from a shell
 
