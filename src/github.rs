@@ -1,331 +1,344 @@
-//! GitHub API interactions — PR comments and deployment statuses.
+//! GitHub interaction — the Deployments API lifecycle plus a failure-only PR
+//! comment.
+//!
+//! GitHub is the interface: the daemon creates a Deployment as its first action
+//! on claiming a deploy job (so even a failed build shows on the PR), then posts
+//! `in_progress` → `success`/`failure` with the preview URL as
+//! `environment_url`, which renders the native "View deployment" box. Teardown
+//! posts `inactive`.
+//!
+//! A `failure` deployment state carries no log, so a build failure additionally
+//! posts a PR comment carrying the `**ePHPm Preview**` marker — the same marker
+//! used to find-and-update in place rather than appending a new comment each
+//! push. The success-path comment is redundant once the deployment box renders,
+//! so it is gone.
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde_json::json;
 
-use crate::deployer::DeployResult;
-use crate::webhook::PullRequestEvent;
+use crate::app_auth::InstallationToken;
 
-/// GitHub API client for posting comments and deployment statuses.
+/// A deployment status state, per the GitHub Deployments API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentState {
+    /// Created, not yet started.
+    Queued,
+    /// Clone/build underway.
+    InProgress,
+    /// Preview healthy.
+    Success,
+    /// A step failed.
+    Failure,
+    /// Torn down.
+    Inactive,
+}
+
+impl DeploymentState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::InProgress => "in_progress",
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Inactive => "inactive",
+        }
+    }
+}
+
+/// GitHub API client bound to one installation token.
 pub struct GitHubClient {
     client: reqwest::Client,
-    /// Installation access token (short-lived, scoped to repo).
-    token: String,
+    token: InstallationToken,
+    api_base: String,
 }
 
 impl GitHubClient {
-    /// Create a new client with the given installation access token.
+    /// Create a client. `github_host` selects the API base (`github.com` →
+    /// `api.github.com`, else GHES `/api/v3`).
     #[must_use]
-    pub fn new(token: String) -> Self {
+    pub fn new(token: InstallationToken, github_host: &str) -> Self {
+        let api_base = if github_host.eq_ignore_ascii_case("github.com") {
+            "https://api.github.com".to_string()
+        } else {
+            format!("https://{github_host}/api/v3")
+        };
         Self {
             client: reqwest::Client::new(),
             token,
+            api_base,
         }
     }
 
-    /// Post a preview deployment comment on the PR.
-    ///
-    /// If a switchboard comment already exists, updates it instead of creating a new one.
-    pub async fn post_preview_comment(
-        &self,
-        event: &PullRequestEvent,
-        result: &DeployResult,
-    ) -> anyhow::Result<()> {
-        let owner = &event.repository.owner.login;
-        let repo = &event.repository.name;
-        let pr_number = event.number;
-
-        let body = format_deploy_comment(result);
-
-        // Check if we already have a comment on this PR.
-        if let Some(comment_id) = self.find_existing_comment(owner, repo, pr_number).await? {
-            self.update_comment(owner, repo, comment_id, &body).await?;
-        } else {
-            self.create_comment(owner, repo, pr_number, &body).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Update the PR comment to show the preview was removed.
-    pub async fn post_teardown_comment(&self, event: &PullRequestEvent) -> anyhow::Result<()> {
-        let owner = &event.repository.owner.login;
-        let repo = &event.repository.name;
-        let pr_number = event.number;
-
-        if let Some(comment_id) = self.find_existing_comment(owner, repo, pr_number).await? {
-            self.update_comment(owner, repo, comment_id, teardown_comment_body())
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    /// Set the commit deployment status (creates the "Environments" UI in GitHub).
-    pub async fn create_deployment_status(
-        &self,
-        event: &PullRequestEvent,
-        result: &DeployResult,
-    ) -> anyhow::Result<()> {
-        let owner = &event.repository.owner.login;
-        let repo = &event.repository.name;
-        let sha = &event.pull_request.head.sha;
-
-        let url = format!("https://{}", result.hostname);
-
-        // Create deployment.
-        let deploy_url = format!("https://api.github.com/repos/{owner}/{repo}/deployments");
-        let resp = self
-            .client
-            .post(&deploy_url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
+    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req.header(AUTHORIZATION, format!("Bearer {}", self.token.expose()))
             .header(USER_AGENT, "switchboard")
             .header(ACCEPT, "application/vnd.github+json")
+    }
+
+    /// Create a Deployment and return its id. Uses a transient ref (the head
+    /// SHA), disables auto-merge, and requires no status contexts so GitHub does
+    /// not refuse to create it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GitHub does not return a numeric deployment id.
+    pub async fn create_deployment(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+        number: u64,
+    ) -> anyhow::Result<u64> {
+        let url = format!("{}/repos/{owner}/{repo}/deployments", self.api_base);
+        let resp = self
+            .auth(self.client.post(&url))
             .json(&json!({
                 "ref": sha,
-                "environment": format!("preview-pr-{}", event.number),
+                "environment": deployment_environment(number),
                 "auto_merge": false,
                 "required_contexts": [],
-                "description": format!("ePHPm preview for PR #{}", event.number),
+                "transient_environment": true,
+                "description": format!("ePHPm preview for PR #{number}"),
             }))
             .send()
             .await
             .context("failed to create deployment")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            tracing::warn!(%status, %body, "failed to create deployment");
-            return Ok(()); // Non-fatal — the comment is more important.
-        }
-
-        let deployment: serde_json::Value = resp.json().await?;
-        let deployment_id = deployment["id"]
-            .as_u64()
-            .context("deployment response missing id")?;
-
-        // Set deployment status to success.
-        let status_url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/deployments/{deployment_id}/statuses"
+        ensure!(
+            resp.status().is_success(),
+            "create deployment failed: HTTP {}",
+            resp.status()
         );
-        self.client
-            .post(&status_url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .header(USER_AGENT, "switchboard")
-            .header(ACCEPT, "application/vnd.github+json")
-            .json(&json!({
-                "state": "success",
-                "environment_url": url,
-                "description": format!("{} preview deployed", result.framework.as_str()),
-            }))
+        let deployment: serde_json::Value = resp.json().await.context("deployment response")?;
+        deployment["id"]
+            .as_u64()
+            .context("deployment response missing id")
+    }
+
+    /// Post a status on an existing Deployment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or GitHub rejects it.
+    pub async fn set_deployment_status(
+        &self,
+        owner: &str,
+        repo: &str,
+        deployment_id: u64,
+        state: DeploymentState,
+        environment_url: Option<&str>,
+        description: &str,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/repos/{owner}/{repo}/deployments/{deployment_id}/statuses",
+            self.api_base
+        );
+        let mut body = json!({
+            "state": state.as_str(),
+            "description": truncate(description, 140),
+        });
+        if let Some(env_url) = environment_url {
+            body["environment_url"] = json!(env_url);
+        }
+        let resp = self
+            .auth(self.client.post(&url))
+            .json(&body)
             .send()
             .await
             .context("failed to set deployment status")?;
-
+        ensure!(
+            resp.status().is_success(),
+            "set deployment status failed: HTTP {}",
+            resp.status()
+        );
         Ok(())
     }
 
-    /// Find an existing switchboard comment on a PR.
-    async fn find_existing_comment(
+    /// Mark the most recent Deployment for a PR's environment `inactive` (the
+    /// teardown signal). Best-effort: absence of a prior deployment is not an
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only on a transport failure; a missing deployment is a
+    /// successful no-op.
+    pub async fn deactivate_environment(
         &self,
         owner: &str,
         repo: &str,
-        pr_number: u64,
-    ) -> anyhow::Result<Option<u64>> {
-        let url =
-            format!("https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments");
+        number: u64,
+    ) -> anyhow::Result<()> {
+        let list_url = format!(
+            "{}/repos/{owner}/{repo}/deployments?environment={}&per_page=1",
+            self.api_base,
+            deployment_environment(number)
+        );
         let resp = self
-            .client
-            .get(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .header(USER_AGENT, "switchboard")
-            .header(ACCEPT, "application/vnd.github+json")
+            .auth(self.client.get(&list_url))
             .send()
-            .await?;
+            .await
+            .context("list deployments")?;
+        if !resp.status().is_success() {
+            return Ok(());
+        }
+        let deployments: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
+        let Some(id) = deployments.first().and_then(|d| d["id"].as_u64()) else {
+            return Ok(());
+        };
+        self.set_deployment_status(
+            owner,
+            repo,
+            id,
+            DeploymentState::Inactive,
+            None,
+            "preview removed",
+        )
+        .await
+    }
 
+    /// Post (or update in place) the failure comment on a PR. Failure-only —
+    /// success is carried by the deployment box.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn post_failure_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        log_excerpt: &str,
+    ) -> anyhow::Result<()> {
+        let body = failure_comment_body(log_excerpt);
+        if let Some(id) = self.find_marked_comment(owner, repo, number).await? {
+            let url = format!(
+                "{}/repos/{owner}/{repo}/issues/comments/{id}",
+                self.api_base
+            );
+            self.auth(self.client.patch(&url))
+                .json(&json!({ "body": body }))
+                .send()
+                .await
+                .context("failed to update failure comment")?;
+        } else {
+            let url = format!(
+                "{}/repos/{owner}/{repo}/issues/{number}/comments",
+                self.api_base
+            );
+            self.auth(self.client.post(&url))
+                .json(&json!({ "body": body }))
+                .send()
+                .await
+                .context("failed to create failure comment")?;
+        }
+        Ok(())
+    }
+
+    /// Find a prior switchboard comment on a PR by its marker.
+    async fn find_marked_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> anyhow::Result<Option<u64>> {
+        let url = format!(
+            "{}/repos/{owner}/{repo}/issues/{number}/comments",
+            self.api_base
+        );
+        let resp = self.auth(self.client.get(&url)).send().await?;
         if !resp.status().is_success() {
             return Ok(None);
         }
-
         let comments: Vec<serde_json::Value> = resp.json().await?;
         for comment in comments {
-            let body = comment["body"].as_str().unwrap_or("");
-            if body.contains("**ePHPm Preview**") {
-                if let Some(id) = comment["id"].as_u64() {
-                    return Ok(Some(id));
-                }
+            if comment["body"]
+                .as_str()
+                .unwrap_or("")
+                .contains(COMMENT_MARKER)
+                && let Some(id) = comment["id"].as_u64()
+            {
+                return Ok(Some(id));
             }
         }
-
         Ok(None)
     }
-
-    async fn create_comment(
-        &self,
-        owner: &str,
-        repo: &str,
-        pr_number: u64,
-        body: &str,
-    ) -> anyhow::Result<()> {
-        let url =
-            format!("https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments");
-        self.client
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .header(USER_AGENT, "switchboard")
-            .header(ACCEPT, "application/vnd.github+json")
-            .json(&json!({ "body": body }))
-            .send()
-            .await
-            .context("failed to create PR comment")?;
-        Ok(())
-    }
-
-    async fn update_comment(
-        &self,
-        owner: &str,
-        repo: &str,
-        comment_id: u64,
-        body: &str,
-    ) -> anyhow::Result<()> {
-        let url =
-            format!("https://api.github.com/repos/{owner}/{repo}/issues/comments/{comment_id}");
-        self.client
-            .patch(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .header(USER_AGENT, "switchboard")
-            .header(ACCEPT, "application/vnd.github+json")
-            .json(&json!({ "body": body }))
-            .send()
-            .await
-            .context("failed to update PR comment")?;
-        Ok(())
-    }
 }
 
-/// The PR comment body posted when a preview is torn down. Kept as its own
-/// pure function (rather than inlined in the async network path) so the exact
-/// rendered markdown is unit-testable and still carries the `**ePHPm Preview**`
-/// marker that [`GitHubClient::find_existing_comment`] matches on.
-fn teardown_comment_body() -> &'static str {
-    "**ePHPm Preview** — removed\n\n\
-     Preview deployment has been torn down."
+/// The marker every switchboard-authored comment carries, so it is found and
+/// updated in place rather than duplicated on each push.
+const COMMENT_MARKER: &str = "**ePHPm Preview**";
+
+/// The GitHub Deployment environment name for a PR.
+#[must_use]
+pub fn deployment_environment(number: u64) -> String {
+    format!("preview-pr-{number}")
 }
 
-/// Format the PR comment body for a successful deploy.
-fn format_deploy_comment(result: &DeployResult) -> String {
-    let url = crate::deployer::preview_url(&result.hostname, result.php_version.as_deref());
-    let php_display = result.php_version.as_deref().unwrap_or("latest");
-    let status = if result.healthy {
-        "ready"
-    } else {
-        "deployed (health check pending)"
-    };
-
+/// The failure comment markdown. Carries the marker and a fenced log excerpt.
+fn failure_comment_body(log_excerpt: &str) -> String {
+    let excerpt = truncate(log_excerpt.trim(), 3000);
     format!(
-        "**ePHPm Preview** — {status}\n\n\
-         | | |\n\
-         |---|---|\n\
-         | URL | {url} |\n\
-         | Framework | {} |\n\
-         | PHP | {php_display} |\n\
-         | Deployed in | {:.1}s |\n\n\
-         Preview updates automatically on each push to this PR.",
-        result.framework.as_str(),
-        result.duration.as_secs_f64(),
+        "{COMMENT_MARKER} — build failed\n\n\
+         The preview could not be deployed. Latest output:\n\n\
+         ```\n{excerpt}\n```\n\n\
+         Push a fix to retry."
     )
+}
+
+/// Truncate `s` to at most `max` bytes on a char boundary, appending `…` when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deployer::Framework;
-    use std::time::Duration;
 
     #[test]
-    fn comment_format_default_php() {
-        let result = DeployResult {
-            hostname: "pr-42.my-blog.preview.ephpm.dev".into(),
-            framework: Framework::WordPress,
-            duration: Duration::from_millis(14_320),
-            php_version: None,
-            healthy: true,
-        };
-        let comment = format_deploy_comment(&result);
-        assert!(comment.contains("https://pr-42.my-blog.preview.ephpm.dev"));
-        assert!(
-            !comment.contains(":80"),
-            "default PHP should not have a port"
-        );
-        assert!(comment.contains("WordPress"));
-        assert!(comment.contains("latest"));
-        assert!(comment.contains("14.3s"));
-        assert!(comment.contains("ready"));
+    fn environment_name() {
+        assert_eq!(deployment_environment(42), "preview-pr-42");
     }
 
     #[test]
-    fn comment_format_php84() {
-        let result = DeployResult {
-            hostname: "pr-42.my-blog.preview.ephpm.dev".into(),
-            framework: Framework::Laravel,
-            duration: Duration::from_millis(9_500),
-            php_version: Some("8.4".into()),
-            healthy: false,
-        };
-        let comment = format_deploy_comment(&result);
-        assert!(comment.contains(":8084"), "PHP 8.4 should use port 8084");
-        assert!(comment.contains("health check pending"));
-        assert!(comment.contains("Laravel"));
-        assert!(comment.contains("8.4"));
+    fn deployment_state_strings() {
+        assert_eq!(DeploymentState::Queued.as_str(), "queued");
+        assert_eq!(DeploymentState::InProgress.as_str(), "in_progress");
+        assert_eq!(DeploymentState::Success.as_str(), "success");
+        assert_eq!(DeploymentState::Failure.as_str(), "failure");
+        assert_eq!(DeploymentState::Inactive.as_str(), "inactive");
     }
 
     #[test]
-    fn comment_carries_marker_and_table() {
-        // The marker is load-bearing: find_existing_comment matches on it to
-        // decide update-vs-create, so it must always be present.
-        let result = DeployResult {
-            hostname: "pr-1.app.preview.ephpm.dev".into(),
-            framework: Framework::Symfony,
-            duration: Duration::from_millis(3_000),
-            php_version: Some("8.3".into()),
-            healthy: true,
-        };
-        let comment = format_deploy_comment(&result);
-        assert!(comment.contains("**ePHPm Preview**"));
-        assert!(comment.contains("| URL |"));
-        assert!(comment.contains("| Framework |"));
-        assert!(comment.contains("| PHP |"));
-        assert!(comment.contains("Symfony"));
-        assert!(comment.contains(":8083"), "PHP 8.3 should use port 8083");
-        // Auto-update footer is present so reviewers know pushes refresh it.
-        assert!(comment.contains("updates automatically"));
+    fn failure_comment_has_marker_and_log() {
+        let body = failure_comment_body("composer: command not found\nexit 127");
+        assert!(body.contains(COMMENT_MARKER));
+        assert!(body.contains("build failed"));
+        assert!(body.contains("composer: command not found"));
+        assert!(body.contains("```"));
     }
 
     #[test]
-    fn comment_duration_rounds_to_one_decimal() {
-        // 2_449ms rounds to 2.4s (one decimal), not 2s or 2.449s.
-        let result = DeployResult {
-            hostname: "h".into(),
-            framework: Framework::Drupal,
-            duration: Duration::from_millis(2_449),
-            php_version: Some("8.5".into()),
-            healthy: true,
-        };
-        let comment = format_deploy_comment(&result);
-        assert!(comment.contains("2.4s"), "got: {comment}");
-        assert!(comment.contains("Drupal"));
-        // 8.5 is the default port-less URL — no explicit port in the link.
-        assert!(!comment.contains(":8085"));
+    fn truncate_respects_char_boundary_and_marks_cut() {
+        let s = "a".repeat(10);
+        assert_eq!(truncate(&s, 100), s);
+        let cut = truncate(&s, 4);
+        assert_eq!(cut, "aaaa…");
     }
 
     #[test]
-    fn teardown_body_is_marked_and_removed() {
-        let body = teardown_comment_body();
-        // Must keep the marker so the existing comment is found and updated in
-        // place rather than a fresh "removed" comment being appended.
-        assert!(body.contains("**ePHPm Preview**"));
-        assert!(body.contains("removed"));
-        assert!(body.contains("torn down"));
+    fn truncate_does_not_split_multibyte() {
+        // '€' is 3 bytes; cutting at 2 must not panic and must not split it.
+        let s = "a€b";
+        let cut = truncate(s, 2);
+        assert!(cut.ends_with('…'));
+        assert!(cut.starts_with('a'));
     }
 }

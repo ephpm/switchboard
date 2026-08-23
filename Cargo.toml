@@ -1,17 +1,20 @@
 [package]
 name = "switchboard"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88: the daemon uses let-chains (`if let … && …`), stabilized in 1.88.
+rust-version = "1.88"
 license = "MIT"
-description = "GitHub webhook handler for ePHPm preview deployments"
+description = "Preview-deployment daemon for ePHPm — consumes switchboard-api job files, provisions previews, reports to GitHub"
+
+[[bin]]
+name = "switchboard"
+path = "src/main.rs"
 
 [dependencies]
-# HTTP server (receives webhooks)
-axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 
-# HTTP client (GitHub API)
+# HTTP client (GitHub Deployments API + preview health polling)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Serialization
@@ -19,13 +22,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # YAML (ephpm.yaml app manifest + switchboard secrets file). serde_yml is the
 # actively-maintained fork of the archived serde_yaml — chosen to avoid the
-# RUSTSEC-2024-0320 "unmaintained" advisory if switchboard is open-sourced.
+# RUSTSEC-2024-0320 "unmaintained" advisory.
 serde_yml = "0.0.12"
-
-# Crypto (webhook signature verification)
-hmac = "0.12"
-sha2 = "0.10"
-hex = "0.4"
 
 # Logging
 tracing = "0.1"
@@ -37,7 +35,17 @@ thiserror = "2"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+
+# JWT base64url (GitHub App auth)
 base64 = "0.22"
+
+# GIT_ASKPASS helper script lives in a private temp file for the daemon's
+# lifetime (the installation token is passed to git via env, never argv/disk).
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: the preview-label cross-implementation guard (identity hash) that
+# pins switchboard-api's PreviewLabel port to the Rust algorithm.
+sha2 = "0.10"
+hex = "0.4"

@@ -121,6 +121,6 @@ jobs:
           $SUDO apt-get install -y --no-install-recommends build-essential pkg-config
       # Pinned to the crate's declared rust-version (Cargo.toml). A build that
       # needs a newer toolchain than we advertise is a bug in the manifest.
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets

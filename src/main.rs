@@ -1,34 +1,37 @@
-//! switchboard — GitHub webhook handler for ePHPm preview deployments.
+//! switchboard — the preview-deployment daemon for ePHPm.
 //!
-//! Receives `pull_request` webhook events from GitHub, deploys preview
-//! sites to an ePHPm instance's `sites_dir`, and posts PR comments
-//! with the preview URL.
+//! It is a queue worker, not an HTTP server. switchboard-api
+//! (`ephpm/switchboard-api`) receives GitHub webhooks, verifies them, and writes
+//! job files into a directory; this daemon watches that directory, provisions
+//! (or tears down) previews, and reports status to GitHub via the Deployments
+//! API. The webhook receiver and this daemon are the two halves of a deliberate
+//! split — see `README.md` and switchboard-api's `MIGRATION.md`.
 
+mod app_auth;
 mod config;
 mod deployer;
+mod git_askpass;
 mod github;
+mod job;
 mod manifest;
+mod preview;
+mod queue;
 mod secrets;
-mod webhook;
+mod site;
 
-use std::sync::Arc;
+use std::time::Duration;
 
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use clap::Parser;
-use tracing::info;
-
+use app_auth::{AppAuth, InstallationToken};
 use config::Config;
+use deployer::DeployContext;
+use git_askpass::Askpass;
+use github::{DeploymentState, GitHubClient};
+use job::{Intent, Job};
+use queue::{HandleOutcome, JobSink, QueueWatcher};
 use secrets::Secrets;
 
-/// Shared application state.
-struct AppState {
-    config: Config,
-    secrets: Secrets,
-}
+use clap::Parser;
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,276 +43,237 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
-    info!(listen = %config.listen, "starting switchboard");
-    info!(sites_dir = %config.sites_dir.display(), "preview deployments target");
-    info!(domain = %config.preview_domain, "preview domain");
+    info!(queue = %config.queue_dir.display(), "starting switchboard daemon");
+    info!(sites_dir = %config.sites_dir.display(), preview_domain = %config.preview_domain, "preview target");
 
-    // Verify the GitHub App private key exists.
-    anyhow::ensure!(
-        config.app_key.exists(),
-        "GitHub App private key not found at {}",
-        config.app_key.display()
-    );
+    // App auth: load + permission-check the key, resolve the API base.
+    let app_auth = AppAuth::load(config.app_id, config.app_key.clone(), &config.github_host)?;
 
-    // Ensure sites_dir exists.
-    tokio::fs::create_dir_all(&config.sites_dir).await?;
-
-    // Load switchboard's own secret store (file + SWITCHBOARD_SECRET_* env).
+    // Secret store for `${secret.NAME}` resolution (never from the app repo).
     let secrets = Secrets::load(config.secrets_file.as_deref())?;
 
-    let listen = config.listen.clone();
-    let state = Arc::new(AppState { config, secrets });
+    // GIT_ASKPASS helper — carries the token to git via env, never argv/disk.
+    let askpass = Askpass::create()?;
 
-    let app = axum::Router::new()
-        .route("/webhook", post(handle_webhook))
-        .route("/health", get(|| async { "ok" }))
-        .with_state(state);
+    let orchestrator = Orchestrator {
+        config: config.clone(),
+        secrets,
+        app_auth,
+        askpass,
+    };
 
-    let listener = tokio::net::TcpListener::bind(&listen).await?;
-    let listen_addr = listener.local_addr()?;
-    info!(%listen_addr, "switchboard listening");
+    let watcher = QueueWatcher::new(
+        &config.queue_dir,
+        config.github_host.clone(),
+        Duration::from_secs(config.poll_interval_secs),
+    );
 
-    axum::serve(listener, app).await?;
+    watcher
+        .run(&orchestrator, Box::pin(shutdown_signal()))
+        .await;
+    info!("switchboard daemon stopped");
     Ok(())
 }
 
-/// Handle incoming GitHub webhook events.
-async fn handle_webhook(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
-    // Verify webhook signature.
-    let signature = match headers
-        .get("x-hub-signature-256")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(sig) => sig,
-        None => {
-            tracing::warn!("webhook missing signature header");
-            return StatusCode::UNAUTHORIZED;
+/// Resolves when the process receives a shutdown signal (Ctrl-C, or SIGTERM on
+/// Unix) so the watcher can finish its current pass and exit cleanly.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
         }
     };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
 
-    if let Err(e) = webhook::verify_signature(&body, &state.config.webhook_secret, signature) {
-        tracing::warn!(%e, "webhook signature verification failed");
-        return StatusCode::UNAUTHORIZED;
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
     }
-
-    // Only handle pull_request events.
-    let event_type = headers
-        .get("x-github-event")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if event_type != "pull_request" {
-        tracing::debug!(event = event_type, "ignoring non-PR event");
-        return StatusCode::OK;
-    }
-
-    // Parse the event.
-    let event: webhook::PullRequestEvent = match serde_json::from_slice(&body) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!(%e, "failed to parse pull_request event");
-            return StatusCode::BAD_REQUEST;
-        }
-    };
-
-    tracing::info!(
-        repo = %event.repository.full_name,
-        pr = event.number,
-        action = %event.action,
-        "received PR event"
-    );
-
-    // Spawn the deploy/teardown work in a background task so we respond 200 quickly.
-    tokio::spawn(async move {
-        if event.should_deploy() {
-            handle_deploy(&state, &event).await;
-        } else if event.should_teardown() {
-            handle_teardown(&state, &event).await;
-        }
-    });
-
-    StatusCode::OK
 }
 
-/// Deploy a preview and post a comment.
-async fn handle_deploy(state: &AppState, event: &webhook::PullRequestEvent) {
-    let ctx = deployer::DeployContext {
-        sites_dir: &state.config.sites_dir,
-        preview_domain: &state.config.preview_domain,
-        composer: &state.config.composer,
-        secrets: &state.secrets,
-        health_timeout: std::time::Duration::from_secs(state.config.health_timeout_secs),
-        health_interval: std::time::Duration::from_secs(state.config.health_interval_secs),
-    };
-    let result = deployer::deploy_preview(event, &ctx).await;
+/// The daemon's [`JobSink`]: mints tokens, reports to GitHub, and drives the
+/// deploy/teardown pipeline.
+struct Orchestrator {
+    config: Config,
+    secrets: Secrets,
+    app_auth: AppAuth,
+    askpass: Askpass,
+}
 
-    match result {
-        Ok(deploy_result) => match get_installation_token(state, event).await {
-            Ok(token) => {
-                let client = github::GitHubClient::new(token);
+impl JobSink for Orchestrator {
+    async fn handle(&self, job: Job) -> HandleOutcome {
+        match job.intent() {
+            Some(Intent::Deploy) => self.deploy(&job).await,
+            Some(Intent::Teardown) => self.teardown(&job).await,
+            // Validation guarantees this is unreachable; drop it rather than spin.
+            None => {
+                warn!(delivery = %job.delivery_id, "job with no actionable intent — dropping");
+                HandleOutcome::Done
+            }
+        }
+    }
+}
 
-                if let Err(e) = client.post_preview_comment(event, &deploy_result).await {
-                    tracing::error!(%e, "failed to post PR comment");
+impl Orchestrator {
+    fn deploy_context(&self) -> DeployContext<'_> {
+        DeployContext {
+            sites_dir: &self.config.sites_dir,
+            preview_domain: &self.config.preview_domain,
+            sites_domain_suffix: self.config.sites_domain_suffix.as_deref(),
+            site_overrides_dir: self.config.site_overrides_dir.as_deref(),
+            sqlite_dir: self.config.sqlite_dir.as_deref(),
+            vhost_temp_base: self.config.vhost_temp_base.as_deref(),
+            composer: &self.config.composer,
+            secrets: &self.secrets,
+            fork_secrets: self.config.fork_secrets,
+            askpass: &self.askpass,
+            health_timeout: Duration::from_secs(self.config.health_timeout_secs),
+            health_interval: Duration::from_secs(self.config.health_interval_secs),
+        }
+    }
+
+    /// Mint an installation token if the job carries an installation id.
+    async fn mint_token(&self, job: &Job) -> Option<InstallationToken> {
+        let installation_id = job.installation_id?;
+        match self.app_auth.installation_token(installation_id).await {
+            Ok(token) => Some(token),
+            Err(e) => {
+                warn!(%e, "failed to mint installation token — proceeding without GitHub reporting");
+                None
+            }
+        }
+    }
+
+    async fn deploy(&self, job: &Job) -> HandleOutcome {
+        // Fork gate (defense in depth over switchboard-api's own gate).
+        if job.pull_request.fork && !self.config.allow_fork_deploy {
+            warn!(
+                repo = %job.repository.full_name,
+                pr = job.pull_request.number,
+                "refusing fork PR deploy (allow_fork_deploy is off)"
+            );
+            return HandleOutcome::Done;
+        }
+
+        let owner = &job.repository.owner;
+        let repo = &job.repository.name;
+        let number = job.pull_request.number;
+        let sha = &job.pull_request.head.sha;
+
+        // Token + GitHub client. Create the Deployment as the FIRST action so a
+        // failed build still shows on the PR.
+        let token = self.mint_token(job).await;
+        let client = token
+            .clone()
+            .map(|t| GitHubClient::new(t, &self.config.github_host));
+        let mut deployment_id = None;
+        if let Some(client) = &client {
+            match client.create_deployment(owner, repo, sha, number).await {
+                Ok(id) => {
+                    deployment_id = Some(id);
+                    let _ = client
+                        .set_deployment_status(
+                            owner,
+                            repo,
+                            id,
+                            DeploymentState::Queued,
+                            None,
+                            "queued",
+                        )
+                        .await;
+                    let _ = client
+                        .set_deployment_status(
+                            owner,
+                            repo,
+                            id,
+                            DeploymentState::InProgress,
+                            None,
+                            "provisioning preview",
+                        )
+                        .await;
                 }
-                if let Err(e) = client.create_deployment_status(event, &deploy_result).await {
-                    tracing::error!(%e, "failed to set deployment status");
+                Err(e) => warn!(%e, "failed to create GitHub deployment — continuing without it"),
+            }
+        }
+
+        let ctx = self.deploy_context();
+        match deployer::deploy_preview(job, &ctx, token.as_ref()).await {
+            Ok(result) => {
+                info!(
+                    site_key = %result.site_key,
+                    hostname = %result.hostname,
+                    url = %result.preview_url,
+                    framework = result.framework.as_str(),
+                    php = result.php_version.as_deref().unwrap_or("default"),
+                    healthy = result.healthy,
+                    duration_ms = result.duration.as_millis(),
+                    "preview deployed"
+                );
+                if let (Some(client), Some(id)) = (&client, deployment_id) {
+                    let desc = format!("{} preview deployed", result.framework.as_str());
+                    let _ = client
+                        .set_deployment_status(
+                            owner,
+                            repo,
+                            id,
+                            DeploymentState::Success,
+                            Some(&result.preview_url),
+                            &desc,
+                        )
+                        .await;
                 }
+                HandleOutcome::Done
             }
             Err(e) => {
-                tracing::error!(%e, "failed to get installation token");
-            }
-        },
-        Err(e) => {
-            tracing::error!(
-                repo = %event.repository.full_name,
-                pr = event.number,
-                %e,
-                "preview deployment failed"
-            );
-        }
-    }
-}
-
-/// Tear down a preview and update the comment.
-async fn handle_teardown(state: &AppState, event: &webhook::PullRequestEvent) {
-    if let Err(e) =
-        deployer::teardown_preview(event, &state.config.sites_dir, &state.config.preview_domain)
-            .await
-    {
-        tracing::error!(%e, "preview teardown failed");
-    }
-
-    match get_installation_token(state, event).await {
-        Ok(token) => {
-            let client = github::GitHubClient::new(token);
-            if let Err(e) = client.post_teardown_comment(event).await {
-                tracing::error!(%e, "failed to update PR comment on teardown");
+                error!(repo = %job.repository.full_name, pr = number, %e, "preview deployment failed");
+                if let Some(client) = &client {
+                    if let Some(id) = deployment_id {
+                        let _ = client
+                            .set_deployment_status(
+                                owner,
+                                repo,
+                                id,
+                                DeploymentState::Failure,
+                                None,
+                                "deploy failed",
+                            )
+                            .await;
+                    }
+                    // A failure deployment carries no log — post the error too.
+                    let _ = client
+                        .post_failure_comment(owner, repo, number, &format!("{e:#}"))
+                        .await;
+                }
+                // Leave the claimed file for inspection.
+                HandleOutcome::Retain
             }
         }
-        Err(e) => {
-            tracing::error!(%e, "failed to get installation token for teardown");
+    }
+
+    async fn teardown(&self, job: &Job) -> HandleOutcome {
+        let ctx = self.deploy_context();
+        if let Err(e) = deployer::teardown_preview(job, &ctx).await {
+            error!(%e, "preview teardown failed");
+            return HandleOutcome::Retain;
         }
-    }
-}
-
-/// Get a short-lived installation access token from GitHub.
-///
-/// GitHub Apps authenticate by:
-/// 1. Creating a JWT signed with the app's private key
-/// 2. Exchanging the JWT for an installation access token
-async fn get_installation_token(
-    state: &AppState,
-    event: &webhook::PullRequestEvent,
-) -> anyhow::Result<String> {
-    let installation_id = event
-        .installation
-        .as_ref()
-        .map(|i| i.id)
-        .ok_or_else(|| anyhow::anyhow!("webhook event missing installation id"))?;
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-
-    let header = base64_url_encode(&serde_json::to_vec(&serde_json::json!({
-        "alg": "RS256",
-        "typ": "JWT"
-    }))?);
-
-    let payload = base64_url_encode(&serde_json::to_vec(&serde_json::json!({
-        "iat": now - 60,
-        "exp": now + (10 * 60),
-        "iss": state.config.app_id
-    }))?);
-
-    let signing_input = format!("{header}.{payload}");
-
-    // Sign with RSA private key (shells out to openssl for MVP).
-    let mut child = tokio::process::Command::new("openssl")
-        .args(["dgst", "-sha256", "-sign"])
-        .arg(&state.config.app_key)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        stdin.write_all(signing_input.as_bytes()).await?;
-    }
-
-    let output = child.wait_with_output().await?;
-    anyhow::ensure!(output.status.success(), "openssl signing failed");
-
-    let signature = base64_url_encode(&output.stdout);
-    let jwt = format!("{signing_input}.{signature}");
-
-    // Exchange JWT for installation token.
-    let url = format!("https://api.github.com/app/installations/{installation_id}/access_tokens");
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .header("Authorization", format!("Bearer {jwt}"))
-        .header("User-Agent", "switchboard")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?;
-
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "failed to get installation token: {}",
-        resp.status()
-    );
-
-    let body: serde_json::Value = resp.json().await?;
-    body["token"]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| anyhow::anyhow!("installation token response missing 'token' field"))
-}
-
-/// Base64url encode (no padding) for JWT.
-fn base64_url_encode(input: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn base64url_encodes_without_padding() {
-        // "hello" is standard base64 "aGVsbG8=" — the JWT encoding must drop
-        // the '=' padding (a padded segment is not a valid JWS part).
-        assert_eq!(base64_url_encode(b"hello"), "aGVsbG8");
-        assert!(!base64_url_encode(b"hello").contains('='));
-        // Empty input is the empty string, not "=".
-        assert_eq!(base64_url_encode(b""), "");
-    }
-
-    #[test]
-    fn base64url_uses_url_safe_alphabet() {
-        // These bytes encode to "+/8" in the standard alphabet; the URL-safe
-        // JWT encoding must instead emit '-' and '_' and never '+' or '/',
-        // otherwise the token breaks when placed in an Authorization header.
-        let encoded = base64_url_encode(&[0xfb, 0xff]);
-        assert_eq!(encoded, "-_8");
-        assert!(!encoded.contains('+'));
-        assert!(!encoded.contains('/'));
-    }
-
-    #[test]
-    fn base64url_roundtrips_via_decode() {
-        use base64::Engine;
-        let original = b"the quick brown fox \x00\x01\xff";
-        let encoded = base64_url_encode(original);
-        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&encoded)
-            .expect("url-safe no-pad output must decode");
-        assert_eq!(decoded, original);
+        // Best-effort: mark the environment inactive.
+        if let Some(token) = self.mint_token(job).await {
+            let client = GitHubClient::new(token, &self.config.github_host);
+            let _ = client
+                .deactivate_environment(
+                    &job.repository.owner,
+                    &job.repository.name,
+                    job.pull_request.number,
+                )
+                .await;
+        }
+        HandleOutcome::Done
     }
 }
