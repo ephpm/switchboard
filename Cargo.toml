@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-description = "GitHub webhook handler for ePHPm preview deployments"
+description = "Preview-deployment daemon for ePHPm — consumes job files, kicks drain, provisions previews"
 
 [dependencies]
-# HTTP server (receives webhooks)
+# HTTP server (the legacy webhook receiver, off by default)
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 

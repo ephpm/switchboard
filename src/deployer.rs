@@ -16,7 +16,6 @@ use tokio::process::Command;
 
 use crate::manifest::AppManifest;
 use crate::secrets::Secrets;
-use crate::webhook::PullRequestEvent;
 
 /// Generated file (at the checkout/site root) that exports the resolved preview
 /// env into PHP via `putenv`/`$_ENV`/`$_SERVER`. Referenced as
@@ -53,6 +52,54 @@ impl Framework {
     }
 }
 
+/// Everything about *what* to provision, independent of where it came from.
+///
+/// A queue job ([`crate::job::Job::to_preview_request`]) and — while the
+/// legacy receiver is still compiled in — a webhook event both produce one of
+/// these, so the provisioning pipeline below has exactly one entry point.
+#[derive(Debug, Clone)]
+pub struct PreviewRequest {
+    /// **Authoritative preview identity.** Names the directory under
+    /// `sites_dir` and the leading DNS label of the preview host. Produced by
+    /// switchboard-api and never recomputed here.
+    pub label: String,
+    /// `owner/repo` of the base repository — the per-repo secret scope.
+    pub repo_full_name: String,
+    /// Base repository owner login.
+    pub owner: String,
+    /// Base repository name.
+    pub repo_name: String,
+    /// Pull request number.
+    pub pr_number: u64,
+    /// Where to fetch from. Always the **base** repo when `fetch_ref` is set.
+    pub fetch_url: String,
+    /// `refs/pull/<n>/head` when known — the fetch path that works for forks
+    /// and for deleted forks without trusting a third-party clone URL.
+    pub fetch_ref: Option<String>,
+    /// Head branch name, used only as a fallback when `fetch_ref` is absent.
+    pub branch: Option<String>,
+    /// Head commit SHA to check out.
+    pub sha: String,
+    /// GitHub App installation, when one is known. `None` disables reporting
+    /// for this preview.
+    pub installation_id: Option<u64>,
+}
+
+impl PreviewRequest {
+    /// The preview hostname: the authoritative label plus the configured
+    /// preview domain.
+    #[must_use]
+    pub fn preview_host(&self, domain: &str) -> String {
+        preview_host(&self.label, domain)
+    }
+}
+
+/// `<label>.<domain>` — the single place the preview host is assembled.
+#[must_use]
+pub fn preview_host(label: &str, domain: &str) -> String {
+    format!("{label}.{domain}")
+}
+
 /// Non-repo inputs to a deploy: switchboard config plus the secret store.
 pub struct DeployContext<'a> {
     /// ePHPm sites directory where previews are swapped into place.
@@ -85,10 +132,10 @@ pub struct DeployResult {
     pub healthy: bool,
 }
 
-/// Deploy a preview for a pull request event.
+/// Deploy a preview.
 ///
 /// Pipeline order:
-/// 1. Clone the repo at the PR's head SHA.
+/// 1. Fetch the PR head (`refs/pull/<n>/head` from the base repo) at its SHA.
 /// 2. Detect the framework and load the `ephpm.yaml` manifest (or synthesize).
 /// 3. Run `build:` commands in the checkout, in order (failures logged, deploy
 ///    continues — matching the POC's composer behavior).
@@ -104,30 +151,30 @@ pub struct DeployResult {
 /// Returns an error if cloning, manifest loading (present-but-invalid), or the
 /// atomic swap fails.
 pub async fn deploy_preview(
-    event: &PullRequestEvent,
+    req: &PreviewRequest,
     ctx: &DeployContext<'_>,
 ) -> anyhow::Result<DeployResult> {
     let start = Instant::now();
-    let hostname = event.preview_host(ctx.preview_domain);
-    let site_dir = ctx.sites_dir.join(&hostname);
-    let clone_url = event.clone_url();
-    let branch = &event.pull_request.head.ref_name;
-    let sha = &event.pull_request.head.sha;
+    let hostname = req.preview_host(ctx.preview_domain);
+    // The **label** names the directory, not the hostname: ePHPm resolves a
+    // vhost by stripping its `sites_domain_suffix` from the Host header, and
+    // the remainder is the directory name under `sites_dir`.
+    let site_dir = ctx.sites_dir.join(&req.label);
 
     tracing::info!(
-        repo = %event.repository.full_name,
-        pr = event.number,
-        branch = %branch,
+        repo = %req.repo_full_name,
+        pr = req.pr_number,
+        label = %req.label,
         hostname = %hostname,
         "deploying preview"
     );
 
-    // (1) Clone to a temp directory first, then move into place.
+    // (1) Fetch into a staging directory first, then move into place.
     let tmp_dir = site_dir.with_extension("tmp");
     if tmp_dir.exists() {
         tokio::fs::remove_dir_all(&tmp_dir).await.ok();
     }
-    clone_checkout(clone_url, branch, sha, &tmp_dir).await?;
+    fetch_checkout(req, &tmp_dir).await?;
 
     // (2) Detect framework + load manifest.
     let framework = detect_framework(&tmp_dir).await;
@@ -153,7 +200,7 @@ pub async fn deploy_preview(
     // Reference the FINAL (post-swap) prepend path in the effective ini.
     let final_prepend = site_dir.join(PREPEND_FILE);
     materialize_env(
-        event,
+        &req.repo_full_name,
         &manifest,
         ctx.secrets,
         &tmp_dir,
@@ -181,7 +228,7 @@ pub async fn deploy_preview(
     // (6) Run seed: commands now that the site is live and its per-site DB can
     // be created on first access.
     let preview_url = preview_url(&hostname, Some(manifest.php.as_str()));
-    run_seed(&manifest, &site_dir, &preview_url, &hostname, event.number).await;
+    run_seed(&manifest, &site_dir, &preview_url, &hostname, req.pr_number).await;
 
     // (7) Health-gate: only report ready once the site serves a 200.
     let healthy = wait_healthy(&preview_url, &manifest.health, ctx).await;
@@ -204,28 +251,80 @@ pub async fn deploy_preview(
     })
 }
 
-/// Clone `clone_url` at `sha` into `dest`. Tries a shallow branch clone first,
-/// then falls back to a full clone + checkout (handles force pushes).
-async fn clone_checkout(
-    clone_url: &str,
-    branch: &str,
-    sha: &str,
-    dest: &Path,
-) -> anyhow::Result<()> {
-    let status = Command::new("git")
-        .args(["clone", "--depth", "1", "--branch", branch, clone_url])
-        .arg(dest)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .status()
-        .await
-        .context("failed to run git clone")?;
+/// Materialize the PR head at `req.sha` into `dest`.
+///
+/// The preferred path is a shallow fetch of `refs/pull/<n>/head` from the
+/// **base** repository: it resolves the head commit of a fork PR without
+/// cloning the fork, and it still resolves after the fork is deleted. The exact
+/// SHA is requested first (GitHub serves reachable SHAs), so a force-push
+/// between the webhook and the deploy cannot silently swap the code out from
+/// under the recorded commit; only if that is refused do we fall back to the
+/// ref tip, and then loudly.
+///
+/// When no `fetch_ref` is known (the legacy webhook path) this degrades to a
+/// shallow branch clone.
+async fn fetch_checkout(req: &PreviewRequest, dest: &Path) -> anyhow::Result<()> {
+    let Some(pull_ref) = req.fetch_ref.as_deref() else {
+        return clone_branch(&req.fetch_url, req.branch.as_deref(), &req.sha, dest).await;
+    };
 
-    if status.success() {
+    tokio::fs::create_dir_all(dest)
+        .await
+        .with_context(|| format!("failed to create {}", dest.display()))?;
+    run_git(dest, &["init", "--quiet"]).await?;
+    run_git(dest, &["remote", "add", "origin", &req.fetch_url]).await?;
+
+    // Exact SHA first.
+    if run_git(dest, &["fetch", "--depth", "1", "origin", &req.sha])
+        .await
+        .is_ok()
+        && run_git(dest, &["checkout", "--quiet", "--detach", &req.sha])
+            .await
+            .is_ok()
+    {
         return Ok(());
     }
 
-    let _ = tokio::fs::remove_dir_all(dest).await;
+    // Fall back to the ref tip. This is the head of the PR *now*, which may be
+    // a newer commit than the job recorded — say so rather than pretend.
+    run_git(dest, &["fetch", "--depth", "1", "origin", pull_ref])
+        .await
+        .with_context(|| format!("failed to fetch {pull_ref} from {}", req.fetch_url))?;
+    run_git(dest, &["checkout", "--quiet", "--detach", "FETCH_HEAD"])
+        .await
+        .context("failed to check out FETCH_HEAD")?;
+    tracing::warn!(
+        label = %req.label,
+        sha = %req.sha,
+        %pull_ref,
+        "exact SHA unavailable — deployed the current tip of the pull ref instead"
+    );
+    Ok(())
+}
+
+/// Legacy path: shallow clone a branch, falling back to a full clone plus an
+/// explicit checkout when the branch has been force-pushed or renamed.
+async fn clone_branch(
+    clone_url: &str,
+    branch: Option<&str>,
+    sha: &str,
+    dest: &Path,
+) -> anyhow::Result<()> {
+    if let Some(branch) = branch {
+        let status = Command::new("git")
+            .args(["clone", "--depth", "1", "--branch", branch, clone_url])
+            .arg(dest)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .status()
+            .await
+            .context("failed to run git clone")?;
+        if status.success() {
+            return Ok(());
+        }
+        let _ = tokio::fs::remove_dir_all(dest).await;
+    }
+
     let status = Command::new("git")
         .args(["clone", "--depth", "1", clone_url])
         .arg(dest)
@@ -236,14 +335,20 @@ async fn clone_checkout(
         .context("git clone fallback failed")?;
     anyhow::ensure!(status.success(), "git clone failed for {clone_url}");
 
+    run_git(dest, &["checkout", "--quiet", "--detach", sha]).await
+}
+
+/// Run `git` in `dir`, erroring on a non-zero exit.
+async fn run_git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
     let status = Command::new("git")
-        .args(["checkout", sha])
-        .current_dir(dest)
+        .args(args)
+        .current_dir(dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .await?;
-    anyhow::ensure!(status.success(), "git checkout {sha} failed");
+        .await
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    anyhow::ensure!(status.success(), "git {} failed", args.join(" "));
     Ok(())
 }
 
@@ -306,14 +411,13 @@ async fn run_build(manifest: &AppManifest, checkout: &Path, composer: &str, host
 /// Laravel `env()`), plus a `.env` file when the docroot is not the project
 /// root. Also writes a non-secret sidecar exposing the effective manifest.
 async fn materialize_env(
-    event: &PullRequestEvent,
+    repo: &str,
     manifest: &AppManifest,
     secrets: &Secrets,
     checkout: &Path,
     final_prepend: &Path,
     websocket: bool,
 ) -> anyhow::Result<()> {
-    let repo = &event.repository.full_name;
     let mut resolved: BTreeMap<String, String> = BTreeMap::new();
     for (key, raw) in &manifest.env {
         let mut missing = Vec::new();
@@ -510,28 +614,32 @@ pub fn preview_url(hostname: &str, php_version: Option<&str>) -> String {
     }
 }
 
-/// Remove a preview deployment.
+/// Remove a preview deployment: `<sites_dir>/<label>/`.
+///
+/// Tearing down a preview that was never deployed is a success, not an error —
+/// GitHub sends `closed` for pull requests that never got one.
+///
+/// Removing the per-site database is deliberately **not** done here; the
+/// database lifecycle is ePHPm's and is out of scope for this pass.
 ///
 /// # Errors
 ///
-/// Returns an error if the directory cannot be removed.
-pub async fn teardown_preview(
-    event: &PullRequestEvent,
-    sites_dir: &Path,
-    preview_domain: &str,
-) -> anyhow::Result<()> {
-    let hostname = event.preview_host(preview_domain);
-    let site_dir = sites_dir.join(&hostname);
+/// Returns an error if the directory exists but cannot be removed.
+pub async fn teardown_preview(label: &str, sites_dir: &Path) -> anyhow::Result<()> {
+    let site_dir = sites_dir.join(label);
 
     if site_dir.exists() {
         tokio::fs::remove_dir_all(&site_dir)
             .await
             .context("failed to remove preview directory")?;
-        tracing::info!(%hostname, "preview torn down");
+        tracing::info!(%label, path = %site_dir.display(), "preview torn down");
     } else {
-        tracing::debug!(%hostname, "preview directory not found (already removed?)");
+        tracing::debug!(%label, "preview directory not found (already removed?)");
     }
 
+    // Stated rather than silently skipped: the preview's per-site database file
+    // under ePHPm's `[db.sqlite].dir` is left in place.
+    tracing::debug!(%label, "per-site database left in place (teardown out of scope)");
     Ok(())
 }
 
@@ -669,24 +777,31 @@ mod tests {
         .unwrap()
     }
 
-    fn make_event() -> PullRequestEvent {
-        serde_json::from_value(serde_json::json!({
-            "action": "opened",
-            "number": 7,
-            "pull_request": {
-                "head": {"ref": "feature", "sha": "deadbeef", "repo": null},
-                "base": {"ref": "main"},
-                "merged": false
-            },
-            "repository": {
-                "full_name": "ephpm/wordpress-sample",
-                "clone_url": "https://github.com/ephpm/wordpress-sample.git",
-                "name": "wordpress-sample",
-                "owner": {"login": "ephpm"}
-            },
-            "installation": null
-        }))
-        .unwrap()
+    fn make_request() -> PreviewRequest {
+        PreviewRequest {
+            label: "ephpm-wordpress-sample-pr-7".into(),
+            repo_full_name: "ephpm/wordpress-sample".into(),
+            owner: "ephpm".into(),
+            repo_name: "wordpress-sample".into(),
+            pr_number: 7,
+            fetch_url: "https://github.com/ephpm/wordpress-sample.git".into(),
+            fetch_ref: Some("refs/pull/7/head".into()),
+            branch: Some("feature".into()),
+            sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            installation_id: None,
+        }
+    }
+
+    #[test]
+    fn preview_host_is_label_plus_domain() {
+        // The label is authoritative and used verbatim — the daemon appends
+        // its configured domain and nothing else.
+        let req = make_request();
+        assert_eq!(
+            req.preview_host("preview.ephpm.dev"),
+            "ephpm-wordpress-sample-pr-7.preview.ephpm.dev"
+        );
+        assert_eq!(preview_host("some-label", "x.dev"), "some-label.x.dev");
     }
 
     #[tokio::test]
@@ -696,11 +811,11 @@ mod tests {
         let mut default = BTreeMap::new();
         default.insert("some_key".to_string(), "resolved-secret".to_string());
         let secrets = Secrets::from_maps(default, BTreeMap::new());
-        let event = make_event();
+        let req = make_request();
         let final_prepend = dir.path().join("site").join(PREPEND_FILE);
 
         materialize_env(
-            &event,
+            &req.repo_full_name,
             &manifest,
             &secrets,
             dir.path(),
@@ -741,10 +856,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manifest = AppManifest::from_yaml_str("version: 1\nenv:\n  K: \"v\"\n").unwrap();
         let secrets = Secrets::default();
-        let event = make_event();
+        let req = make_request();
         let final_prepend = dir.path().join(PREPEND_FILE);
         materialize_env(
-            &event,
+            &req.repo_full_name,
             &manifest,
             &secrets,
             dir.path(),
@@ -895,44 +1010,24 @@ mod tests {
 
     // ── teardown ────────────────────────────────────────────────────
 
-    fn teardown_event() -> PullRequestEvent {
-        serde_json::from_value(serde_json::json!({
-            "action": "closed",
-            "number": 7,
-            "pull_request": {
-                "head": {"ref": "feature", "sha": "deadbeef", "repo": null},
-                "base": {"ref": "main"},
-                "merged": true
-            },
-            "repository": {
-                "full_name": "ephpm/my-blog",
-                "clone_url": "https://github.com/ephpm/my-blog.git",
-                "name": "my-blog",
-                "owner": {"login": "ephpm"}
-            },
-            "installation": null
-        }))
-        .unwrap()
-    }
-
     #[tokio::test]
-    async fn teardown_removes_the_site_dir() {
+    async fn teardown_removes_the_site_dir_named_by_the_label() {
         let sites = tempfile::tempdir().unwrap();
-        let event = teardown_event();
-        let host = event.preview_host("preview.ephpm.dev");
-        let site_dir = sites.path().join(&host);
+        let label = "ephpm-my-blog-pr-7";
+        let site_dir = sites.path().join(label);
         tokio::fs::create_dir_all(site_dir.join("wp-content"))
             .await
             .unwrap();
-        assert!(site_dir.exists());
+        // A neighbouring preview must survive.
+        let other = sites.path().join("ephpm-my-blog-pr-8");
+        tokio::fs::create_dir_all(&other).await.unwrap();
 
-        teardown_preview(&event, sites.path(), "preview.ephpm.dev")
-            .await
-            .unwrap();
+        teardown_preview(label, sites.path()).await.unwrap();
         assert!(
             !site_dir.exists(),
             "teardown must remove the preview directory"
         );
+        assert!(other.exists(), "teardown must not touch other previews");
     }
 
     #[tokio::test]
@@ -941,8 +1036,7 @@ mod tests {
         // success, not an error — GitHub can send `closed` for a PR that never
         // deployed.
         let sites = tempfile::tempdir().unwrap();
-        let event = teardown_event();
-        teardown_preview(&event, sites.path(), "preview.ephpm.dev")
+        teardown_preview("ephpm-my-blog-pr-7", sites.path())
             .await
             .expect("absent preview teardown must succeed");
     }

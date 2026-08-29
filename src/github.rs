@@ -4,8 +4,7 @@ use anyhow::Context;
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde_json::json;
 
-use crate::deployer::DeployResult;
-use crate::webhook::PullRequestEvent;
+use crate::deployer::{DeployResult, PreviewRequest};
 
 /// GitHub API client for posting comments and deployment statuses.
 pub struct GitHubClient {
@@ -27,14 +26,18 @@ impl GitHubClient {
     /// Post a preview deployment comment on the PR.
     ///
     /// If a switchboard comment already exists, updates it instead of creating a new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GitHub API calls fail.
     pub async fn post_preview_comment(
         &self,
-        event: &PullRequestEvent,
+        req: &PreviewRequest,
         result: &DeployResult,
     ) -> anyhow::Result<()> {
-        let owner = &event.repository.owner.login;
-        let repo = &event.repository.name;
-        let pr_number = event.number;
+        let owner = &req.owner;
+        let repo = &req.repo_name;
+        let pr_number = req.pr_number;
 
         let body = format_deploy_comment(result);
 
@@ -49,10 +52,14 @@ impl GitHubClient {
     }
 
     /// Update the PR comment to show the preview was removed.
-    pub async fn post_teardown_comment(&self, event: &PullRequestEvent) -> anyhow::Result<()> {
-        let owner = &event.repository.owner.login;
-        let repo = &event.repository.name;
-        let pr_number = event.number;
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GitHub API calls fail.
+    pub async fn post_teardown_comment(&self, req: &PreviewRequest) -> anyhow::Result<()> {
+        let owner = &req.owner;
+        let repo = &req.repo_name;
+        let pr_number = req.pr_number;
 
         if let Some(comment_id) = self.find_existing_comment(owner, repo, pr_number).await? {
             self.update_comment(owner, repo, comment_id, teardown_comment_body())
@@ -63,16 +70,22 @@ impl GitHubClient {
     }
 
     /// Set the commit deployment status (creates the "Environments" UI in GitHub).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GitHub API calls fail.
     pub async fn create_deployment_status(
         &self,
-        event: &PullRequestEvent,
+        req: &PreviewRequest,
         result: &DeployResult,
     ) -> anyhow::Result<()> {
-        let owner = &event.repository.owner.login;
-        let repo = &event.repository.name;
-        let sha = &event.pull_request.head.sha;
+        let owner = &req.owner;
+        let repo = &req.repo_name;
+        let sha = &req.sha;
 
-        let url = format!("https://{}", result.hostname);
+        // Same URL the PR comment shows, port map included — the two must not
+        // disagree about where the preview lives.
+        let url = crate::deployer::preview_url(&result.hostname, result.php_version.as_deref());
 
         // Create deployment.
         let deploy_url = format!("https://api.github.com/repos/{owner}/{repo}/deployments");
@@ -84,10 +97,10 @@ impl GitHubClient {
             .header(ACCEPT, "application/vnd.github+json")
             .json(&json!({
                 "ref": sha,
-                "environment": format!("preview-pr-{}", event.number),
+                "environment": format!("preview-pr-{}", req.pr_number),
                 "auto_merge": false,
                 "required_contexts": [],
-                "description": format!("ePHPm preview for PR #{}", event.number),
+                "description": format!("ePHPm preview for PR #{}", req.pr_number),
             }))
             .send()
             .await

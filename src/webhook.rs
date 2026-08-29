@@ -55,6 +55,9 @@ pub struct PullRequestHead {
     pub ref_name: String,
     /// SHA of the head commit.
     pub sha: String,
+    /// The head repository (absent for a deleted fork). See
+    /// [`PullRequestRepo::clone_url`] for why it is not a fetch source.
+    #[allow(dead_code)]
     pub repo: Option<PullRequestRepo>,
 }
 
@@ -67,6 +70,10 @@ pub struct PullRequestBase {
 
 #[derive(Debug, Deserialize)]
 pub struct PullRequestRepo {
+    /// The head repo's clone URL. Parsed for completeness but deliberately not
+    /// used as a fetch source: `refs/pull/<n>/head` on the base repo resolves
+    /// the same commit without trusting a fork.
+    #[allow(dead_code)]
     pub clone_url: String,
     #[allow(dead_code)]
     pub full_name: String,
@@ -91,35 +98,31 @@ pub struct Installation {
 }
 
 impl PullRequestEvent {
-    /// The clone URL for the PR's head (handles forks).
-    #[must_use]
-    pub fn clone_url(&self) -> &str {
-        self.pull_request
-            .head
-            .repo
-            .as_ref()
-            .map_or(&self.repository.clone_url, |r| &r.clone_url)
-    }
-
-    /// Generate the preview hostname for this PR.
+    /// Build the provisioning request for this event.
     ///
-    /// The host is a **single DNS label** of the form `<owner>-<repo>-pr-<N>`
-    /// followed by `.{domain}`. Keeping the identity in one label means a
-    /// wildcard certificate for `*.{domain}` covers every preview host, so no
-    /// per-host certificate issuance is required at the edge.
-    ///
-    /// The label is normalized to be DNS-safe (see [`preview_label`]). When
-    /// normalization alters the raw identity, or the label would exceed the
-    /// 63-character DNS label limit, a short hash of the exact `owner/repo#N`
-    /// identity is appended so distinct PRs can never collide onto one host.
+    /// The label is computed here only because this legacy path has no job
+    /// file to read it from; the rules are the same ones switchboard-api ports
+    /// (see [`preview_label`]), so both producers agree.
     #[must_use]
-    pub fn preview_host(&self, domain: &str) -> String {
-        let label = preview_label(
-            &self.repository.owner.login,
-            &self.repository.name,
-            self.number,
-        );
-        format!("{label}.{domain}")
+    pub fn to_preview_request(&self) -> crate::deployer::PreviewRequest {
+        crate::deployer::PreviewRequest {
+            label: preview_label(
+                &self.repository.owner.login,
+                &self.repository.name,
+                self.number,
+            ),
+            repo_full_name: self.repository.full_name.clone(),
+            owner: self.repository.owner.login.clone(),
+            repo_name: self.repository.name.clone(),
+            pr_number: self.number,
+            // Base repo + refs/pull/<n>/head: one fetch strategy for both the
+            // queue path and this one.
+            fetch_url: self.repository.clone_url.clone(),
+            fetch_ref: Some(format!("refs/pull/{}/head", self.number)),
+            branch: Some(self.pull_request.head.ref_name.clone()),
+            sha: self.pull_request.head.sha.clone(),
+            installation_id: self.installation.as_ref().map(|i| i.id),
+        }
     }
 
     /// Whether this is an event we should deploy on.
@@ -229,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_host_format() {
+    fn event_converts_to_a_preview_request() {
         let event = PullRequestEvent {
             action: "opened".into(),
             number: 42,
@@ -255,10 +258,17 @@ mod tests {
             installation: None,
         };
 
+        let req = event.to_preview_request();
+        assert_eq!(req.label, "ephpm-my-blog-pr-42");
         assert_eq!(
-            event.preview_host("preview.ephpm.dev"),
+            req.preview_host("preview.ephpm.dev"),
             "ephpm-my-blog-pr-42.preview.ephpm.dev"
         );
+        // Fetch is always base repo + refs/pull/<n>/head, never the head repo.
+        assert_eq!(req.fetch_url, "https://github.com/ephpm/my-blog.git");
+        assert_eq!(req.fetch_ref.as_deref(), Some("refs/pull/42/head"));
+        assert_eq!(req.sha, "abc123");
+        assert_eq!(req.pr_number, 42);
     }
 
     #[test]
