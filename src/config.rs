@@ -90,45 +90,6 @@ pub struct Config {
     #[arg(long, env = "SWITCHBOARD_APP_ID")]
     pub app_id: Option<u64>,
 
-    // ── cluster coordination (KV) ──────────────────────────────────────
-    /// `host:port` of ePHPm's RESP listener (`[kv.redis_compat] listen`).
-    ///
-    /// Setting this **enables exactly-once coordination**: every node in the
-    /// cluster deploys the same preview, but only the one that wins an atomic
-    /// `SET … NX` claim in the replicated KV posts the PR comment and creates
-    /// the deployment status. Omit it for a single-node deployment, where the
-    /// daemon reports directly (there is no one to race).
-    #[arg(long, env = "SWITCHBOARD_KV_ADDR")]
-    pub kv_addr: Option<String>,
-
-    /// RESP AUTH username — ePHPm's per-site scoping uses the vhost host here,
-    /// which for switchboard is the `switchboard-api` host (the same value as
-    /// `--drain-host`). With it, the daemon's claim keys land in exactly the
-    /// gossip-replicated keyspace `switchboard-api` already writes to. Omit to
-    /// use the one-argument `AUTH <password>` (`requirepass`) form.
-    #[arg(long, env = "SWITCHBOARD_KV_AUTH_USER")]
-    pub kv_auth_user: Option<String>,
-
-    /// File holding ePHPm's `[kv] secret`. The daemon derives the per-site RESP
-    /// password as `HMAC-SHA256(secret, --kv-auth-user)` — the same derivation
-    /// ePHPm uses — so the operator never has to precompute it. Requires
-    /// `--kv-auth-user`. Mutually exclusive with `--kv-password-file`.
-    #[arg(long, env = "SWITCHBOARD_KV_SECRET_FILE")]
-    pub kv_secret_file: Option<PathBuf>,
-
-    /// File holding a literal RESP password — either a `requirepass` value or an
-    /// already-derived per-site password. Mutually exclusive with
-    /// `--kv-secret-file`.
-    #[arg(long, env = "SWITCHBOARD_KV_PASSWORD_FILE")]
-    pub kv_password_file: Option<PathBuf>,
-
-    /// TTL (seconds) stamped on each exactly-once claim key. Bounds key
-    /// accumulation in the KV and lets a claim left by a crashed node be re-won
-    /// later. The default is generous — a claim only needs to outlive the
-    /// slowest node's deploy of one generation.
-    #[arg(long, default_value_t = 21_600, env = "SWITCHBOARD_KV_CLAIM_TTL_SECS")]
-    pub kv_claim_ttl_secs: u64,
-
     // ── legacy webhook receiver (off by default) ───────────────────────
     /// Run the legacy in-process webhook receiver.
     ///
@@ -168,14 +129,6 @@ impl Config {
         self.app_id.is_some() && self.app_key.is_some()
     }
 
-    /// Whether cluster-wide exactly-once coordination is enabled. Keyed on the
-    /// KV address alone: with it, a claim gates every report; without it, the
-    /// daemon reports directly (single-node, nothing to race).
-    #[must_use]
-    pub fn coordination_enabled(&self) -> bool {
-        self.kv_addr.is_some()
-    }
-
     /// Check the combinations clap cannot express.
     ///
     /// # Errors
@@ -206,26 +159,6 @@ impl Config {
             self.app_id.is_some() == self.app_key.is_some(),
             "--app-id and --app-key must be given together (or both omitted to \
              run without GitHub reporting)"
-        );
-        // KV coordination: the two password sources are mutually exclusive, an
-        // auth credential is meaningless without an address to send it to, and
-        // the secret-file derivation needs a username to derive against.
-        anyhow::ensure!(
-            !(self.kv_secret_file.is_some() && self.kv_password_file.is_some()),
-            "--kv-secret-file and --kv-password-file are mutually exclusive"
-        );
-        if self.kv_addr.is_none() {
-            anyhow::ensure!(
-                self.kv_auth_user.is_none()
-                    && self.kv_secret_file.is_none()
-                    && self.kv_password_file.is_none(),
-                "--kv-auth-user / --kv-secret-file / --kv-password-file need \
-                 --kv-addr (the RESP listener to authenticate to)"
-            );
-        }
-        anyhow::ensure!(
-            self.kv_secret_file.is_none() || self.kv_auth_user.is_some(),
-            "--kv-secret-file needs --kv-auth-user to derive the per-site password"
         );
         Ok(())
     }
@@ -359,69 +292,6 @@ mod tests {
         full.validate().unwrap();
         assert!(full.github_reporting_enabled());
         assert_eq!(full.app_id, Some(12345));
-    }
-
-    #[test]
-    fn coordination_is_off_without_a_kv_addr() {
-        let c = parse_single_node(&[]);
-        assert!(
-            !c.coordination_enabled(),
-            "no --kv-addr must mean single-node direct reporting"
-        );
-        assert_eq!(c.kv_claim_ttl_secs, 21_600, "the documented default TTL");
-        c.validate().unwrap();
-    }
-
-    #[test]
-    fn kv_addr_enables_coordination() {
-        let c = parse_single_node(&["--kv-addr", "127.0.0.1:6379"]);
-        assert!(c.coordination_enabled());
-        c.validate().unwrap();
-    }
-
-    #[test]
-    fn kv_auth_without_addr_is_rejected() {
-        // An AUTH credential with nowhere to send it is a misconfiguration, not
-        // a silent no-op.
-        let c = parse_single_node(&["--kv-secret-file", "/etc/ephpm/kv.secret"]);
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn kv_secret_file_requires_auth_user() {
-        let c = parse_single_node(&["--kv-addr", "127.0.0.1:6379", "--kv-secret-file", "/s"]);
-        let err = c
-            .validate()
-            .expect_err("secret file with no auth user must fail");
-        assert!(err.to_string().contains("--kv-auth-user"), "{err}");
-
-        let ok = parse_single_node(&[
-            "--kv-addr",
-            "127.0.0.1:6379",
-            "--kv-auth-user",
-            "switchboard.ephpm.dev",
-            "--kv-secret-file",
-            "/etc/ephpm/kv.secret",
-        ]);
-        ok.validate().unwrap();
-    }
-
-    #[test]
-    fn kv_secret_and_password_files_are_mutually_exclusive() {
-        let c = parse_single_node(&[
-            "--kv-addr",
-            "127.0.0.1:6379",
-            "--kv-auth-user",
-            "h",
-            "--kv-secret-file",
-            "/a",
-            "--kv-password-file",
-            "/b",
-        ]);
-        assert!(
-            c.validate().is_err(),
-            "two password sources must not both be set"
-        );
     }
 
     #[test]
