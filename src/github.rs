@@ -6,6 +6,14 @@ use serde_json::json;
 
 use crate::deployer::{DeployResult, PreviewRequest};
 
+/// Hidden HTML marker carried by every switchboard comment. It renders as
+/// nothing on GitHub but is what [`GitHubClient::find_existing_comment`] matches
+/// on to decide update-vs-create — so the sticky comment is found by an
+/// invisible, stable token rather than by user-visible prose that could be
+/// reworded. The visible `**ePHPm Preview**` header is matched too, as a
+/// fallback for comments posted before this marker existed.
+const COMMENT_MARKER: &str = "<!-- switchboard-preview -->";
+
 /// GitHub API client for posting comments and deployment statuses.
 pub struct GitHubClient {
     client: reqwest::Client,
@@ -62,7 +70,7 @@ impl GitHubClient {
         let pr_number = req.pr_number;
 
         if let Some(comment_id) = self.find_existing_comment(owner, repo, pr_number).await? {
-            self.update_comment(owner, repo, comment_id, teardown_comment_body())
+            self.update_comment(owner, repo, comment_id, &teardown_comment_body())
                 .await?;
         }
 
@@ -164,7 +172,7 @@ impl GitHubClient {
         let comments: Vec<serde_json::Value> = resp.json().await?;
         for comment in comments {
             let body = comment["body"].as_str().unwrap_or("");
-            if body.contains("**ePHPm Preview**") {
+            if is_switchboard_comment(body) {
                 if let Some(id) = comment["id"].as_u64() {
                     return Ok(Some(id));
                 }
@@ -217,13 +225,22 @@ impl GitHubClient {
     }
 }
 
+/// Whether a comment body is one of ours: the hidden marker (current) or the
+/// visible header (comments posted before the marker was introduced).
+fn is_switchboard_comment(body: &str) -> bool {
+    body.contains(COMMENT_MARKER) || body.contains("**ePHPm Preview**")
+}
+
 /// The PR comment body posted when a preview is torn down. Kept as its own
 /// pure function (rather than inlined in the async network path) so the exact
-/// rendered markdown is unit-testable and still carries the `**ePHPm Preview**`
-/// marker that [`GitHubClient::find_existing_comment`] matches on.
-fn teardown_comment_body() -> &'static str {
-    "**ePHPm Preview** — removed\n\n\
-     Preview deployment has been torn down."
+/// rendered markdown is unit-testable and still carries the hidden
+/// [`COMMENT_MARKER`] that [`GitHubClient::find_existing_comment`] matches on.
+fn teardown_comment_body() -> String {
+    format!(
+        "{COMMENT_MARKER}\n\
+         **ePHPm Preview** — removed\n\n\
+         Preview deployment has been torn down."
+    )
 }
 
 /// Format the PR comment body for a successful deploy.
@@ -237,7 +254,8 @@ fn format_deploy_comment(result: &DeployResult) -> String {
     };
 
     format!(
-        "**ePHPm Preview** — {status}\n\n\
+        "{COMMENT_MARKER}\n\
+         **ePHPm Preview** — {status}\n\n\
          | | |\n\
          |---|---|\n\
          | URL | {url} |\n\
@@ -305,6 +323,11 @@ mod tests {
             healthy: true,
         };
         let comment = format_deploy_comment(&result);
+        assert!(
+            comment.contains(COMMENT_MARKER),
+            "hidden marker must be present"
+        );
+        assert!(is_switchboard_comment(&comment));
         assert!(comment.contains("**ePHPm Preview**"));
         assert!(comment.contains("| URL |"));
         assert!(comment.contains("| Framework |"));
@@ -337,8 +360,26 @@ mod tests {
         let body = teardown_comment_body();
         // Must keep the marker so the existing comment is found and updated in
         // place rather than a fresh "removed" comment being appended.
+        assert!(
+            body.contains(COMMENT_MARKER),
+            "hidden marker must be present"
+        );
+        assert!(is_switchboard_comment(&body));
         assert!(body.contains("**ePHPm Preview**"));
         assert!(body.contains("removed"));
         assert!(body.contains("torn down"));
+    }
+
+    #[test]
+    fn find_matches_hidden_marker_and_legacy_header() {
+        // Current comments carry the hidden marker.
+        assert!(is_switchboard_comment(
+            "<!-- switchboard-preview -->\nanything at all"
+        ));
+        // A pre-marker comment is still recognised by its visible header so the
+        // first post-upgrade deploy updates it in place instead of duplicating.
+        assert!(is_switchboard_comment("**ePHPm Preview** — ready"));
+        // An unrelated comment is not ours.
+        assert!(!is_switchboard_comment("LGTM, merging"));
     }
 }
