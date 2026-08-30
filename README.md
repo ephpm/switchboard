@@ -94,36 +94,18 @@ startup logs one `INFO` line and every deploy proceeds normally — it is just n
 reported on the pull request. This is what the e2e cluster, which has no App
 installed, runs with.
 
-#### Exactly-once across the cluster
+**Deduplication is the hidden marker, not coordination.** Every node reconciles
+the same preview and every node reports, but before creating a comment the
+daemon lists the PR's comments and looks for the hidden
+`<!-- switchboard-preview -->` marker; if it finds one it *updates that comment
+in place*. So N nodes converge on a single comment, and a later push refreshes
+it rather than appending. This needs no shared state and no KV listener — the
+operator keeps ePHPm's RESP listener (`[kv.redis_compat]`) off.
 
-In a NodeBalancer-fronted cluster a webhook lands on one node, but
-switchboard-api publishes desired state into ePHPm's **gossip-replicated** KV
-and every node's `/drain` turns that back into its own queue — so **every node
-deploys the same preview**. That is what we want (the preview survives any one
-node dying), but it means every node would also post the PR comment. Three
-nodes, three duplicate comments.
-
-The fix is a cluster-wide claim: before reporting, a node does an atomic
-`SET switchboard:pr-comment:<owner>/<repo>:<pr>:<sha> <node> NX EX <ttl>`
-against ePHPm's RESP listener — the same replicated store, and the same
-`set_nx` primitive, that ePHPm's ACME-leader and SQLite-primary elections use.
-Only the node whose claim lands first posts; the rest see the key present and
-stay quiet. The claim is scoped to the head SHA, so a *new* push mints a *new*
-claim and the winner updates the sticky comment for that commit — an old claim
-never suppresses a real update. If the report then fails, the claim is released
-so another node can retry rather than the PR losing its comment for that commit.
-
-This is enabled by pointing the daemon at the KV with `--kv-addr` (see
-[Cluster coordination](#cluster-coordination)). **Without `--kv-addr` the daemon
-reports directly** — correct for a single node, where there is nothing to race.
-When coordination is on but the KV cannot be reached, a node steps back rather
-than post: a missed comment self-heals on the next push; a triplicate does not.
-
-Honest limit: `set_nx` is best-effort cluster-wide, not linearizable across a
-partition — two partitioned nodes can both win, the same residual race the ACME
-tie-break carries. The hidden-marker "find existing comment before creating" is
-the backstop: a second poster that can already see the first comment updates it
-instead of duplicating.
+Honest limit: the find-then-create is not atomic across nodes, so two nodes that
+both list *before* either has created can momentarily post two comments. It is a
+sub-second window and self-heals — the next push finds one of them by its marker
+and updates it, converging back to one.
 
 ## Configuration
 
@@ -174,24 +156,9 @@ Secrets can also come from `SWITCHBOARD_SECRET_<NAME>` environment variables
 Omit **both** to run without reporting. Supplying exactly one is a startup
 error: a half-configured App would silently never report.
 
-### Cluster coordination
-
-Needed only when more than one node reports the same preview. Enabled by
-`--kv-addr`; without it the daemon reports directly (single node).
-
-| Flag | Env | Default | Meaning |
-|---|---|---|---|
-| `--kv-addr` | `SWITCHBOARD_KV_ADDR` | *(none)* | `host:port` of ePHPm's RESP listener (`[kv.redis_compat] listen`). **Setting it enables exactly-once reporting.** |
-| `--kv-auth-user` | `SWITCHBOARD_KV_AUTH_USER` | *(none)* | RESP AUTH username for ePHPm's per-site scoping — the switchboard-api vhost host (usually the same value as `--drain-host`). Omit for the one-argument `requirepass` form. |
-| `--kv-secret-file` | `SWITCHBOARD_KV_SECRET_FILE` | *(none)* | File holding ePHPm's `[kv] secret`; the daemon derives the per-site password as `HMAC-SHA256(secret, --kv-auth-user)`. Requires `--kv-auth-user`. |
-| `--kv-password-file` | `SWITCHBOARD_KV_PASSWORD_FILE` | *(none)* | File holding a literal RESP password. Mutually exclusive with `--kv-secret-file`. |
-| `--kv-claim-ttl-secs` | `SWITCHBOARD_KV_CLAIM_TTL_SECS` | `21600` | TTL on each claim key — bounds key accumulation and lets a crashed node's claim be re-won. |
-
-The credential is read from a **file** (never a flag or env value) so it stays
-out of process listings and logs. For a multi-tenant preview cluster (which is
-the norm — previews use `sites_dir`), ePHPm's RESP listener requires per-site
-AUTH, so the usual setup is `--kv-auth-user <switchboard-api host>` plus
-`--kv-secret-file` pointing at the same `[kv] secret` ePHPm is configured with.
+Comments are deduplicated cluster-wide by the hidden marker (see
+[Report to GitHub](#3-report-to-github)); no shared state or KV listener is
+involved.
 
 ### Legacy webhook receiver
 
@@ -211,14 +178,11 @@ switchboard \
   --drain-host switchboard.ephpm.dev \
   --drain-token-file /var/www/sites/switchboard/.switchboard/drain_secret \
   --app-id 123456 \
-  --app-key /etc/switchboard/app.pem \
-  --kv-addr 127.0.0.1:6379 \
-  --kv-auth-user switchboard.ephpm.dev \
-  --kv-secret-file /etc/ephpm/secrets/kv.secret
+  --app-key /etc/switchboard/app.pem
 ```
 
-The three `--kv-*` flags are what make a multi-node cluster post one comment
-instead of one per node; drop them for a single node.
+The same invocation runs on every node in a cluster; the PR comment is
+deduplicated by its hidden marker, so all nodes converge on one comment.
 
 Single node, no GitHub App:
 
@@ -254,6 +218,5 @@ pinned to the crate's MSRV on the ephpm org's self-hosted fleet.
 | `src/deployer.rs` | The provisioning pipeline: fetch → manifest → build → env → atomic swap → seed → health |
 | `src/manifest.rs` | The `ephpm.yaml` app manifest schema |
 | `src/secrets.rs` | `${secret.NAME}` resolution from switchboard's own store |
-| `src/github.rs` | PR comments and Deployment statuses |
-| `src/coordinator.rs` | Cluster-wide exactly-once claim (`SET … NX`) over ePHPm's replicated KV, so only one node reports each preview |
+| `src/github.rs` | PR comments and Deployment statuses (sticky via the hidden marker) |
 | `src/webhook.rs` | Signature verification and payload types for the legacy receiver |

@@ -17,7 +17,6 @@
 //! (`--webhook-server-enabled`).
 
 mod config;
-mod coordinator;
 mod deployer;
 mod drain;
 mod github;
@@ -40,8 +39,7 @@ use clap::Parser;
 use tracing::info;
 
 use config::Config;
-use coordinator::Coordinator;
-use deployer::{DeployResult, PreviewRequest};
+use deployer::PreviewRequest;
 use drain::DrainKicker;
 use job::Intent;
 use queue::{ClaimedJob, Queue};
@@ -51,9 +49,6 @@ use secrets::Secrets;
 struct AppState {
     config: Config,
     secrets: Secrets,
-    /// Cluster-wide exactly-once gate for GitHub reporting. `None` in
-    /// single-node mode (no `--kv-addr`), where the daemon reports directly.
-    coordinator: Option<Coordinator>,
 }
 
 #[tokio::main]
@@ -105,28 +100,6 @@ async fn main() -> anyhow::Result<()> {
     // Load switchboard's own secret store (file + SWITCHBOARD_SECRET_* env).
     let secrets = Secrets::load(config.secrets_file.as_deref())?;
 
-    // Build the cluster-wide exactly-once coordinator. Every node deploys the
-    // same preview; without this, every node would also post the PR comment.
-    let coordinator = coordinator::build(
-        config.kv_addr.as_deref(),
-        config.kv_auth_user.as_deref(),
-        config.kv_secret_file.as_deref(),
-        config.kv_password_file.as_deref(),
-        Duration::from_secs(config.kv_claim_ttl_secs),
-    )?;
-    if config.coordination_enabled() {
-        info!(
-            kv = config.kv_addr.as_deref().unwrap_or_default(),
-            per_site_auth = config.kv_auth_user.is_some(),
-            "exactly-once reporting enabled — only one node per cluster will post each comment"
-        );
-    } else {
-        info!(
-            "single-node reporting — no --kv-addr, so this node reports directly \
-             (enable KV coordination before running more than one node)"
-        );
-    }
-
     // Build the drain kicker before anything else runs: a missing token file
     // should fail at startup, not silently warn every two seconds forever.
     let kicker = if config.drain_enabled() {
@@ -156,11 +129,7 @@ async fn main() -> anyhow::Result<()> {
     let webhook_server_enabled = config.webhook_server_enabled;
     let listen = config.listen.clone();
 
-    let state = Arc::new(AppState {
-        config,
-        secrets,
-        coordinator,
-    });
+    let state = Arc::new(AppState { config, secrets });
 
     if let Some(kicker) = kicker {
         tokio::spawn(drain_loop(kicker, drain_interval));
@@ -304,90 +273,19 @@ async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result
     let result = deployer::deploy_preview(req, &ctx).await?;
 
     // Reporting is best-effort: the preview is live either way, and a GitHub
-    // outage must not mark a good deploy as failed.
+    // outage must not mark a good deploy as failed. Every node reconciles the
+    // same preview and reports, but the comment is deduplicated by its hidden
+    // marker: `post_preview_comment` finds an existing switchboard comment and
+    // updates it in place, so N nodes converge on one comment.
     if let Some(client) = github_client(state, req).await {
-        report_deploy(state, req, &client, &result).await;
+        if let Err(e) = client.post_preview_comment(req, &result).await {
+            tracing::error!(%e, "failed to post PR comment");
+        }
+        if let Err(e) = client.create_deployment_status(req, &result).await {
+            tracing::error!(%e, "failed to set deployment status");
+        }
     }
     Ok(())
-}
-
-/// Post the deploy report on the PR — but only from the one node that wins the
-/// cluster-wide claim, so three reconciling nodes produce one comment, not
-/// three.
-///
-/// The claim is scoped to the head SHA, so a new push mints a fresh claim and
-/// the winner updates the sticky comment for the new commit; an old claim never
-/// suppresses a real update. If the report then fails, the claim is released so
-/// another node's reconcile of the same commit can retry rather than the PR
-/// silently losing its comment for that generation.
-async fn report_deploy(
-    state: &AppState,
-    req: &PreviewRequest,
-    client: &github::GitHubClient,
-    result: &DeployResult,
-) {
-    let key = coordinator::deploy_claim_key(&req.owner, &req.repo_name, req.pr_number, &req.sha);
-    if !claim_report(state, &key, req).await {
-        return;
-    }
-
-    let mut failed = false;
-    if let Err(e) = client.post_preview_comment(req, result).await {
-        tracing::error!(%e, "failed to post PR comment");
-        failed = true;
-    }
-    if let Err(e) = client.create_deployment_status(req, result).await {
-        tracing::error!(%e, "failed to set deployment status");
-        failed = true;
-    }
-
-    if failed {
-        release_claim(state, &key).await;
-    }
-}
-
-/// Decide whether this node should perform the guarded report for `key`.
-///
-/// `true` in single-node mode (no coordinator) or when this node wins the
-/// atomic claim. `false` when another node already holds it. On a KV error the
-/// node steps back (`false`): favouring "no duplicate comment" over "posted
-/// despite an unknown cluster state" — a missed comment self-heals on the next
-/// push, a triplicate does not.
-async fn claim_report(state: &AppState, key: &str, req: &PreviewRequest) -> bool {
-    let Some(coordinator) = state.coordinator.as_ref() else {
-        return true; // single node — nothing to race
-    };
-    match coordinator.try_claim(key).await {
-        Ok(true) => {
-            tracing::debug!(label = %req.label, %key, "won the report claim — posting");
-            true
-        }
-        Ok(false) => {
-            tracing::info!(
-                label = %req.label,
-                pr = req.pr_number,
-                "another node is reporting this preview — skipping to avoid a duplicate comment"
-            );
-            false
-        }
-        Err(e) => {
-            tracing::warn!(
-                %e,
-                label = %req.label,
-                "could not reach the KV to claim the report — skipping to stay duplicate-safe"
-            );
-            false
-        }
-    }
-}
-
-/// Release a report claim after the report it guarded failed. Best-effort.
-async fn release_claim(state: &AppState, key: &str) {
-    if let Some(coordinator) = state.coordinator.as_ref() {
-        if let Err(e) = coordinator.release(key).await {
-            tracing::warn!(%e, %key, "failed to release the report claim after a failed report");
-        }
-    }
 }
 
 /// Tear down a preview and update the PR comment.
@@ -395,12 +293,8 @@ async fn handle_teardown(state: &AppState, req: &PreviewRequest) -> anyhow::Resu
     deployer::teardown_preview(&req.label, &state.config.sites_dir).await?;
 
     if let Some(client) = github_client(state, req).await {
-        let key = coordinator::teardown_claim_key(&req.owner, &req.repo_name, req.pr_number);
-        if claim_report(state, &key, req).await {
-            if let Err(e) = client.post_teardown_comment(req).await {
-                tracing::error!(%e, "failed to update PR comment on teardown");
-                release_claim(state, &key).await;
-            }
+        if let Err(e) = client.post_teardown_comment(req).await {
+            tracing::error!(%e, "failed to update PR comment on teardown");
         }
     }
     Ok(())
