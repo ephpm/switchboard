@@ -80,6 +80,23 @@ pub struct Config {
     #[arg(long, default_value_t = 2, env = "SWITCHBOARD_HEALTH_INTERVAL_SECS")]
     pub health_interval_secs: u64,
 
+    // ── fork policy ────────────────────────────────────────────────────
+    /// Deploy pull requests from forks. Off by default: a fork PR is untrusted
+    /// code, and this daemon is the process that actually builds it. This is a
+    /// second gate under switchboard-api's `SWITCHBOARD_ALLOW_FORKS` — the API
+    /// refusing to *queue* fork deploys does not substitute for the daemon
+    /// refusing to *run* them. Fork teardowns are always processed.
+    #[arg(long, default_value_t = false, env = "SWITCHBOARD_ALLOW_FORK_DEPLOY")]
+    pub allow_fork_deploy: bool,
+
+    /// Resolve `${secret.NAME}` operator secrets into fork deploys. Off by
+    /// default even when `--allow-fork-deploy` is set: building untrusted code
+    /// and handing it the operator's secret store are two separate decisions.
+    /// Without this flag a fork deploy proceeds with every secret reference
+    /// expanding to the empty string.
+    #[arg(long, default_value_t = false, env = "SWITCHBOARD_FORK_SECRETS")]
+    pub fork_secrets: bool,
+
     // ── GitHub reporting (optional) ────────────────────────────────────
     /// GitHub App private key path (PEM file). Omit to run without GitHub
     /// reporting — deploys still happen, they are just not reported on the PR.
@@ -159,6 +176,13 @@ impl Config {
             self.app_id.is_some() == self.app_key.is_some(),
             "--app-id and --app-key must be given together (or both omitted to \
              run without GitHub reporting)"
+        );
+        // --fork-secrets only means something for a deploy that is allowed to
+        // run; on its own it is dead configuration that *reads* like a policy.
+        anyhow::ensure!(
+            !self.fork_secrets || self.allow_fork_deploy,
+            "--fork-secrets has no effect without --allow-fork-deploy — set \
+             both to build forks with operator secrets, or neither"
         );
         Ok(())
     }
@@ -292,6 +316,38 @@ mod tests {
         full.validate().unwrap();
         assert!(full.github_reporting_enabled());
         assert_eq!(full.app_id, Some(12345));
+    }
+
+    #[test]
+    fn fork_policy_defaults_to_deny_everything() {
+        let c = parse_single_node(&[]);
+        assert!(!c.allow_fork_deploy, "fork deploys must be opt-in");
+        assert!(!c.fork_secrets, "fork secrets must be opt-in");
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn fork_secrets_without_allow_fork_deploy_is_rejected() {
+        let c = parse_single_node(&["--fork-secrets"]);
+        assert!(
+            c.validate().is_err(),
+            "--fork-secrets alone is dead configuration that reads like policy"
+        );
+    }
+
+    #[test]
+    fn fork_flags_parse_together() {
+        let c = parse_single_node(&["--allow-fork-deploy", "--fork-secrets"]);
+        assert!(c.allow_fork_deploy);
+        assert!(c.fork_secrets);
+        c.validate().unwrap();
+
+        // Allowing the deploy without the secrets is the expected middle
+        // setting and must validate.
+        let c = parse_single_node(&["--allow-fork-deploy"]);
+        assert!(c.allow_fork_deploy);
+        assert!(!c.fork_secrets);
+        c.validate().unwrap();
     }
 
     #[test]

@@ -262,11 +262,34 @@ async fn process_job(state: &AppState, queue: &Queue, claimed: ClaimedJob) {
 
 /// Deploy a preview and report it on the PR.
 async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result<()> {
+    // The daemon-side fork gate. The API refusing to queue fork deploys is a
+    // different repo's policy; this process holds the secret store and builds
+    // the code, so it decides again. A refused fork deploy is a hard error —
+    // the job fails with the gate's message and stays in claimed/.
+    let fork_secrets_mode = deployer::fork_deploy_gate(
+        req.fork,
+        state.config.allow_fork_deploy,
+        state.config.fork_secrets,
+    )?;
+    let withheld = Secrets::default();
+    let secrets = match fork_secrets_mode {
+        deployer::ForkSecrets::Resolve => &state.secrets,
+        deployer::ForkSecrets::Withhold => {
+            tracing::warn!(
+                label = %req.label,
+                repo = %req.repo_full_name,
+                "fork deploy allowed but operator secrets are withheld — every \
+                 ${{secret.NAME}} expands to empty (set --fork-secrets to resolve them)"
+            );
+            &withheld
+        }
+    };
+
     let ctx = deployer::DeployContext {
         sites_dir: &state.config.sites_dir,
         preview_domain: &state.config.preview_domain,
         composer: &state.config.composer,
-        secrets: &state.secrets,
+        secrets,
         health_timeout: Duration::from_secs(state.config.health_timeout_secs),
         health_interval: Duration::from_secs(state.config.health_interval_secs),
     };
@@ -289,6 +312,9 @@ async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result
 }
 
 /// Tear down a preview and update the PR comment.
+///
+/// Deliberately not fork-gated: teardown resolves no secrets and removes
+/// data, and refusing fork teardowns would strand fork previews on disk.
 async fn handle_teardown(state: &AppState, req: &PreviewRequest) -> anyhow::Result<()> {
     deployer::teardown_preview(&req.label, &state.config.sites_dir).await?;
 

@@ -83,6 +83,9 @@ pub struct PreviewRequest {
     /// GitHub App installation, when one is known. `None` disables reporting
     /// for this preview.
     pub installation_id: Option<u64>,
+    /// True when the PR head comes from a fork (or the head repo is gone).
+    /// Gates deploys and secret resolution — see [`fork_deploy_gate`].
+    pub fork: bool,
 }
 
 impl PreviewRequest {
@@ -98,6 +101,58 @@ impl PreviewRequest {
 #[must_use]
 pub fn preview_host(label: &str, domain: &str) -> String {
     format!("{label}.{domain}")
+}
+
+/// What the fork gate decided about operator secrets for an allowed deploy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkSecrets {
+    /// Resolve `${secret.NAME}` from the operator's secret store as usual.
+    Resolve,
+    /// Deploy, but resolve against an **empty** store: every `${secret.NAME}`
+    /// expands to the empty string (with the usual name-only warning), so no
+    /// operator secret reaches the fork's environment.
+    Withhold,
+}
+
+/// The daemon-side fork gate: may this deploy run, and does it get secrets?
+///
+/// switchboard-api already refuses to *queue* fork deploys unless
+/// `SWITCHBOARD_ALLOW_FORKS=true`, but that is a single gate in a different
+/// repo — and the daemon is the process that actually holds the secret store,
+/// so it enforces its own policy regardless of what the API decided:
+///
+/// * fork + no `--allow-fork-deploy` → **hard error**, the job fails loudly;
+/// * fork + `--allow-fork-deploy` only → deploy, secrets withheld;
+/// * fork + both flags → deploy with secrets (the operator said so twice);
+/// * not a fork → deploy with secrets, no flags consulted.
+///
+/// This gate applies to **deploys only**. Teardowns never resolve secrets and
+/// are always processed — refusing them would strand fork previews on disk.
+///
+/// # Errors
+///
+/// Returns an error when the job is a fork deploy and `--allow-fork-deploy`
+/// is not set.
+pub fn fork_deploy_gate(
+    fork: bool,
+    allow_fork_deploy: bool,
+    fork_secrets: bool,
+) -> anyhow::Result<ForkSecrets> {
+    if !fork {
+        return Ok(ForkSecrets::Resolve);
+    }
+    anyhow::ensure!(
+        allow_fork_deploy,
+        "refusing to deploy a pull request from a fork: this daemon builds fork \
+         PRs only with --allow-fork-deploy (SWITCHBOARD_ALLOW_FORK_DEPLOY=true); \
+         note the API's SWITCHBOARD_ALLOW_FORKS gate is separate and does not \
+         imply this one"
+    );
+    if fork_secrets {
+        Ok(ForkSecrets::Resolve)
+    } else {
+        Ok(ForkSecrets::Withhold)
+    }
 }
 
 /// Non-repo inputs to a deploy: switchboard config plus the secret store.
@@ -789,7 +844,49 @@ mod tests {
             branch: Some("feature".into()),
             sha: "0123456789abcdef0123456789abcdef01234567".into(),
             installation_id: None,
+            fork: false,
         }
+    }
+
+    // ── the fork gate ───────────────────────────────────────────────
+
+    #[test]
+    fn non_fork_deploys_resolve_secrets_regardless_of_flags() {
+        for allow in [false, true] {
+            for secrets in [false, true] {
+                assert_eq!(
+                    fork_deploy_gate(false, allow, secrets).unwrap(),
+                    ForkSecrets::Resolve,
+                    "a same-repo PR must be unaffected by the fork flags"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fork_deploy_refused_without_the_flag() {
+        for secrets in [false, true] {
+            let err = fork_deploy_gate(true, false, secrets)
+                .expect_err("a fork deploy without --allow-fork-deploy must fail");
+            assert!(err.to_string().contains("--allow-fork-deploy"), "{err}");
+        }
+    }
+
+    #[test]
+    fn allowed_fork_deploy_withholds_secrets_by_default() {
+        assert_eq!(
+            fork_deploy_gate(true, true, false).unwrap(),
+            ForkSecrets::Withhold,
+            "allowing the build must not imply handing over the secret store"
+        );
+    }
+
+    #[test]
+    fn fork_secrets_flag_releases_the_store() {
+        assert_eq!(
+            fork_deploy_gate(true, true, true).unwrap(),
+            ForkSecrets::Resolve
+        );
     }
 
     #[test]
