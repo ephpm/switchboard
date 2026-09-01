@@ -65,7 +65,7 @@ matter and forgiving about the rest:
 |---|---|---|---|
 | `version` | int | **required** | Only `1`. A missing or unknown version **fails the deploy** — a broken contract must not silently deploy the wrong thing. |
 | `php` | string | `"8.5"` | Selects which PHP instance serves you. `8.5` → `https://<host>`; older minors get a port: `8.4` → `:8084`, `8.3` → `:8083` (formula `8080 + minor`). A version that is not `8.<minor>` falls back to the default URL rather than emitting a bogus port. |
-| `docroot` | string | `"."` | Relative to the repo root. Today this affects the **`.env` heuristic**, the **WebSocket auto-detect path**, and the **working directory of `seed:` steps**. It does **not** yet change what the server treats as the web root — see [§5](#5-the-web-root-is-your-repo-root-today). |
+| `docroot` | string | `"."` | Relative to the repo root. Today this affects the **`.env` heuristic**, the **WebSocket auto-detect path**, and the **working directory of `seed:` steps**. Switchboard does **not** translate it into the web root the server serves — see [§5](#5-the-web-root-is-your-repo-root-today). |
 | `build` | list of strings | `[]` | Shell commands (`sh -c`) run in the checkout, in order, **before** the site goes live. A failing step is logged and the deploy **continues**. If `build` is empty and a `composer.json` exists, an implicit `composer install --no-dev --no-interaction --optimize-autoloader --quiet` runs instead. |
 | `services.database` | `"turso"` \| `false` | `"turso"` | `"turso"` (case-insensitive), `true`, `false`, or `"none"`. Any other string is a parse error naming the field. |
 | `services.kv` | bool | `true` | Requests the embedded KV store. |
@@ -144,9 +144,11 @@ $_ENV['DB_PASSWORD']      // undefined
 
 ### It is worse than "absent": it can be *wrong*
 
-`variables_order` is `EGPCS`, so `$_ENV` **is** populated — from the ePHPm
-process's real environment. If the host process happens to have a variable with
-a name you also expect (`DATABASE_URL` is a realistic collision), `getenv()`
+`variables_order` is `EGPCS` — that is PHP's own compiled-in default, which ePHPm
+does not override (an operator's `[php] ini_file` or `ini_overrides` could). So
+`$_ENV` **is** populated — from the ePHPm process's real environment. If the
+host process happens to have a variable with a name you also expect
+(`DATABASE_URL` is a realistic collision), `getenv()`
 returns that unrelated value instead of failing loudly. During verification the
 host process had an unrelated `DATABASE_URL` set, and `getenv('DATABASE_URL')`
 returned it while `$_SERVER['DATABASE_URL']` held the correct per-site DSN.
@@ -248,7 +250,7 @@ this a no-op in development and production. It is not web-reachable (403), so
 including it does not expose your secrets.
 
 *(A first-class fix belongs in switchboard/ePHPm rather than in every app — see
-[§10](#10-known-gaps-and-in-flight-work).)*
+[§11](#11-known-gaps-and-in-flight-work).)*
 
 ---
 
@@ -341,9 +343,20 @@ migrations, that is the thing most likely to fail first.
 
 **Verified, and this is the biggest sharp edge on the current host.**
 
-ePHPm serves the vhost directory — your whole checkout — as the document root.
-`docroot:` in the manifest is recorded and used by switchboard, but the server
-does not act on it yet.
+On a switchboard preview, ePHPm serves the vhost directory — your whole
+checkout — as the document root. `docroot:` in the manifest is recorded and used
+by switchboard, but nothing translates it into a served web root.
+
+To be precise about where the gap is, because it is not where you would guess:
+ePHPm *can* serve a per-site document root. It reads one from an **operator-owned
+override file** outside the tenant checkout (`[server] site_overrides_dir`, a
+`<site-key>.toml` carrying `document_root = "public"`). ePHPm deliberately never
+reads a document root from inside your repository — a tenant must not be able to
+re-point its own web root. What is missing is the switchboard half: nothing
+writes that override file from your `ephpm.yaml`'s `docroot:`
+([switchboard#3](https://github.com/ephpm/switchboard/issues/3)). So unless your
+operator has hand-written an override for your site, the effect below is what you
+get.
 
 Measured on a live preview whose repo root contained a Laravel-shaped tree:
 
@@ -376,8 +389,9 @@ Two consequences:
 
 - **WordPress and any app whose repo root *is* its web root**: nothing. This
   case works as-is, which is why it is the well-trodden path today.
-- **Laravel / Symfony / Drupal**: until the server-side fix lands
-  ([§10](#10-known-gaps-and-in-flight-work)), add a root front controller and
+- **Laravel / Symfony / Drupal**: unless your operator has hand-written a
+  per-site document-root override for you
+  ([§11](#11-known-gaps-and-in-flight-work)), add a root front controller and
   keep sensitive files out of the checkout:
 
   ```php
@@ -447,6 +461,21 @@ opcache_get_configuration, opcache_is_script_cached
 Still callable, and **verified** so: `putenv`, `stream_socket_client`,
 `curl_init`, `symlink`, `link`.
 
+That is one host's `disable_functions`, not a fixed contract — two subsets of it
+are conditional, so read the value back rather than assuming:
+
+- **`fsockopen`** is disabled by default but is deliberately *restored* when the
+  operator sets `network_egress_externally_managed = true` (i.e. egress is
+  policed outside PHP). `pfsockopen` stays disabled either way.
+- **`opcache_invalidate`, `opcache_get_status`, `opcache_get_configuration`,
+  `opcache_is_script_cached`** are disabled only when `[opcache]
+  cluster_invalidation` is off. That knob defaults to `cluster.enabled`, so on a
+  clustered preview host these four remain **callable**. `opcache_reset` and
+  `opcache_compile_file` are always disabled.
+
+An operator can also add entries of their own, so the effective list is only ever
+a superset of the above. Read it with `ini_get('disable_functions')`.
+
 What this costs you in practice:
 
 - **No shelling out at runtime.** Anything that calls `exec`/`proc_open` from a
@@ -466,19 +495,26 @@ This deserves its own callout because the failure is confusing: your code is
 correct, the library is correct, and the connection still refuses to open.
 
 `multi_tenant_hardening` sets `mysqli.allow_persistent = 0` (**verified**:
-`ini_get('mysqli.allow_persistent')` returns `'0'`), and removes
-`pfsockopen`/`fsockopen`. Persistent handles are keyed without a tenant
-component, so one preview could inherit another's connection — that is the
-reason, and it is not negotiable on a shared host.
+`ini_get('mysqli.allow_persistent')` returns `'0'`), along with
+`pgsql.allow_persistent = 0` and `odbc.allow_persistent = 0`, and removes
+`pfsockopen`. Persistent handles are keyed without a tenant component, so one
+preview could inherit another's connection — that is the reason, and it is not
+negotiable on a shared host.
 
 Breaks:
 
 - `mysqli` with a `p:` host prefix
-- `PDO::ATTR_PERSISTENT` on the mysqli-backed driver
 - phpredis `pconnect` / `Redis::pconnect`
 - anything built on `pfsockopen`
 
 Does **not** break: ordinary PDO connections, `stream_socket_client`, curl.
+
+⚠️ **PDO is the exception, and it is not enforced.** `PDO::ATTR_PERSISTENT` has
+no global ini equivalent, so the host **cannot** switch it off — ePHPm's source
+calls this a documented residual. Do not read "persistent connections are
+disabled" as "PDO persistence is safely blocked for me": nothing blocks it, and
+a pooled PDO handle on a shared host is exactly the cross-tenant reuse the rest
+of this section exists to prevent. Turn it off yourself.
 
 If your app enables persistent connections by config, turn them off for the
 preview.
@@ -651,8 +687,9 @@ Recommended packages: [`ephpm/db-wordpress`](https://github.com/ephpm/db-wordpre
 (`object-cache.php` drop-in). With the db drop-in you do not need the
 `define()` block at all.
 
-Watch out for: plugins that shell out (§6), plugins that call `mail()`, and the
-missing `zip` extension on some builds if you install themes/plugins at runtime.
+Watch out for: plugins that shell out (§6), plugins that call `mail()`, and —
+if you install themes or plugins at runtime — confirming `zip` is actually
+present on your host rather than assuming it (§6).
 
 ### Laravel
 
@@ -816,11 +853,11 @@ Labelled so you do not build on them.
 
 | Item | Status |
 |---|---|
-| Per-site document root (`docroot:` actually routing) | **Planned, not merged.** An operator-owned per-site override read from outside the tenant checkout is in development in ePHPm. Until it ships, §5 applies. |
+| Per-site document root (`docroot:` actually routing) | **Server side shipped; switchboard side not wired.** ePHPm serves a per-site document root from an operator-owned override outside the tenant checkout (`[server] site_overrides_dir`). Nothing yet generates that override from your `ephpm.yaml` `docroot:` ([switchboard#3](https://github.com/ephpm/switchboard/issues/3)), so §5 still applies unless your operator wrote one by hand. |
 | `ini:` block | **Advisory only.** Recorded in a sidecar; nothing applies it. `memory_limit` in your manifest does nothing. |
 | `env:` for `docroot: "."` apps | **Inert without the §3 workaround** — no `.env` is written and the prepend is not auto-loaded. |
 | `env:` for `docroot != "."` apps | Works, but **overwrites a committed `.env`**. |
-| Auth gate for private previews | **Not merged.** Middleware for gating previews behind HTTP Basic / signed session cookies / GitHub OAuth is in review upstream (ePHPm PRs #387, #388, #389). Assume your preview URL is public. |
+| Auth gate for private previews | **Not available.** Middleware for gating previews behind HTTP Basic / signed session cookies / GitHub OAuth was proposed upstream (ePHPm PRs #387, #388, #389) and **closed unmerged** — there is no basic-auth, session-cookie or OAuth builtin today. Assume your preview URL is public. |
 | Seeding via KV-sourced credentials in multi-tenant mode | **Not possible today** (ePHPm issue #384) — the RESP listener has no operator-scoped path in multi-tenant mode. |
 | Clustered / multi-node previews | Per-site database isolation is **single-node only**. |
 | `build:` / `seed:` failures | Logged, not fatal. Use `health:` as your real gate. |
