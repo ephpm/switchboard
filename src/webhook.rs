@@ -57,7 +57,6 @@ pub struct PullRequestHead {
     pub sha: String,
     /// The head repository (absent for a deleted fork). See
     /// [`PullRequestRepo::clone_url`] for why it is not a fetch source.
-    #[allow(dead_code)]
     pub repo: Option<PullRequestRepo>,
 }
 
@@ -75,7 +74,8 @@ pub struct PullRequestRepo {
     /// the same commit without trusting a fork.
     #[allow(dead_code)]
     pub clone_url: String,
-    #[allow(dead_code)]
+    /// `owner/name` of the head repo — compared against the base repo to
+    /// detect a fork.
     pub full_name: String,
 }
 
@@ -122,6 +122,21 @@ impl PullRequestEvent {
             branch: Some(self.pull_request.head.ref_name.clone()),
             sha: self.pull_request.head.sha.clone(),
             installation_id: self.installation.as_ref().map(|i| i.id),
+            fork: self.is_fork(),
+        }
+    }
+
+    /// Whether the PR head is a fork — the same rule switchboard-api applies:
+    /// the head repo's `full_name` differs from the base repo's
+    /// (case-insensitively, GitHub full names are case-preserving but
+    /// case-insensitive), **or the head repo is absent** (deleted fork).
+    #[must_use]
+    pub fn is_fork(&self) -> bool {
+        match &self.pull_request.head.repo {
+            None => true,
+            Some(repo) => !repo
+                .full_name
+                .eq_ignore_ascii_case(&self.repository.full_name),
         }
     }
 
@@ -231,16 +246,19 @@ mod tests {
         assert!(verify_signature(&body, "secret", "bad-header").is_err());
     }
 
-    #[test]
-    fn event_converts_to_a_preview_request() {
-        let event = PullRequestEvent {
+    /// An event whose head repo is `head_repo` (None = deleted fork).
+    fn event_with_head_repo(head_repo: Option<&str>) -> PullRequestEvent {
+        PullRequestEvent {
             action: "opened".into(),
             number: 42,
             pull_request: PullRequest {
                 head: PullRequestHead {
                     ref_name: "feature/xyz".into(),
                     sha: "abc123".into(),
-                    repo: None,
+                    repo: head_repo.map(|full_name| PullRequestRepo {
+                        clone_url: format!("https://github.com/{full_name}.git"),
+                        full_name: full_name.into(),
+                    }),
                 },
                 base: PullRequestBase {
                     ref_name: "main".into(),
@@ -256,9 +274,15 @@ mod tests {
                 },
             },
             installation: None,
-        };
+        }
+    }
+
+    #[test]
+    fn event_converts_to_a_preview_request() {
+        let event = event_with_head_repo(Some("ephpm/my-blog"));
 
         let req = event.to_preview_request();
+        assert!(!req.fork, "same-repo head must not be flagged as a fork");
         assert_eq!(req.label, "ephpm-my-blog-pr-42");
         assert_eq!(
             req.preview_host("preview.ephpm.dev"),
@@ -269,6 +293,31 @@ mod tests {
         assert_eq!(req.fetch_ref.as_deref(), Some("refs/pull/42/head"));
         assert_eq!(req.sha, "abc123");
         assert_eq!(req.pr_number, 42);
+    }
+
+    #[test]
+    fn fork_detected_by_differing_head_repo() {
+        // Same rules switchboard-api applies to compute `pull_request.fork`.
+        let event = event_with_head_repo(Some("attacker/my-blog"));
+        assert!(event.is_fork());
+        assert!(event.to_preview_request().fork);
+    }
+
+    #[test]
+    fn fork_comparison_is_case_insensitive() {
+        // GitHub full names are case-preserving but case-insensitive; a
+        // capitalization difference is the same repo, not a fork.
+        let event = event_with_head_repo(Some("EPHPM/My-Blog"));
+        assert!(!event.is_fork());
+    }
+
+    #[test]
+    fn deleted_fork_head_repo_counts_as_a_fork() {
+        // A missing head repo means the fork was deleted — same-repo PRs
+        // always carry their repo, so absent ⇒ fork (matches the API).
+        let event = event_with_head_repo(None);
+        assert!(event.is_fork());
+        assert!(event.to_preview_request().fork);
     }
 
     #[test]

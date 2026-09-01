@@ -146,6 +146,24 @@ seconds forever.
 Secrets can also come from `SWITCHBOARD_SECRET_<NAME>` environment variables
 (folded into the default scope, lowercased; the file wins on conflict).
 
+### Fork policy
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--allow-fork-deploy` | `SWITCHBOARD_ALLOW_FORK_DEPLOY` | `false` | Deploy pull requests from forks. Without it a fork deploy job **fails** with a clear message. |
+| `--fork-secrets` | `SWITCHBOARD_FORK_SECRETS` | `false` | Resolve `${secret.NAME}` operator secrets into fork deploys. Requires `--allow-fork-deploy`; setting it alone is a startup error. |
+
+The job file carries `pull_request.fork` (emitted by switchboard-api since its
+first release); a schema-1 document **without** the field is treated as a fork,
+because no legitimate producer omits it. This gate is deliberately a second one
+under the API's `SWITCHBOARD_ALLOW_FORKS`: the API decides what gets *queued*,
+but this daemon is the process that holds the secret store and builds the code,
+so it decides again. Building untrusted code and handing it operator secrets
+are two separate decisions, hence two flags — with `--allow-fork-deploy` alone,
+a fork builds but every `${secret.NAME}` expands to the empty string (with a
+name-only warning). Fork **teardowns** are always processed; refusing them
+would strand previews on disk.
+
 ### GitHub reporting (optional)
 
 | Flag | Env | Default | Meaning |

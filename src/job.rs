@@ -89,8 +89,25 @@ pub struct JobRepository {
 pub struct JobPullRequest {
     /// PR number.
     pub number: u64,
+    /// True when the PR head comes from a fork — or when the head repository is
+    /// gone (deleted fork), which the API also reports as `true`.
+    ///
+    /// **Absent means fork.** switchboard-api has emitted this field in every
+    /// schema-1 job file since its initial commit, and it is the only producer
+    /// of job files, so a document without the field was not written by the
+    /// API. Trust is the thing being decided here; a document that cannot
+    /// prove same-repo provenance is treated as a fork (fail closed). The
+    /// worst case for a legitimate job is a refused deploy with a clear
+    /// message — teardowns are unaffected either way.
+    #[serde(default = "fork_when_absent")]
+    pub fork: bool,
     /// Head of the PR.
     pub head: JobHead,
+}
+
+/// Serde default for [`JobPullRequest::fork`]: absent ⇒ fork (fail closed).
+fn fork_when_absent() -> bool {
+    true
 }
 
 /// The PR head.
@@ -166,6 +183,7 @@ impl Job {
             branch: Some(self.pull_request.head.ref_name.clone()),
             sha: self.pull_request.head.sha.clone(),
             installation_id: self.installation_id,
+            fork: self.pull_request.fork,
         }
     }
 }
@@ -232,6 +250,42 @@ mod tests {
             Some("refs/pull/7/head")
         );
         assert_eq!(job.installation_id, Some(999));
+    }
+
+    #[test]
+    fn fork_false_parses_as_not_a_fork() {
+        let job = Job::parse(sample_json("l", "deploy").as_bytes()).unwrap();
+        assert!(
+            !job.pull_request.fork,
+            "the sample document says fork:false"
+        );
+        assert!(!job.to_preview_request().fork);
+    }
+
+    #[test]
+    fn fork_true_reaches_the_preview_request() {
+        let doc = sample_json("l", "deploy").replace("\"fork\": false", "\"fork\": true");
+        let job = Job::parse(doc.as_bytes()).unwrap();
+        assert!(job.pull_request.fork);
+        assert!(job.to_preview_request().fork);
+    }
+
+    #[test]
+    fn absent_fork_field_is_treated_as_fork() {
+        // switchboard-api has emitted `pull_request.fork` since its first
+        // commit and is the only job-file producer, so a schema-1 document
+        // without the field has unproven provenance — fail closed.
+        let doc = sample_json("l", "deploy").replace("\"fork\": false,", "");
+        assert!(
+            !doc.contains("\"fork\""),
+            "test setup must actually drop the field"
+        );
+        let job = Job::parse(doc.as_bytes()).expect("the field is optional, not required");
+        assert!(
+            job.pull_request.fork,
+            "absent fork must deserialize as true"
+        );
+        assert!(job.to_preview_request().fork);
     }
 
     #[test]
