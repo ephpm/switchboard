@@ -24,6 +24,7 @@ mod job;
 mod manifest;
 mod queue;
 mod secrets;
+mod teardown;
 mod webhook;
 
 use std::path::Path;
@@ -316,7 +317,13 @@ async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result
 /// Deliberately not fork-gated: teardown resolves no secrets and removes
 /// data, and refusing fork teardowns would strand fork previews on disk.
 async fn handle_teardown(state: &AppState, req: &PreviewRequest) -> anyhow::Result<()> {
-    deployer::teardown_preview(&req.label, &state.config.sites_dir).await?;
+    let ctx = teardown::TeardownContext {
+        sites_dir: &state.config.sites_dir,
+        sqlite_dir: state.config.sqlite_dir.as_deref(),
+        site_overrides_dir: state.config.site_overrides_dir.as_deref(),
+        vhost_temp_base: state.config.vhost_temp_base.as_deref(),
+    };
+    teardown::teardown_preview(&req.label, &ctx).await?;
 
     if let Some(client) = github_client(state, req).await {
         if let Err(e) = client.post_teardown_comment(req).await {

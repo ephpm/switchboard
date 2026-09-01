@@ -55,9 +55,26 @@ A **deploy** fetches `refs/pull/<n>/head` at the recorded `head.sha` from the
 **base** repository (which works for forks, and for deleted forks, without
 trusting a third-party clone URL), builds per the app's `ephpm.yaml` manifest,
 and installs the result at `<sites_dir>/<label>/` by staging into
-`<label>.tmp` and renaming. A **teardown** removes `<sites_dir>/<label>/`. The
-preview's per-site database is left in place — database teardown is out of
-scope.
+`<label>.tmp` and renaming.
+
+A **teardown** removes everything the preview left on this node, each derived
+from the label by exact path — never a glob wider than the one site:
+
+* `<sites_dir>/<label>/` (and a leftover `<label>.tmp` staging directory);
+* the per-site database `<label>.db` + `-wal`/`-shm`/`-journal` under
+  `--sqlite-dir` (ePHPm's `[db.sqlite].dir`) — the dominant disk consumer on a
+  WordPress preview;
+* the `<label>.toml` docroot override under `--site-overrides-dir`;
+* the per-vhost temp/session state root under `--vhost-temp-base` (default:
+  this process's `<system temp>/ephpm-vhosts`, matching ePHPm's default). The
+  directory name embeds a hash ePHPm computed over the container path; the
+  daemon reproduces it and additionally sweeps for this label's exact name
+  shape (`<label>-<16 hex>`), so a hash it cannot reproduce still gets reaped.
+
+Leave `--sqlite-dir` / `--site-overrides-dir` unset and those artifacts are
+left in place (logged, not silent). In cluster mode every node's daemon runs
+the same teardown against its own disk, which is the complete story — each
+node reaps its own replicas.
 
 ### 2. Kick `/drain`
 
@@ -142,6 +159,9 @@ seconds forever.
 | `--secrets-file` | `SWITCHBOARD_SECRETS_FILE` | *(none)* | YAML secret store for `${secret.NAME}` references in a manifest's `env:`. |
 | `--health-timeout-secs` | `SWITCHBOARD_HEALTH_TIMEOUT_SECS` | `60` | How long to poll the manifest's `health:` path for a 200. `0` disables the gate. |
 | `--health-interval-secs` | `SWITCHBOARD_HEALTH_INTERVAL_SECS` | `2` | Seconds between health polls. |
+| `--sqlite-dir` | `SWITCHBOARD_SQLITE_DIR` | *(none)* | ePHPm's `[db.sqlite].dir`. Teardown removes the preview's `<label>.db` (+ journal files) from here; unset, databases accumulate. |
+| `--site-overrides-dir` | `SWITCHBOARD_SITE_OVERRIDES_DIR` | *(none)* | ePHPm's `site_overrides_dir`. Teardown removes the preview's `<label>.toml` from here. |
+| `--vhost-temp-base` | `SWITCHBOARD_VHOST_TEMP_BASE` | `<system temp>/ephpm-vhosts` | Where ePHPm keeps per-vhost temp/session state roots. Set explicitly when the daemon and ePHPm do not share a temp dir (`PrivateTmp`, differing `TMPDIR`). |
 
 Secrets can also come from `SWITCHBOARD_SECRET_<NAME>` environment variables
 (folded into the default scope, lowercased; the file wins on conflict).
@@ -234,6 +254,7 @@ pinned to the crate's MSRV on the ephpm org's self-hosted fleet.
 | `src/queue.rs` | Scan, claim (`link`+`unlink`), coalesce per label, complete |
 | `src/drain.rs` | The `/drain` kick and the shared-secret file |
 | `src/deployer.rs` | The provisioning pipeline: fetch → manifest → build → env → atomic swap → seed → health |
+| `src/teardown.rs` | Preview teardown: vhost dir, per-site database, override file, vhost temp/session state root |
 | `src/manifest.rs` | The `ephpm.yaml` app manifest schema |
 | `src/secrets.rs` | `${secret.NAME}` resolution from switchboard's own store |
 | `src/github.rs` | PR comments and Deployment statuses (sticky via the hidden marker) |
