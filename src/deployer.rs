@@ -669,35 +669,6 @@ pub fn preview_url(hostname: &str, php_version: Option<&str>) -> String {
     }
 }
 
-/// Remove a preview deployment: `<sites_dir>/<label>/`.
-///
-/// Tearing down a preview that was never deployed is a success, not an error —
-/// GitHub sends `closed` for pull requests that never got one.
-///
-/// Removing the per-site database is deliberately **not** done here; the
-/// database lifecycle is ePHPm's and is out of scope for this pass.
-///
-/// # Errors
-///
-/// Returns an error if the directory exists but cannot be removed.
-pub async fn teardown_preview(label: &str, sites_dir: &Path) -> anyhow::Result<()> {
-    let site_dir = sites_dir.join(label);
-
-    if site_dir.exists() {
-        tokio::fs::remove_dir_all(&site_dir)
-            .await
-            .context("failed to remove preview directory")?;
-        tracing::info!(%label, path = %site_dir.display(), "preview torn down");
-    } else {
-        tracing::debug!(%label, "preview directory not found (already removed?)");
-    }
-
-    // Stated rather than silently skipped: the preview's per-site database file
-    // under ePHPm's `[db.sqlite].dir` is left in place.
-    tracing::debug!(%label, "per-site database left in place (teardown out of scope)");
-    Ok(())
-}
-
 /// Detect the PHP framework from the project files.
 async fn detect_framework(dir: &Path) -> Framework {
     if dir.join("wp-config.php").exists() || dir.join("wp-config-sample.php").exists() {
@@ -1103,38 +1074,5 @@ mod tests {
             health_interval: Duration::from_secs(1),
         };
         assert!(!wait_healthy("https://example.invalid", "/", &ctx).await);
-    }
-
-    // ── teardown ────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn teardown_removes_the_site_dir_named_by_the_label() {
-        let sites = tempfile::tempdir().unwrap();
-        let label = "ephpm-my-blog-pr-7";
-        let site_dir = sites.path().join(label);
-        tokio::fs::create_dir_all(site_dir.join("wp-content"))
-            .await
-            .unwrap();
-        // A neighbouring preview must survive.
-        let other = sites.path().join("ephpm-my-blog-pr-8");
-        tokio::fs::create_dir_all(&other).await.unwrap();
-
-        teardown_preview(label, sites.path()).await.unwrap();
-        assert!(
-            !site_dir.exists(),
-            "teardown must remove the preview directory"
-        );
-        assert!(other.exists(), "teardown must not touch other previews");
-    }
-
-    #[tokio::test]
-    async fn teardown_is_ok_when_already_absent() {
-        // Teardown of a never-deployed / already-removed preview is a no-op
-        // success, not an error — GitHub can send `closed` for a PR that never
-        // deployed.
-        let sites = tempfile::tempdir().unwrap();
-        teardown_preview("ephpm-my-blog-pr-7", sites.path())
-            .await
-            .expect("absent preview teardown must succeed");
     }
 }

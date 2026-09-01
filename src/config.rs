@@ -80,6 +80,27 @@ pub struct Config {
     #[arg(long, default_value_t = 2, env = "SWITCHBOARD_HEALTH_INTERVAL_SECS")]
     pub health_interval_secs: u64,
 
+    // ── teardown (per-site artifacts outside sites_dir) ────────────────
+    /// ePHPm's `[db.sqlite].dir`, where each preview's `<label>.db` (and its
+    /// `-wal`/`-shm`/`-journal` companions) lives. Teardown removes them;
+    /// unset, per-site databases are left in place and accumulate.
+    #[arg(long, env = "SWITCHBOARD_SQLITE_DIR")]
+    pub sqlite_dir: Option<PathBuf>,
+
+    /// ePHPm's `site_overrides_dir`, where each preview's `<label>.toml`
+    /// docroot override lives. Teardown removes it; unset, override files are
+    /// left in place.
+    #[arg(long, env = "SWITCHBOARD_SITE_OVERRIDES_DIR")]
+    pub site_overrides_dir: Option<PathBuf>,
+
+    /// The directory ePHPm keeps per-vhost temp/session state roots in.
+    /// Defaults to this process's `<system temp>/ephpm-vhosts`, which matches
+    /// ePHPm's own default when both processes see the same `TMPDIR` — set it
+    /// explicitly when they don't (e.g. systemd `PrivateTmp`, or ePHPm running
+    /// with a different `TMPDIR`).
+    #[arg(long, env = "SWITCHBOARD_VHOST_TEMP_BASE")]
+    pub vhost_temp_base: Option<PathBuf>,
+
     // ── fork policy ────────────────────────────────────────────────────
     /// Deploy pull requests from forks. Off by default: a fork PR is untrusted
     /// code, and this daemon is the process that actually builds it. This is a
@@ -219,6 +240,31 @@ mod tests {
         assert_eq!(c.health_timeout_secs, 60);
         assert_eq!(c.health_interval_secs, 2);
         assert!(c.secrets_file.is_none());
+        // Teardown knobs default to unset: db/override cleanup is opt-in
+        // (their locations are deployment-specific), the vhost temp base
+        // falls back to the process temp dir at use time.
+        assert!(c.sqlite_dir.is_none());
+        assert!(c.site_overrides_dir.is_none());
+        assert!(c.vhost_temp_base.is_none());
+    }
+
+    #[test]
+    fn teardown_knobs_parse() {
+        let c = parse_single_node(&[
+            "--sqlite-dir",
+            "/var/lib/ephpm/sqlite",
+            "--site-overrides-dir",
+            "/etc/ephpm/sites",
+            "--vhost-temp-base",
+            "/tmp/ephpm-vhosts",
+        ]);
+        assert_eq!(c.sqlite_dir, Some(PathBuf::from("/var/lib/ephpm/sqlite")));
+        assert_eq!(
+            c.site_overrides_dir,
+            Some(PathBuf::from("/etc/ephpm/sites"))
+        );
+        assert_eq!(c.vhost_temp_base, Some(PathBuf::from("/tmp/ephpm-vhosts")));
+        c.validate().unwrap();
     }
 
     #[test]
