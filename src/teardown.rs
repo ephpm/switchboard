@@ -1,14 +1,17 @@
 //! Preview teardown: remove **everything** a preview left on this node.
 //!
 //! A deploy creates more than the vhost directory, and every artifact is
-//! per-site state that nothing else ever reaps (issue #9):
+//! per-site state that nothing else ever reaps (issue #9). All of them are named
+//! by the **canonical site key** (see [`crate::site_key`]) — the same string the
+//! deploy used, which on a node with `sites_domain_suffix` configured is the
+//! preview label and on one without it is the full preview FQDN:
 //!
-//! * `<sites_dir>/<label>/` — the vhost directory (and a `<label>.tmp` staging
+//! * `<sites_dir>/<key>/` — the vhost directory (and a `<key>.tmp` staging
 //!   directory when a deploy died mid-swap);
-//! * `<sqlite_dir>/<label>.db` — ePHPm's per-site database, plus its `-wal` /
+//! * `<sqlite_dir>/<key>.db` — ePHPm's per-site database, plus its `-wal` /
 //!   `-shm` / `-journal` companions. On a WordPress preview this is the
 //!   dominant disk consumer;
-//! * `<site_overrides_dir>/<label>.toml` — the docroot override the deploy
+//! * `<site_overrides_dir>/<key>.toml` — the docroot override the deploy
 //!   wrote for ePHPm (ephpm#391);
 //! * the per-vhost temp/session state root ePHPm creates under
 //!   `<temp>/ephpm-vhosts/` — sessions, uploads, PHP temp files.
@@ -16,8 +19,8 @@
 //! # Path safety
 //!
 //! Every removal target is `<configured root>/<derived name>` where the name
-//! is derived from the validated preview label — never from a glob wider than
-//! the one site. [`validate_label`] fails closed: a label that is not a single,
+//! is derived from the validated site key — never from a glob wider than
+//! the one site. [`validate_site_key`] fails closed: a key that is not a single,
 //! plain path component (separators, `..`, drive colons, NULs) aborts the
 //! teardown before anything is touched.
 //!
@@ -30,7 +33,7 @@
 //! canonicalization difference, or a std hasher change would make our
 //! reproduction miss. So the reproduction is attempted first (both the
 //! canonical and the raw container path), and then the base directory is swept
-//! for entries matching exactly `<sanitized-label>-<16 lowercase hex>` — the
+//! for entries matching exactly `<sanitized-key>-<16 lowercase hex>` — the
 //! one site's name shape, not a glob over the base.
 //!
 //! # Cluster story
@@ -51,12 +54,12 @@ use anyhow::Context;
 /// `[server].site_overrides_dir`; when a knob is `None` that artifact class is
 /// left in place (stated in the log, not silently skipped).
 pub struct TeardownContext<'a> {
-    /// ePHPm sites directory — previews live at `<sites_dir>/<label>/`.
+    /// ePHPm sites directory — previews live at `<sites_dir>/<site_key>/`.
     pub sites_dir: &'a Path,
-    /// ePHPm's `[db.sqlite].dir`, where `<label>.db` lives. `None` = leave
+    /// ePHPm's `[db.sqlite].dir`, where `<site_key>.db` lives. `None` = leave
     /// database files in place.
     pub sqlite_dir: Option<&'a Path>,
-    /// ePHPm's `site_overrides_dir`, where `<label>.toml` lives. `None` =
+    /// ePHPm's `site_overrides_dir`, where `<site_key>.toml` lives. `None` =
     /// leave override files in place.
     pub site_overrides_dir: Option<&'a Path>,
     /// The directory ePHPm keeps per-vhost state roots in. `None` = use this
@@ -77,13 +80,13 @@ pub struct TeardownContext<'a> {
 ///
 /// # Errors
 ///
-/// Returns an error if the label is not a safe single path component, or if
+/// Returns an error if the site key is not one ePHPm would serve, or if
 /// any artifact exists but cannot be removed.
-pub async fn teardown_preview(label: &str, ctx: &TeardownContext<'_>) -> anyhow::Result<()> {
-    validate_label(label)?;
+pub async fn teardown_preview(site_key: &str, ctx: &TeardownContext<'_>) -> anyhow::Result<()> {
+    validate_site_key(site_key)?;
 
     let mut failures: Vec<String> = Vec::new();
-    let site_dir = ctx.sites_dir.join(label);
+    let site_dir = ctx.sites_dir.join(site_key);
 
     // Resolve the container to its canonical form BEFORE removing it — the
     // state-root digest is computed by ePHPm over the resolved path, and a
@@ -95,7 +98,7 @@ pub async fn teardown_preview(label: &str, ctx: &TeardownContext<'_>) -> anyhow:
     // uses, so we remove exactly what it creates).
     for dir in [site_dir.clone(), site_dir.with_extension("tmp")] {
         match tokio::fs::remove_dir_all(&dir).await {
-            Ok(()) => tracing::info!(%label, path = %dir.display(), "removed preview directory"),
+            Ok(()) => tracing::info!(%site_key, path = %dir.display(), "removed preview directory"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => failures.push(format!("failed to remove {}: {e}", dir.display())),
         }
@@ -104,10 +107,10 @@ pub async fn teardown_preview(label: &str, ctx: &TeardownContext<'_>) -> anyhow:
     // (2) The per-site database and its journal companions.
     if let Some(sqlite_dir) = ctx.sqlite_dir {
         for suffix in ["db", "db-wal", "db-shm", "db-journal"] {
-            let file = sqlite_dir.join(format!("{label}.{suffix}"));
+            let file = sqlite_dir.join(format!("{site_key}.{suffix}"));
             match tokio::fs::remove_file(&file).await {
                 Ok(()) => {
-                    tracing::info!(%label, path = %file.display(), "removed per-site database file");
+                    tracing::info!(%site_key, path = %file.display(), "removed per-site database file");
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => failures.push(format!("failed to remove {}: {e}", file.display())),
@@ -116,20 +119,22 @@ pub async fn teardown_preview(label: &str, ctx: &TeardownContext<'_>) -> anyhow:
     } else {
         // Stated rather than silently skipped, exactly like the old teardown
         // stated it never tried.
-        tracing::debug!(%label, "per-site database left in place (--sqlite-dir not configured)");
+        tracing::debug!(%site_key, "per-site database left in place (--sqlite-dir not configured)");
     }
 
     // (3) The docroot override file the deploy wrote for ePHPm.
     if let Some(overrides_dir) = ctx.site_overrides_dir {
-        let file = overrides_dir.join(format!("{label}.toml"));
+        let file = overrides_dir.join(format!("{site_key}.toml"));
         match tokio::fs::remove_file(&file).await {
-            Ok(()) => tracing::info!(%label, path = %file.display(), "removed site override file"),
+            Ok(()) => {
+                tracing::info!(%site_key, path = %file.display(), "removed site override file")
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => failures.push(format!("failed to remove {}: {e}", file.display())),
         }
     } else {
         tracing::debug!(
-            %label,
+            %site_key,
             "site override file left in place (--site-overrides-dir not configured)"
         );
     }
@@ -140,28 +145,28 @@ pub async fn teardown_preview(label: &str, ctx: &TeardownContext<'_>) -> anyhow:
         Path::to_path_buf,
     );
     if let Err(e) =
-        remove_state_roots(&base, label, canonical_container.as_deref(), &site_dir).await
+        remove_state_roots(&base, site_key, canonical_container.as_deref(), &site_dir).await
     {
         failures.push(format!("{e:#}"));
     }
 
     anyhow::ensure!(
         failures.is_empty(),
-        "teardown of {label} left artifacts behind: {}",
+        "teardown of {site_key} left artifacts behind: {}",
         failures.join("; ")
     );
     Ok(())
 }
 
-/// Remove the vhost state roots for `label` under `base`.
+/// Remove the vhost state roots for `site_key` under `base`.
 ///
 /// Tries the reproduced ePHPm names first (canonical and raw container paths),
 /// then sweeps `base` for entries matching this site's exact name shape,
-/// `<sanitized-label>-<16 lowercase hex>`. Only ever removes direct children
+/// `<sanitized-key>-<16 lowercase hex>`. Only ever removes direct children
 /// of `base` whose names match the one site.
 async fn remove_state_roots(
     base: &Path,
-    label: &str,
+    site_key: &str,
     canonical_container: Option<&Path>,
     raw_container: &Path,
 ) -> anyhow::Result<()> {
@@ -193,7 +198,7 @@ async fn remove_state_roots(
             {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                if matches_state_root_name(name, label) {
+                if matches_state_root_name(name, site_key) {
                     let path = entry.path();
                     if !targets.contains(&path) {
                         targets.push(path);
@@ -211,7 +216,7 @@ async fn remove_state_roots(
     for dir in targets {
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => {
-                tracing::info!(%label, path = %dir.display(), "removed per-vhost temp/session state root");
+                tracing::info!(%site_key, path = %dir.display(), "removed per-vhost temp/session state root");
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -222,26 +227,23 @@ async fn remove_state_roots(
     Ok(())
 }
 
-/// Refuse any label that is not a single, plain path component.
+/// Refuse any site key that is not a single, plain path component.
 ///
-/// The label names files under every configured root; this is the check that
-/// makes `root.join(label)` incapable of resolving outside the root. The API
-/// only ever emits DNS labels (`[a-z0-9-]`), so anything this rejects was not
-/// produced by a legitimate producer.
+/// The key names files under every configured root; this is the check that makes
+/// `root.join(key)` incapable of resolving outside the root. It is the same
+/// allowlist ePHPm applies before joining a key onto `sites_dir`
+/// ([`crate::site_key::is_valid_site_key`]), so a key this refuses is one ePHPm
+/// would never have served in the first place.
 ///
 /// # Errors
 ///
-/// Returns an error for an empty label, `.`/`..`, or a label containing a path
-/// separator, a Windows drive colon, or a NUL.
-fn validate_label(label: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(!label.is_empty(), "refusing teardown: empty preview label");
+/// Returns an error for any key outside `[a-z0-9._-]`, and for the dot shapes
+/// (`.`, `..`, `a..b`, leading/trailing dot) that would traverse when joined.
+fn validate_site_key(site_key: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        label != "." && label != "..",
-        "refusing teardown: preview label {label:?} is a relative path component"
-    );
-    anyhow::ensure!(
-        !label.contains(['/', '\\', ':', '\0']),
-        "refusing teardown: preview label {label:?} is not a single path component"
+        crate::site_key::is_valid_site_key(site_key),
+        "refusing teardown: {site_key:?} is not a valid ePHPm site key — it \
+         must be non-empty DNS-style labels from [a-z0-9._-] with no empty label"
     );
     Ok(())
 }
@@ -260,18 +262,18 @@ fn state_root_name(container: &Path) -> String {
     container.hash(&mut hasher);
     let digest = hasher.finish();
 
-    let label = container
+    let site_key = container
         .file_name()
         .and_then(|s| s.to_str())
         .map_or_else(|| "site".to_string(), sanitize_path_label);
 
-    format!("{label}-{digest:016x}")
+    format!("{site_key}-{digest:016x}")
 }
 
-/// Whether a directory entry under the vhost temp base belongs to `label`:
-/// exactly `<sanitized-label>-<16 lowercase hex>`, ePHPm's state-root shape.
-fn matches_state_root_name(entry: &str, label: &str) -> bool {
-    let sanitized = sanitize_path_label(label);
+/// Whether a directory entry under the vhost temp base belongs to `site_key`:
+/// exactly `<sanitized-key>-<16 lowercase hex>`, ePHPm's state-root shape.
+fn matches_state_root_name(entry: &str, site_key: &str) -> bool {
+    let sanitized = sanitize_path_label(site_key);
     let Some(rest) = entry.strip_prefix(&sanitized) else {
         return false;
     };
@@ -281,7 +283,7 @@ fn matches_state_root_name(entry: &str, label: &str) -> bool {
     hex.len() == 16 && hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
-/// ePHPm's label sanitization, verbatim (`sanitize_path_label` in its router):
+/// ePHPm's site_key sanitization, verbatim (`sanitize_path_label` in its router):
 /// keep `[A-Za-z0-9._-]`, map everything else to `_`, cap at 64 chars, and
 /// fall back to `"site"` for an empty result.
 fn sanitize_path_label(name: &str) -> String {
@@ -344,27 +346,27 @@ mod tests {
             }
         }
 
-        /// Materialize the full artifact set for `label`, exactly as a deploy
+        /// Materialize the full artifact set for `site_key`, exactly as a deploy
         /// plus first requests leave them. The state root uses the reproduced
         /// ePHPm digest of the container path.
-        async fn deploy_artifacts(&self, label: &str) {
-            tokio::fs::create_dir_all(self.sites.join(label).join("wp-content"))
+        async fn deploy_artifacts(&self, site_key: &str) {
+            tokio::fs::create_dir_all(self.sites.join(site_key).join("wp-content"))
                 .await
                 .unwrap();
             for suffix in ["db", "db-wal", "db-shm", "db-journal"] {
-                tokio::fs::write(self.sqlite.join(format!("{label}.{suffix}")), b"x")
+                tokio::fs::write(self.sqlite.join(format!("{site_key}.{suffix}")), b"x")
                     .await
                     .unwrap();
             }
             tokio::fs::write(
-                self.overrides.join(format!("{label}.toml")),
+                self.overrides.join(format!("{site_key}.toml")),
                 b"document_root = \"public\"\n",
             )
             .await
             .unwrap();
             let state = self
                 .temp_base
-                .join(state_root_name(&self.sites.join(label)));
+                .join(state_root_name(&self.sites.join(site_key)));
             tokio::fs::create_dir_all(state.join("sessions"))
                 .await
                 .unwrap();
@@ -374,28 +376,31 @@ mod tests {
     #[tokio::test]
     async fn teardown_removes_every_artifact_class() {
         let f = Fixture::new().await;
-        let label = "ephpm-my-blog-pr-7";
-        f.deploy_artifacts(label).await;
+        let site_key = "ephpm-my-blog-pr-7";
+        f.deploy_artifacts(site_key).await;
         // A staging dir from a deploy that died mid-swap.
-        tokio::fs::create_dir_all(f.sites.join(format!("{label}.tmp")))
+        tokio::fs::create_dir_all(f.sites.join(format!("{site_key}.tmp")))
             .await
             .unwrap();
 
-        teardown_preview(label, &f.ctx()).await.unwrap();
+        teardown_preview(site_key, &f.ctx()).await.unwrap();
 
-        assert!(!f.sites.join(label).exists(), "vhost dir must be removed");
         assert!(
-            !f.sites.join(format!("{label}.tmp")).exists(),
+            !f.sites.join(site_key).exists(),
+            "vhost dir must be removed"
+        );
+        assert!(
+            !f.sites.join(format!("{site_key}.tmp")).exists(),
             "staging dir must be removed"
         );
         for suffix in ["db", "db-wal", "db-shm", "db-journal"] {
             assert!(
-                !f.sqlite.join(format!("{label}.{suffix}")).exists(),
+                !f.sqlite.join(format!("{site_key}.{suffix}")).exists(),
                 "database artifact .{suffix} must be removed"
             );
         }
         assert!(
-            !f.overrides.join(format!("{label}.toml")).exists(),
+            !f.overrides.join(format!("{site_key}.toml")).exists(),
             "override file must be removed"
         );
         let mut entries = tokio::fs::read_dir(&f.temp_base).await.unwrap();
@@ -411,31 +416,31 @@ mod tests {
         // vhost dir surviving. Deploy two artifacts only (no vhost dir at all)
         // and verify teardown still reaps them.
         let f = Fixture::new().await;
-        let label = "ephpm-my-blog-pr-9";
-        tokio::fs::write(f.sqlite.join(format!("{label}.db")), b"x")
+        let site_key = "ephpm-my-blog-pr-9";
+        tokio::fs::write(f.sqlite.join(format!("{site_key}.db")), b"x")
             .await
             .unwrap();
-        tokio::fs::write(f.overrides.join(format!("{label}.toml")), b"")
+        tokio::fs::write(f.overrides.join(format!("{site_key}.toml")), b"")
             .await
             .unwrap();
 
-        teardown_preview(label, &f.ctx()).await.unwrap();
-        assert!(!f.sqlite.join(format!("{label}.db")).exists());
-        assert!(!f.overrides.join(format!("{label}.toml")).exists());
+        teardown_preview(site_key, &f.ctx()).await.unwrap();
+        assert!(!f.sqlite.join(format!("{site_key}.db")).exists());
+        assert!(!f.overrides.join(format!("{site_key}.toml")).exists());
     }
 
     #[tokio::test]
     async fn teardown_never_touches_a_neighbouring_site() {
         let f = Fixture::new().await;
-        let label = "ephpm-my-blog-pr-7";
+        let site_key = "ephpm-my-blog-pr-7";
         let neighbour = "ephpm-my-blog-pr-8";
-        f.deploy_artifacts(label).await;
+        f.deploy_artifacts(site_key).await;
         f.deploy_artifacts(neighbour).await;
-        // A neighbour whose label extends ours must also survive the sweep.
+        // A neighbour whose site_key extends ours must also survive the sweep.
         let prefix_neighbour = "ephpm-my-blog-pr-71";
         f.deploy_artifacts(prefix_neighbour).await;
 
-        teardown_preview(label, &f.ctx()).await.unwrap();
+        teardown_preview(site_key, &f.ctx()).await.unwrap();
 
         for survivor in [neighbour, prefix_neighbour] {
             assert!(f.sites.join(survivor).exists(), "{survivor} vhost dir");
@@ -462,22 +467,22 @@ mod tests {
         // path (canonicalization, TMPDIR history) — reproduced digest misses,
         // the exact-shape sweep must still find it.
         let f = Fixture::new().await;
-        let label = "ephpm-my-blog-pr-7";
-        let foreign = f.temp_base.join(format!("{label}-00000000deadbeef"));
+        let site_key = "ephpm-my-blog-pr-7";
+        let foreign = f.temp_base.join(format!("{site_key}-00000000deadbeef"));
         tokio::fs::create_dir_all(foreign.join("tmp"))
             .await
             .unwrap();
         // Same prefix but NOT the state-root shape: must survive.
-        let short = f.temp_base.join(format!("{label}-beef"));
+        let short = f.temp_base.join(format!("{site_key}-beef"));
         // A different digest value so it cannot collide with `foreign` on a
         // case-insensitive filesystem (Windows dev machines).
-        let upper = f.temp_base.join(format!("{label}-11111111DEADBEEF"));
-        let longer = f.temp_base.join(format!("{label}-x-00000000deadbeef"));
+        let upper = f.temp_base.join(format!("{site_key}-11111111DEADBEEF"));
+        let longer = f.temp_base.join(format!("{site_key}-x-00000000deadbeef"));
         for dir in [&short, &upper, &longer] {
             tokio::fs::create_dir_all(dir).await.unwrap();
         }
 
-        teardown_preview(label, &f.ctx()).await.unwrap();
+        teardown_preview(site_key, &f.ctx()).await.unwrap();
 
         assert!(
             !foreign.exists(),
@@ -510,8 +515,8 @@ mod tests {
     #[tokio::test]
     async fn unconfigured_knobs_leave_those_artifacts_in_place() {
         let f = Fixture::new().await;
-        let label = "ephpm-my-blog-pr-7";
-        f.deploy_artifacts(label).await;
+        let site_key = "ephpm-my-blog-pr-7";
+        f.deploy_artifacts(site_key).await;
 
         let ctx = TeardownContext {
             sites_dir: &f.sites,
@@ -519,15 +524,18 @@ mod tests {
             site_overrides_dir: None,
             vhost_temp_base: Some(&f.temp_base),
         };
-        teardown_preview(label, &ctx).await.unwrap();
+        teardown_preview(site_key, &ctx).await.unwrap();
 
-        assert!(!f.sites.join(label).exists(), "vhost dir is always removed");
         assert!(
-            f.sqlite.join(format!("{label}.db")).exists(),
+            !f.sites.join(site_key).exists(),
+            "vhost dir is always removed"
+        );
+        assert!(
+            f.sqlite.join(format!("{site_key}.db")).exists(),
             "no --sqlite-dir: database must be left alone"
         );
         assert!(
-            f.overrides.join(format!("{label}.toml")).exists(),
+            f.overrides.join(format!("{site_key}.toml")).exists(),
             "no --site-overrides-dir: override must be left alone"
         );
     }
@@ -538,10 +546,10 @@ mod tests {
         let canary = "ephpm-my-blog-pr-7";
         f.deploy_artifacts(canary).await;
 
-        for label in ["", ".", "..", "a/b", "a\\b", "a:b", "a\0b", "../escape"] {
-            let err = teardown_preview(label, &f.ctx())
+        for site_key in ["", ".", "..", "a/b", "a\\b", "a:b", "a\0b", "../escape"] {
+            let err = teardown_preview(site_key, &f.ctx())
                 .await
-                .expect_err(&format!("label {label:?} must be refused"));
+                .expect_err(&format!("site_key {site_key:?} must be refused"));
             assert!(err.to_string().contains("refusing teardown"), "{err}");
         }
         // Nothing was removed by any refused attempt.

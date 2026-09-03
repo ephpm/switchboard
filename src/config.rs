@@ -49,7 +49,8 @@ pub struct Config {
 
     // ── provisioning ───────────────────────────────────────────────────
     /// ePHPm sites directory where previews are deployed. Each preview lands at
-    /// `<sites_dir>/<preview.label>/`.
+    /// `<sites_dir>/<site-key>/`, where the site key is derived from the preview
+    /// host exactly as ePHPm derives it — see [`crate::site_key`].
     #[arg(long, default_value = "/var/www/sites", env = "SWITCHBOARD_SITES_DIR")]
     pub sites_dir: PathBuf,
 
@@ -60,6 +61,19 @@ pub struct Config {
         env = "SWITCHBOARD_PREVIEW_DOMAIN"
     )]
     pub preview_domain: String,
+
+    /// ePHPm's `[server] sites_domain_suffix` **as configured on the node this
+    /// daemon provisions**.
+    ///
+    /// This is not a preference — it decides the name of every per-site artifact
+    /// (see [`crate::site_key`]), and getting it wrong provisions a preview into
+    /// a directory ePHPm never resolves. Defaults to `.<preview-domain>`, which
+    /// is the configuration the preview cluster runs and the one that yields the
+    /// short `<label>/` directory names. Pass an **empty string** for a node
+    /// whose `ephpm.toml` sets no suffix; the site key is then the full preview
+    /// FQDN and directories are named accordingly.
+    #[arg(long, env = "SWITCHBOARD_SITES_DOMAIN_SUFFIX")]
+    pub sites_domain_suffix: Option<String>,
 
     /// Composer command (or path to binary).
     #[arg(long, default_value = "composer", env = "SWITCHBOARD_COMPOSER")]
@@ -167,6 +181,22 @@ impl Config {
         self.app_id.is_some() && self.app_key.is_some()
     }
 
+    /// ePHPm's `sites_domain_suffix` for this node, resolved.
+    ///
+    /// Unset means "the node's suffix matches our preview domain", the
+    /// configuration the preview cluster runs — so the default is
+    /// `.<preview-domain>` rather than `None`. An explicitly empty value means
+    /// the node genuinely has no suffix, in which case the site key is the full
+    /// preview FQDN. See [`crate::site_key`].
+    #[must_use]
+    pub fn effective_sites_domain_suffix(&self) -> Option<String> {
+        match self.sites_domain_suffix.as_deref() {
+            None => Some(format!(".{}", self.preview_domain.trim_matches('.'))),
+            Some(explicit) if explicit.trim().is_empty() => None,
+            Some(explicit) => Some(explicit.trim().to_ascii_lowercase()),
+        }
+    }
+
     /// Check the combinations clap cannot express.
     ///
     /// # Errors
@@ -205,6 +235,20 @@ impl Config {
             "--fork-secrets has no effect without --allow-fork-deploy — set \
              both to build forks with operator secrets, or neither"
         );
+        // ePHPm rejects a `sites_domain_suffix` without a leading dot at config
+        // load (#397: `Host: <suffix>` otherwise strips to the empty string and
+        // `sites_dir.join("")` is the whole fleet). A daemon configured with a
+        // suffix ePHPm would refuse is a daemon deriving keys no server will
+        // ever agree with, so refuse it here too rather than provisioning into
+        // directories nobody serves.
+        if let Some(suffix) = self.effective_sites_domain_suffix() {
+            anyhow::ensure!(
+                suffix.starts_with('.'),
+                "--sites-domain-suffix {suffix:?} must begin with a dot — ePHPm \
+                 refuses a dotless suffix at config load (ephpm#397), so a key \
+                 derived from one would never match a served vhost"
+            );
+        }
         Ok(())
     }
 }
@@ -246,6 +290,58 @@ mod tests {
         assert!(c.sqlite_dir.is_none());
         assert!(c.site_overrides_dir.is_none());
         assert!(c.vhost_temp_base.is_none());
+    }
+
+    // ── the site-key derivation's one input (#13) ───────────────────────
+
+    /// Unset means "the node's suffix is our preview domain" — the shape the
+    /// preview cluster actually runs, and the one that keeps vhost directories
+    /// named by the short label.
+    #[test]
+    fn sites_domain_suffix_defaults_to_the_preview_domain() {
+        let c = parse_single_node(&[]);
+        assert_eq!(
+            c.effective_sites_domain_suffix().as_deref(),
+            Some(".preview.ephpm.dev")
+        );
+        let c = parse_single_node(&["--preview-domain", "pr.example.com"]);
+        assert_eq!(
+            c.effective_sites_domain_suffix().as_deref(),
+            Some(".pr.example.com")
+        );
+    }
+
+    /// An explicitly empty value is how an operator says "this node's
+    /// ephpm.toml sets no suffix" — the switchboard#13 configuration. The site
+    /// key is then the full preview FQDN.
+    #[test]
+    fn empty_sites_domain_suffix_means_the_node_has_none() {
+        let c = parse_single_node(&["--sites-domain-suffix", ""]);
+        assert_eq!(c.effective_sites_domain_suffix(), None);
+        c.validate()
+            .expect("an absent suffix is a valid deployment");
+    }
+
+    #[test]
+    fn explicit_sites_domain_suffix_overrides_the_preview_domain() {
+        let c = parse_single_node(&["--sites-domain-suffix", ".Internal.Example"]);
+        assert_eq!(
+            c.effective_sites_domain_suffix().as_deref(),
+            Some(".internal.example"),
+            "the suffix is compared against a lowercased host, so it is lowercased too"
+        );
+    }
+
+    /// ePHPm refuses a dotless suffix at config load (#397 — `Host: <suffix>`
+    /// strips to the empty string and `sites_dir.join("")` is the whole fleet).
+    /// A daemon configured with one would derive keys no server agrees with.
+    #[test]
+    fn dotless_sites_domain_suffix_is_refused() {
+        let c = parse_single_node(&["--sites-domain-suffix", "preview.ephpm.dev"]);
+        let err = c
+            .validate()
+            .expect_err("a dotless suffix must not be accepted");
+        assert!(err.to_string().contains("must begin with a dot"), "{err}");
     }
 
     #[test]

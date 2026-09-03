@@ -24,6 +24,8 @@ mod job;
 mod manifest;
 mod queue;
 mod secrets;
+mod site_key;
+mod site_override;
 mod teardown;
 mod webhook;
 
@@ -67,6 +69,26 @@ async fn main() -> anyhow::Result<()> {
     info!(state_dir = %config.state_dir.display(), "starting switchboard daemon");
     info!(sites_dir = %config.sites_dir.display(), "preview deployments target");
     info!(domain = %config.preview_domain, "preview domain");
+    // The site-key derivation decides the name of every per-site artifact, so
+    // it is worth one startup line: an operator reading "site key = full FQDN"
+    // when they expected the short label has found their bug immediately.
+    match config.effective_sites_domain_suffix() {
+        Some(suffix) => info!(
+            %suffix,
+            "ePHPm sites_domain_suffix — preview site keys are the bare label"
+        ),
+        None => info!(
+            "no ePHPm sites_domain_suffix configured — preview site keys (and \
+             therefore vhost directory names) are the full preview FQDN"
+        ),
+    }
+    if config.site_overrides_dir.is_none() {
+        info!(
+            "--site-overrides-dir is not configured — a preview whose ephpm.yaml \
+             sets `docroot:` will be served from its repository root instead \
+             (switchboard#3)"
+        );
+    }
 
     if config.github_reporting_enabled() {
         let app_key = config
@@ -286,9 +308,12 @@ async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result
         }
     };
 
+    let suffix = state.config.effective_sites_domain_suffix();
     let ctx = deployer::DeployContext {
         sites_dir: &state.config.sites_dir,
         preview_domain: &state.config.preview_domain,
+        sites_domain_suffix: suffix.as_deref(),
+        site_overrides_dir: state.config.site_overrides_dir.as_deref(),
         composer: &state.config.composer,
         secrets,
         health_timeout: Duration::from_secs(state.config.health_timeout_secs),
@@ -323,7 +348,13 @@ async fn handle_teardown(state: &AppState, req: &PreviewRequest) -> anyhow::Resu
         site_overrides_dir: state.config.site_overrides_dir.as_deref(),
         vhost_temp_base: state.config.vhost_temp_base.as_deref(),
     };
-    teardown::teardown_preview(&req.label, &ctx).await?;
+    // The same derivation the deploy used — teardown must remove the artifacts
+    // that were actually created, which on a node without a
+    // `sites_domain_suffix` are named by the full preview FQDN, not the label.
+    let suffix = state.config.effective_sites_domain_suffix();
+    let host = req.preview_host(&state.config.preview_domain);
+    let key = site_key::site_key(&host, suffix.as_deref())?;
+    teardown::teardown_preview(&key, &ctx).await?;
 
     if let Some(client) = github_client(state, req).await {
         if let Err(e) = client.post_teardown_comment(req).await {

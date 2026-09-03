@@ -47,29 +47,45 @@ owned by switchboard-api's README, sections **"The job file contract"** and
 * **Delete on success, leave on failure.** A failed job stays in
   `queue/claimed/` for inspection rather than being retried forever.
 
-`preview.label` is **authoritative and never recomputed** — it names the
-directory under `sites_dir` and, with `--preview-domain` appended, the host
-ePHPm resolves.
+`preview.label` is **authoritative and never recomputed** — with
+`--preview-domain` appended it is the preview host ePHPm resolves.
+
+### The site key
+
+Every per-site artifact is named by the **canonical site key**, which is ePHPm's
+derivation, not switchboard's (`src/site_key.rs`): the preview host, normalized,
+with ePHPm's `[server] sites_domain_suffix` stripped. So:
+
+| `[server] sites_domain_suffix` on the node | `--sites-domain-suffix` | Site key for `blog-pr-7.preview.ephpm.dev` |
+|---|---|---|
+| `.preview.ephpm.dev` (what the preview cluster runs) | *(default)* | `blog-pr-7` |
+| unset | `""` | `blog-pr-7.preview.ephpm.dev` |
+
+Getting this wrong does not error — it provisions the preview into a directory
+ePHPm never resolves, and per ePHPm's fail-closed rule such a request gets no
+per-site database and no `DB_*` credentials. That is why the suffix is an
+explicit, validated flag rather than an assumption. The daemon logs the
+resolved derivation at startup.
 
 A **deploy** fetches `refs/pull/<n>/head` at the recorded `head.sha` from the
 **base** repository (which works for forks, and for deleted forks, without
 trusting a third-party clone URL), builds per the app's `ephpm.yaml` manifest,
-and installs the result at `<sites_dir>/<label>/` by staging into
-`<label>.tmp` and renaming.
+publishes the manifest's `docroot:` as ePHPm's per-site override, and installs
+the result at `<sites_dir>/<key>/` by staging into `<key>.tmp` and renaming.
 
 A **teardown** removes everything the preview left on this node, each derived
-from the label by exact path — never a glob wider than the one site:
+from the site key by exact path — never a glob wider than the one site:
 
-* `<sites_dir>/<label>/` (and a leftover `<label>.tmp` staging directory);
-* the per-site database `<label>.db` + `-wal`/`-shm`/`-journal` under
+* `<sites_dir>/<key>/` (and a leftover `<key>.tmp` staging directory);
+* the per-site database `<key>.db` + `-wal`/`-shm`/`-journal` under
   `--sqlite-dir` (ePHPm's `[db.sqlite].dir`) — the dominant disk consumer on a
   WordPress preview;
-* the `<label>.toml` docroot override under `--site-overrides-dir`;
+* the `<key>.toml` docroot override under `--site-overrides-dir`;
 * the per-vhost temp/session state root under `--vhost-temp-base` (default:
   this process's `<system temp>/ephpm-vhosts`, matching ePHPm's default). The
   directory name embeds a hash ePHPm computed over the container path; the
-  daemon reproduces it and additionally sweeps for this label's exact name
-  shape (`<label>-<16 hex>`), so a hash it cannot reproduce still gets reaped.
+  daemon reproduces it and additionally sweeps for this site's exact name
+  shape (`<key>-<16 hex>`), so a hash it cannot reproduce still gets reaped.
 
 Leave `--sqlite-dir` / `--site-overrides-dir` unset and those artifacts are
 left in place (logged, not silent). In cluster mode every node's daemon runs
@@ -153,14 +169,15 @@ seconds forever.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--sites-dir` | `SWITCHBOARD_SITES_DIR` | `/var/www/sites` | ePHPm's sites directory. Previews land at `<sites_dir>/<preview.label>/`. |
+| `--sites-dir` | `SWITCHBOARD_SITES_DIR` | `/var/www/sites` | ePHPm's sites directory. Previews land at `<sites_dir>/<site-key>/`. |
 | `--preview-domain` | `SWITCHBOARD_PREVIEW_DOMAIN` | `preview.ephpm.dev` | Suffix appended to the label to form the preview host. |
+| `--sites-domain-suffix` | `SWITCHBOARD_SITES_DOMAIN_SUFFIX` | `.<preview-domain>` | ePHPm's `[server] sites_domain_suffix` **on this node**. Decides the site key (see above). Pass `""` for a node that configures no suffix. Must begin with a dot — ePHPm refuses a dotless one (ephpm#397). |
 | `--composer` | `SWITCHBOARD_COMPOSER` | `composer` | Composer command or path. |
 | `--secrets-file` | `SWITCHBOARD_SECRETS_FILE` | *(none)* | YAML secret store for `${secret.NAME}` references in a manifest's `env:`. |
 | `--health-timeout-secs` | `SWITCHBOARD_HEALTH_TIMEOUT_SECS` | `60` | How long to poll the manifest's `health:` path for a 200. `0` disables the gate. |
 | `--health-interval-secs` | `SWITCHBOARD_HEALTH_INTERVAL_SECS` | `2` | Seconds between health polls. |
-| `--sqlite-dir` | `SWITCHBOARD_SQLITE_DIR` | *(none)* | ePHPm's `[db.sqlite].dir`. Teardown removes the preview's `<label>.db` (+ journal files) from here; unset, databases accumulate. |
-| `--site-overrides-dir` | `SWITCHBOARD_SITE_OVERRIDES_DIR` | *(none)* | ePHPm's `site_overrides_dir`. Teardown removes the preview's `<label>.toml` from here. |
+| `--sqlite-dir` | `SWITCHBOARD_SQLITE_DIR` | *(none)* | ePHPm's `[db.sqlite].dir`. Teardown removes the preview's `<key>.db` (+ journal files) from here; unset, databases accumulate. |
+| `--site-overrides-dir` | `SWITCHBOARD_SITE_OVERRIDES_DIR` | *(none)* | ePHPm's `[server] site_overrides_dir` — a directory **outside** `sites_dir` (ePHPm refuses to start otherwise). The deploy writes each preview's `<key>.toml` document-root override here and teardown removes it. **Unset, a manifest's `docroot:` cannot be honoured** and ePHPm serves the whole checkout — the deploy warns. |
 | `--vhost-temp-base` | `SWITCHBOARD_VHOST_TEMP_BASE` | `<system temp>/ephpm-vhosts` | Where ePHPm keeps per-vhost temp/session state roots. Set explicitly when the daemon and ePHPm do not share a temp dir (`PrivateTmp`, differing `TMPDIR`). |
 
 Secrets can also come from `SWITCHBOARD_SECRET_<NAME>` environment variables
