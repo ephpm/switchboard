@@ -13,7 +13,8 @@ things about the environment, because it is not a normal PHP host:
 3. `open_basedir` confines you to your own checkout. `shell_exec` and friends
    are gone.
 4. **Persistent connections are disabled.** Redis `pconnect`, mysqli `p:`.
-5. The **web root is your repository root** today, whatever `docroot:` says.
+5. `docroot:` is your web root — but only when the operator has configured
+   `--site-overrides-dir` on the preview host.
 6. Build and seed commands run **outside** ePHPm, so they cannot reach your
    preview's database directly.
 
@@ -65,7 +66,7 @@ matter and forgiving about the rest:
 |---|---|---|---|
 | `version` | int | **required** | Only `1`. A missing or unknown version **fails the deploy** — a broken contract must not silently deploy the wrong thing. |
 | `php` | string | `"8.5"` | Selects which PHP instance serves you. `8.5` → `https://<host>`; older minors get a port: `8.4` → `:8084`, `8.3` → `:8083` (formula `8080 + minor`). A version that is not `8.<minor>` falls back to the default URL rather than emitting a bogus port. |
-| `docroot` | string | `"."` | Relative to the repo root. Today this affects the **`.env` heuristic**, the **WebSocket auto-detect path**, and the **working directory of `seed:` steps**. Switchboard does **not** translate it into the web root the server serves — see [§5](#5-the-web-root-is-your-repo-root-today). |
+| `docroot` | string | `"."` | Relative to the repo root, and **the web root ePHPm serves** — switchboard publishes it as ePHPm's per-site document-root override. Also sets the WebSocket auto-detect path and the working directory of `seed:` steps. A value ePHPm would refuse (`..`, absolute, non-existent) **fails the deploy**. See [§5](#5-docroot-is-your-web-root). |
 | `build` | list of strings | `[]` | Shell commands (`sh -c`) run in the checkout, in order, **before** the site goes live. A failing step is logged and the deploy **continues**. If `build` is empty and a `composer.json` exists, an implicit `composer install --no-dev --no-interaction --optimize-autoloader --quiet` runs instead. |
 | `services.database` | `"turso"` \| `false` | `"turso"` | `"turso"` (case-insensitive), `true`, `false`, or `"none"`. Any other string is a parse error naming the field. |
 | `services.kv` | bool | `true` | Requests the embedded KV store. |
@@ -94,9 +95,9 @@ or `wp-config-sample.php` → WordPress; then `composer.json` containing
 | Drupal | `web` | `composer install …` | — |
 | Generic | `.` | *(implicit composer if `composer.json`)* | — |
 
-Read [§5](#5-the-web-root-is-your-repo-root-today) and
-[§8](#8-build-and-seed-run-outside-ephpm) before relying on the Laravel and
-Symfony rows: both of those defaults have a gap on the current host.
+The Laravel/Symfony/Drupal rows depend on the operator having configured
+`--site-overrides-dir` — read [§5](#5-docroot-is-your-web-root). Read
+[§8](#8-build-and-seed-run-outside-ephpm) before relying on their `seed:` steps.
 
 `ephpm/wordpress-sample` ships a conforming manifest —
 [`ephpm.yaml`](https://github.com/ephpm/wordpress-sample/blob/main/ephpm.yaml)
@@ -203,30 +204,35 @@ Read it from `$_SERVER` on every request; never bake it into `wp-config.php`,
 This is the least intuitive part of the contract, so it is worth being precise.
 **Verified** in `src/deployer.rs::materialize_env`.
 
-At deploy time switchboard resolves your `env:` map and writes:
+At deploy time switchboard resolves your `env:` map and writes, at your
+repository root:
 
 | File | When | Web-reachable? |
 |---|---|---|
-| `.ephpm-preview-prepend.php` | always | No — dot-prefixed paths return **403** |
-| `.env` | only when `docroot != "."` | No — **403** |
+| `.env` | always | No — dot-prefixed paths return **403** |
+| `.ephpm-preview-prepend.php` | always | No — **403** |
 | `.switchboard-preview.json` | always (env **keys** only, never values) | No — **403** |
 
-The prepend file sets `putenv()`, `$_ENV` and `$_SERVER` for each variable. It
-is meant to be loaded via `auto_prepend_file` — but the `ini:` block is
-advisory, and nothing on the current host applies it. **Verified:**
-`ini_get('auto_prepend_file')` on a live preview returns `''`.
+All three are dot-prefixed, and ePHPm's `hidden_files` default is `deny`, so
+none of them is readable over HTTP even when your repository root *is* the web
+root. That is what makes writing the `.env` there safe.
 
-So today:
+So:
 
-- **`docroot != "."`** (Laravel, Symfony, Drupal): your `env:` values arrive
-  through the generated **`.env`** file, which your framework's dotenv loader
-  reads normally. ⚠️ **switchboard overwrites `.env` unconditionally.** If your
-  repo commits a `.env`, it is replaced. Put preview values in `env:`.
-- **`docroot == "."`** (WordPress, most bespoke apps): no `.env` is written,
-  and the prepend is not auto-loaded, so **your `env:` values do not reach
-  PHP** unless you load them yourself.
+- **Any app whose framework reads a `.env`** (Laravel, Symfony, Drupal, and
+  anything using `vlucas/phpdotenv` or `symfony/dotenv`) gets its `env:` values
+  with no work. ⚠️ **switchboard overwrites `.env`.** If your repo commits one,
+  it is replaced by the preview's — put preview values in `env:`. The deploy
+  logs a warning when it replaces a committed file.
+- **Apps that do not read a `.env`** (WordPress, most bespoke apps) need one
+  line — see below. There is no `auto_prepend_file` on this host:
+  ePHPm's per-site override channel understands `document_root` and nothing
+  else, so nothing loads the prepend for you
+  ([switchboard#4](https://github.com/ephpm/switchboard/issues/4) tracks
+  closing that, which needs a change in ePHPm itself).
+  **Verified:** `ini_get('auto_prepend_file')` on a live preview returns `''`.
 
-### Workaround for `docroot: "."` — load the prepend yourself
+### If your framework does not read `.env` — load the prepend yourself
 
 **Verified working** on a live preview:
 
@@ -339,75 +345,50 @@ migrations, that is the thing most likely to fail first.
 
 ---
 
-## 5. The web root is your repo root (today)
+## 5. `docroot:` is your web root
 
-**Verified, and this is the biggest sharp edge on the current host.**
-
-On a switchboard preview, ePHPm serves the vhost directory — your whole
-checkout — as the document root. `docroot:` in the manifest is recorded and used
-by switchboard, but nothing translates it into a served web root.
-
-To be precise about where the gap is, because it is not where you would guess:
-ePHPm *can* serve a per-site document root. It reads one from an **operator-owned
-override file** outside the tenant checkout (`[server] site_overrides_dir`, a
+`docroot:` now decides what the preview serves. At deploy time switchboard
+translates it into ePHPm's per-site document-root override — an
+**operator-owned** file outside your checkout (`[server] site_overrides_dir`, a
 `<site-key>.toml` carrying `document_root = "public"`). ePHPm deliberately never
-reads a document root from inside your repository — a tenant must not be able to
-re-point its own web root. What is missing is the switchboard half: nothing
-writes that override file from your `ephpm.yaml`'s `docroot:`
-([switchboard#3](https://github.com/ephpm/switchboard/issues/3)). So unless your
-operator has hand-written an override for your site, the effect below is what you
-get.
+reads a document root from inside your repository, because a tenant must not be
+able to re-point its own web root; switchboard is the trusted party that
+translates your manifest into that file.
 
-Measured on a live preview whose repo root contained a Laravel-shaped tree:
+So for `docroot: "public"`:
 
 ```
-GET /composer.json             → 200   {"name":"demo/app"}
-GET /vendor/secret.txt         → 200   private vendor file
-GET /storage/logs/laravel.log  → 200   stack trace with DB_PASSWORD=abc
-GET /.env                      → 403   (hidden-file rule)
-GET /public/index.php          → 200   LARAVEL FRONT CONTROLLER
+GET /                          → your front controller (public/index.php)
+GET /vendor/secret.txt         → 404   (outside the web root)
+GET /storage/logs/laravel.log  → 404   (outside the web root)
+GET /composer.json             → 404   (outside the web root)
 ```
 
-and on a repo with **only** `public/index.php` and no root `index.php`:
+This is what the WordPress case (`docroot: "."`) always did — its repository
+root *is* its web root, so nothing changes for it.
 
-```
-GET /                          → 404
-GET /index.php                 → 404
-GET /public/index.php          → 200
-```
+### Rules your `docroot:` must satisfy
 
-Two consequences:
+The deploy **fails loudly** rather than silently serving your whole checkout if
+`docroot:` is anything ePHPm would refuse:
 
-1. **A front-controller app does not route.** `docroot: public` does not make
-   `/` serve `public/index.php`. Your preview 404s.
-2. **Everything above your web root is published.** Dotfiles (`.env`, `.git`)
-   are blocked with 403 by the hidden-file rule, but `composer.json`,
-   `vendor/`, `config/`, and `storage/logs/*.log` are not dotfiles. A Laravel
-   log routinely contains stack traces with credentials in them.
+* a plain relative path (`public`, `web`, `app/htdocs`) — no `..`, no leading
+  `/`, no drive letter, no backslashes;
+* characters from `[A-Za-z0-9._/-]` only;
+* it must **exist** in the built checkout and be a directory. If your web root
+  is produced by a `build:` step, that step has to run first — it does: `build:`
+  runs before this check.
+* a symlink is fine as long as it resolves inside your checkout.
 
-### What to do about it now
+### Two things to check with your operator
 
-- **WordPress and any app whose repo root *is* its web root**: nothing. This
-  case works as-is, which is why it is the well-trodden path today.
-- **Laravel / Symfony / Drupal**: unless your operator has hand-written a
-  per-site document-root override for you
-  ([§11](#11-known-gaps-and-in-flight-work)), add a root front controller and
-  keep sensitive files out of the checkout:
-
-  ```php
-  <?php // index.php at the repo root — preview shim
-  require __DIR__ . '/public/index.php';
-  ```
-
-  Relative asset paths under `public/` will still need `/public/...` prefixes
-  unless you also add a rewrite, so treat this as a stopgap for a *smoke-test*
-  preview, not a faithful one.
-- Add a `.gitignore`d, never-committed `storage/logs`, or truncate logs in a
-  `build:` step. Assume anything in your checkout that is not dot-prefixed is
-  world-readable at your preview URL.
-
-Ask the operator whether the per-site document-root override is deployed before
-you rely on `docroot:` doing anything.
+1. `--site-overrides-dir` must be configured on the preview host. If it is not,
+   there is nowhere to publish your `docroot:`, ePHPm serves your whole
+   checkout, and the deploy logs a warning saying exactly that. A preview whose
+   `/vendor/composer.json` returns 200 is the symptom.
+2. Everything above your web root is now unreachable — but that is a property of
+   the override, not of your repository. Keep treating a checkout as public
+   anyway: truncate `storage/logs` in a `build:` step and never commit secrets.
 
 ---
 
@@ -427,8 +408,15 @@ Set per request to exactly two entries: **your site container** and **your
 private temp/session root**. Not the shared `/tmp`. Measured:
 
 ```
-open_basedir = <sites_dir>/<your-host> : <tmp>/ephpm-vhosts/<your-host>-<hash>
+open_basedir = <sites_dir>/<site-key> : <tmp>/ephpm-vhosts/<site-key>-<hash>
 ```
+
+(The site key is your preview host with the host's domain suffix stripped —
+`ephpm-my-app-pr-42`, not the full FQDN, on the standard preview cluster.)
+
+Note this is the **container**, not your `docroot:` — so PHP can still
+`require` from above your web root, which is exactly what a front-controller
+app needs. `docroot:` narrows what HTTP serves, not what PHP can open.
 
 and reading a neighbouring site's `.env` by absolute path returned `false`
 (**verified**). `sys_temp_dir`, `upload_tmp_dir` and `session.save_path` are
@@ -693,12 +681,10 @@ present on your host rather than assuming it (§6).
 
 ### Laravel
 
-Works, with the §5 stopgap. `docroot: public` does not route yet.
-
 ```yaml
 version: 1
 php: "8.5"
-docroot: "public"           # honoured for .env + seed cwd; NOT for routing yet
+docroot: "public"           # the web root ePHPm serves
 build:
   - "composer install --no-dev --optimize-autoloader --no-interaction"
   - "php artisan key:generate --force"
@@ -713,8 +699,9 @@ env:
 health: "/"
 ```
 
-- Add the root `index.php` shim from §5, or accept a 404 until the server-side
-  override ships.
+- Confirm with your operator that `--site-overrides-dir` is configured; without
+  it `docroot: public` cannot be published and the preview serves the whole
+  checkout (§5).
 - **Do not** run `php artisan config:cache` — it freezes rotating credentials
   (§2).
 - `env('DB_PASSWORD')` works (verified adapter order, §2). Leave
@@ -749,7 +736,7 @@ env:
 health: "/"
 ```
 
-- Root `index.php` shim per §5.
+- Same `--site-overrides-dir` prerequisite as Laravel (§5).
 - `DATABASE_URL` is injected into `$_SERVER`, which Symfony's `Dotenv`
   respects. Beware the collision described in §2: prefer an explicit
   `$_SERVER['DATABASE_URL']` read if you are debugging a wrong-DSN symptom.
@@ -773,7 +760,7 @@ install` if you have a `composer.json`, a per-site database, the KV store, and
 Checklist for anything hand-rolled:
 
 - Read credentials from `$_SERVER`, with a fallback for local dev.
-- Put your entrypoint at the repo root (or add the §5 shim).
+- Put your entrypoint at the repo root, or name its directory in `docroot:` (§5).
 - No `exec`, no `mail`, no persistent connections.
 - Anything needing the database at deploy time goes over HTTP (§8).
 - Assume every non-dotfile in your repo is web-readable.
@@ -853,10 +840,10 @@ Labelled so you do not build on them.
 
 | Item | Status |
 |---|---|
-| Per-site document root (`docroot:` actually routing) | **Server side shipped; switchboard side not wired.** ePHPm serves a per-site document root from an operator-owned override outside the tenant checkout (`[server] site_overrides_dir`). Nothing yet generates that override from your `ephpm.yaml` `docroot:` ([switchboard#3](https://github.com/ephpm/switchboard/issues/3)), so §5 still applies unless your operator wrote one by hand. |
-| `ini:` block | **Advisory only.** Recorded in a sidecar; nothing applies it. `memory_limit` in your manifest does nothing. |
-| `env:` for `docroot: "."` apps | **Inert without the §3 workaround** — no `.env` is written and the prepend is not auto-loaded. |
-| `env:` for `docroot != "."` apps | Works, but **overwrites a committed `.env`**. |
+| Per-site document root (`docroot:` routing) | **Shipped both sides.** ePHPm reads an operator-owned override outside the tenant checkout (`[server] site_overrides_dir`); switchboard generates it from your `ephpm.yaml` `docroot:`. **Requires the operator to set `--site-overrides-dir`** — unset, ePHPm serves the whole checkout and the deploy warns. |
+| `auto_prepend_file` per site | **Not available.** ePHPm's per-site override channel understands `document_root` and nothing else, so the generated `.ephpm-preview-prepend.php` is never auto-loaded. Apps that need it `require_once` it (§3). [switchboard#4](https://github.com/ephpm/switchboard/issues/4). |
+| `ini:` block | **Advisory only.** Recorded in a sidecar; nothing applies it. `memory_limit` in your manifest does nothing. The deploy warns when you set it. |
+| `env:` | Delivered via a generated `.env` for every `docroot:` shape. **Overwrites a committed `.env`** (logged). Apps that do not read a `.env` need the one-line `require_once` in §3. |
 | Auth gate for private previews | **Not available.** Middleware for gating previews behind HTTP Basic / signed session cookies / GitHub OAuth was proposed upstream (ePHPm PRs #387, #388, #389) and **closed unmerged** — there is no basic-auth, session-cookie or OAuth builtin today. Assume your preview URL is public. |
 | Seeding via KV-sourced credentials in multi-tenant mode | **Not possible today** (ePHPm issue #384) — the RESP listener has no operator-scoped path in multi-tenant mode. |
 | Clustered / multi-node previews | Per-site database isolation is **single-node only**. |
