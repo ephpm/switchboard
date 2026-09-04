@@ -6,7 +6,8 @@
 //! credential. What is left here is the half that needs to be unconfined:
 //!
 //! 1. **Consume the job queue** written by the API at `<state_dir>/queue/` —
-//!    claim, coalesce, and provision. See [`job`] and [`queue`].
+//!    claim, coalesce, re-validate against current state, and provision. See
+//!    [`job`], [`queue`] and [`validate`].
 //! 2. **Kick `/drain`** on the local ePHPm instance on a configurable interval,
 //!    because a PHP vhost has no timer of its own. See [`drain`].
 //! 3. **Talk to GitHub** — mint an installation token, post the preview comment
@@ -27,6 +28,7 @@ mod secrets;
 mod site_key;
 mod site_override;
 mod teardown;
+mod validate;
 mod webhook;
 
 use std::path::Path;
@@ -47,6 +49,7 @@ use drain::DrainKicker;
 use job::Intent;
 use queue::{ClaimedJob, Queue};
 use secrets::Secrets;
+use validate::Verdict;
 
 /// Shared application state.
 struct AppState {
@@ -235,7 +238,12 @@ async fn queue_loop(state: Arc<AppState>, queue: Queue, interval: Duration) -> a
 
 /// Run one claimed job, then either clear it or leave it in `claimed/`.
 async fn process_job(state: &AppState, queue: &Queue, claimed: ClaimedJob) {
-    let ClaimedJob { name, path, job } = claimed;
+    let ClaimedJob {
+        name,
+        path,
+        job,
+        enqueued_at_ms,
+    } = claimed;
     let intent = match job.intent() {
         Ok(intent) => intent,
         // Unreachable in practice: Job::parse validates the intent. Handled
@@ -260,6 +268,29 @@ async fn process_job(state: &AppState, queue: &Queue, claimed: ClaimedJob) {
         "processing job"
     );
 
+    // A claimed job is a statement about the past. Before acting on a deploy,
+    // check it still describes the present (switchboard#18) — a queue that sat
+    // through a restart can otherwise provision a preview for a merged PR.
+    if intent == Intent::Deploy {
+        if let Verdict::Discard { reason } = deploy_still_wanted(state, &req, enqueued_at_ms).await
+        {
+            tracing::warn!(
+                job = %name,
+                label = %req.label,
+                repo = %req.repo_full_name,
+                pr = req.pr_number,
+                %reason,
+                "discarding a stale deploy job instead of applying it"
+            );
+            // Resolved, not failed: the job has been dealt with correctly, so
+            // it is cleared rather than parked in claimed/ for an operator.
+            if let Err(e) = queue.complete(&name) {
+                tracing::warn!(job = %name, %e, "discarded job could not be cleared");
+            }
+            return;
+        }
+    }
+
     let outcome = match intent {
         Intent::Deploy => handle_deploy(state, &req).await,
         Intent::Teardown => handle_teardown(state, &req).await,
@@ -280,6 +311,67 @@ async fn process_job(state: &AppState, queue: &Queue, claimed: ClaimedJob) {
             %e,
             "job failed — left in claimed/ for inspection"
         ),
+    }
+}
+
+/// Is this deploy job still worth applying?
+///
+/// Two checks, in cost order (see [`validate`] for the full reasoning):
+///
+/// 1. **Age** — offline arithmetic on the enqueue time, so it runs on every
+///    node including the ones with no GitHub App configured.
+/// 2. **Current PR state** — authoritative, one API call, and **fails open**:
+///    if GitHub cannot be asked, the job is applied rather than dropped.
+///
+/// Only deploys reach here; a teardown is never wrong to apply late.
+async fn deploy_still_wanted(
+    state: &AppState,
+    req: &PreviewRequest,
+    enqueued_at_ms: Option<u64>,
+) -> Verdict {
+    if enqueued_at_ms.is_none() {
+        tracing::warn!(
+            label = %req.label,
+            "job has no readable enqueue time — the age bound cannot be applied to it"
+        );
+    }
+    let age = validate::queue_age(enqueued_at_ms, validate::now_ms());
+    let verdict = validate::age_verdict(age, state.config.max_job_age());
+    if verdict.is_discard() {
+        return verdict;
+    }
+
+    // The authoritative check needs a token. Without one the age bound above is
+    // the whole story — say so at DEBUG rather than warning per job, since the
+    // operator was already told at startup that reporting is off.
+    if !state.config.github_reporting_enabled() || req.installation_id.is_none() {
+        tracing::debug!(
+            label = %req.label,
+            "no GitHub credentials for this job — applying it on the age bound alone"
+        );
+        return Verdict::Apply;
+    }
+    let Some(client) = github_client(state, req).await else {
+        return Verdict::Apply;
+    };
+
+    match client
+        .pull_request_state(&req.owner, &req.repo_name, req.pr_number)
+        .await
+    {
+        Ok(pr_state) => {
+            tracing::debug!(label = %req.label, ?pr_state, "re-checked pull request state");
+            validate::pr_state_verdict(&pr_state)
+        }
+        // Fail open: a GitHub outage must not silently stop deploying previews.
+        Err(e) => {
+            tracing::warn!(
+                label = %req.label,
+                %e,
+                "could not re-check the pull request state — applying the job anyway"
+            );
+            Verdict::Apply
+        }
     }
 }
 
