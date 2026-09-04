@@ -96,16 +96,41 @@ pub struct Config {
 
     // ── teardown (per-site artifacts outside sites_dir) ────────────────
     /// ePHPm's `[db.sqlite].dir`, where each preview's `<label>.db` (and its
-    /// `-wal`/`-shm`/`-journal` companions) lives. Teardown removes them;
-    /// unset, per-site databases are left in place and accumulate.
+    /// `-wal`/`-shm`/`-journal` companions) lives. Teardown removes them.
+    ///
+    /// **Required** unless `--allow-incomplete-teardown` is set: a daemon that
+    /// does not know this path cannot remove a tenant's database when its PR
+    /// closes, and used to report the teardown as a success anyway
+    /// (switchboard#17).
     #[arg(long, env = "SWITCHBOARD_SQLITE_DIR")]
     pub sqlite_dir: Option<PathBuf>,
 
     /// ePHPm's `site_overrides_dir`, where each preview's `<label>.toml`
-    /// docroot override lives. Teardown removes it; unset, override files are
-    /// left in place.
+    /// docroot override lives. Teardown removes it.
+    ///
+    /// **Required** unless `--allow-incomplete-teardown` is set — and unset it
+    /// also means a manifest's `docroot:` cannot be honoured on the deploy
+    /// side, so it is the same "this node is not fully wired to ePHPm" fact
+    /// twice.
     #[arg(long, env = "SWITCHBOARD_SITE_OVERRIDES_DIR")]
     pub site_overrides_dir: Option<PathBuf>,
+
+    /// Run with an incomplete teardown: start even though `--sqlite-dir` or
+    /// `--site-overrides-dir` is unset, and let teardown report success while
+    /// leaving those artifacts on disk.
+    ///
+    /// This is an acknowledgement, not a feature. The paths are ePHPm's
+    /// configuration and the daemon cannot derive them, so the only way to make
+    /// "teardown left a tenant database behind" impossible to reach by accident
+    /// is to refuse to start without them. An operator whose nodes genuinely
+    /// have no per-site databases (or no override directory) says so here, once,
+    /// and gets a `WARN` per teardown naming what was not removed.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "SWITCHBOARD_ALLOW_INCOMPLETE_TEARDOWN"
+    )]
+    pub allow_incomplete_teardown: bool,
 
     /// The directory ePHPm keeps per-vhost temp/session state roots in.
     /// Defaults to this process's `<system temp>/ephpm-vhosts`, which matches
@@ -235,6 +260,34 @@ impl Config {
             "--fork-secrets has no effect without --allow-fork-deploy — set \
              both to build forks with operator secrets, or neither"
         );
+        // A daemon that cannot remove a tenant's database when its PR closes is
+        // a data-retention problem, and the live preview cluster hit it exactly
+        // this way: a hand-provisioned systemd unit passed neither path, so
+        // every webhook teardown left `<key>.db` + `-wal` on disk and reported
+        // success (switchboard#17). The unit is not in this repo, so a
+        // config-only fix is undiscoverable — refuse to start instead, and make
+        // the operator's "yes, I know" an explicit flag.
+        if !self.allow_incomplete_teardown {
+            let mut missing: Vec<&str> = Vec::new();
+            if self.sqlite_dir.is_none() {
+                missing.push("--sqlite-dir (SWITCHBOARD_SQLITE_DIR, ePHPm's [db.sqlite].dir)");
+            }
+            if self.site_overrides_dir.is_none() {
+                missing.push(
+                    "--site-overrides-dir (SWITCHBOARD_SITE_OVERRIDES_DIR, ePHPm's \
+                     [server] site_overrides_dir)",
+                );
+            }
+            anyhow::ensure!(
+                missing.is_empty(),
+                "teardown would be incomplete: {} not configured. Teardown removes \
+                 each preview's per-site database and docroot override from these \
+                 directories; without them a closed PR leaves its tenant database \
+                 on disk. Set them, or pass --allow-incomplete-teardown \
+                 (SWITCHBOARD_ALLOW_INCOMPLETE_TEARDOWN=true) to accept that.",
+                missing.join(" and ")
+            );
+        }
         // ePHPm rejects a `sites_domain_suffix` without a leading dot at config
         // load (#397: `Host: <suffix>` otherwise strips to the empty string and
         // `sites_dir.join("")` is the whole fleet). A daemon configured with a
@@ -260,17 +313,36 @@ mod tests {
     /// The one flag with no default and no `Option`: a parse must supply it.
     const REQUIRED: &[&str] = &["switchboard", "--state-dir", "/srv/api/.switchboard"];
 
+    /// The two teardown roots [`Config::validate`] now insists on (#17). Not
+    /// needed to *parse* — only to pass validation without acknowledging an
+    /// incomplete teardown.
+    const TEARDOWN_ROOTS: &[&str] = &[
+        "--sqlite-dir",
+        "/var/lib/ephpm-web/db",
+        "--site-overrides-dir",
+        "/etc/ephpm/sites",
+    ];
+
     fn parse(extra: &[&str]) -> Config {
         let args = REQUIRED.iter().chain(extra.iter());
         Config::try_parse_from(args).expect("expected a valid config parse")
     }
 
-    /// A parse with the drain kick switched off — the smallest config that
-    /// validates. Used by tests that are about something other than draining.
+    /// A parse whose teardown is complete. Used by every test that calls
+    /// `validate()` about something other than the teardown gate itself.
+    fn parse_complete(extra: &[&str]) -> Config {
+        let mut args = TEARDOWN_ROOTS.to_vec();
+        args.extend_from_slice(extra);
+        parse(&args)
+    }
+
+    /// A complete parse with the drain kick switched off — the smallest config
+    /// that validates. Used by tests that are about something other than
+    /// draining.
     fn parse_single_node(extra: &[&str]) -> Config {
         let mut args = vec!["--drain-interval-secs", "0"];
         args.extend_from_slice(extra);
-        parse(&args)
+        parse_complete(&args)
     }
 
     #[test]
@@ -284,12 +356,66 @@ mod tests {
         assert_eq!(c.health_timeout_secs, 60);
         assert_eq!(c.health_interval_secs, 2);
         assert!(c.secrets_file.is_none());
-        // Teardown knobs default to unset: db/override cleanup is opt-in
-        // (their locations are deployment-specific), the vhost temp base
-        // falls back to the process temp dir at use time.
+        // The teardown roots have no defaults — their locations are ePHPm's
+        // configuration and cannot be derived. They *parse* as absent and are
+        // then refused by validate() unless the operator acknowledges an
+        // incomplete teardown (#17). The vhost temp base is different: its
+        // default is real, and applied at use time.
         assert!(c.sqlite_dir.is_none());
         assert!(c.site_overrides_dir.is_none());
         assert!(c.vhost_temp_base.is_none());
+        assert!(!c.allow_incomplete_teardown, "incompleteness is opt-in");
+    }
+
+    // ── teardown completeness (#17) ─────────────────────────────────────
+
+    /// The live cluster's configuration: a unit passing neither teardown root.
+    /// It used to start happily and abandon a tenant database on every closed
+    /// PR; now it does not start at all.
+    #[test]
+    fn missing_teardown_roots_refuse_to_start() {
+        let c = parse(&["--drain-interval-secs", "0"]);
+        let err = c
+            .validate()
+            .expect_err("a daemon that cannot reap tenant databases must not start");
+        let msg = err.to_string();
+        assert!(msg.contains("--sqlite-dir"), "{msg}");
+        assert!(msg.contains("--site-overrides-dir"), "{msg}");
+        // The message has to carry the way out, or the operator's only option
+        // is to guess.
+        assert!(msg.contains("--allow-incomplete-teardown"), "{msg}");
+    }
+
+    #[test]
+    fn one_missing_teardown_root_is_still_refused_and_named_alone() {
+        let c = parse(&[
+            "--drain-interval-secs",
+            "0",
+            "--site-overrides-dir",
+            "/etc/ephpm/sites",
+        ]);
+        let msg = c.validate().unwrap_err().to_string();
+        assert!(msg.contains("--sqlite-dir"), "{msg}");
+        assert!(
+            !msg.contains("--site-overrides-dir ("),
+            "a configured root must not be listed as missing: {msg}"
+        );
+    }
+
+    /// Both roots set is the shape the preview cluster's unit must move to.
+    #[test]
+    fn both_teardown_roots_validate() {
+        parse_single_node(&[]).validate().unwrap();
+    }
+
+    /// The acknowledged escape hatch, for a deployment with no per-site
+    /// databases at all.
+    #[test]
+    fn acknowledged_incomplete_teardown_starts() {
+        let c = parse(&["--drain-interval-secs", "0", "--allow-incomplete-teardown"]);
+        assert!(c.allow_incomplete_teardown);
+        c.validate()
+            .expect("an explicit acknowledgement is a valid deployment");
     }
 
     // ── the site-key derivation's one input (#13) ───────────────────────
@@ -346,7 +472,9 @@ mod tests {
 
     #[test]
     fn teardown_knobs_parse() {
-        let c = parse_single_node(&[
+        let c = parse(&[
+            "--drain-interval-secs",
+            "0",
             "--sqlite-dir",
             "/var/lib/ephpm/sqlite",
             "--site-overrides-dir",
@@ -376,7 +504,7 @@ mod tests {
 
     #[test]
     fn zero_drain_interval_disables_the_kick() {
-        let c = parse(&["--drain-interval-secs", "0"]);
+        let c = parse_complete(&["--drain-interval-secs", "0"]);
         assert!(
             !c.drain_enabled(),
             "0 must disable the kick outright (single-node mode)"
@@ -388,16 +516,16 @@ mod tests {
 
     #[test]
     fn drain_enabled_requires_host_and_token_file() {
-        let missing_both = parse(&[]);
+        let missing_both = parse_complete(&[]);
         assert!(
             missing_both.validate().is_err(),
             "an enabled kick with no vhost must not start"
         );
 
-        let missing_token = parse(&["--drain-host", "switchboard.example"]);
+        let missing_token = parse_complete(&["--drain-host", "switchboard.example"]);
         assert!(missing_token.validate().is_err());
 
-        let complete = parse(&[
+        let complete = parse_complete(&[
             "--drain-host",
             "switchboard.example",
             "--drain-token-file",
@@ -513,7 +641,7 @@ mod tests {
 
     #[test]
     fn explicit_flags_override_defaults() {
-        let c = parse(&[
+        let c = parse_complete(&[
             "--queue-interval-secs",
             "5",
             "--drain-interval-secs",
