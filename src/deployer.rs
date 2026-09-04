@@ -216,6 +216,8 @@ pub struct DeployResult {
 ///    continues — matching the POC's composer behavior).
 /// 4. Materialize `env:` — resolve `${secret.NAME}` from switchboard's own
 ///    secret store and write it where the app can read it.
+///    Then move the deploy manifest out of the served root (switchboard#16) —
+///    after `build:` has had it, before it could ever be requested.
 /// 5. Write (or clear) the per-site document-root override, **before** the swap
 ///    so the vhost is never briefly served with its container as the web root.
 /// 6. Atomic swap the checkout into `sites_dir`.
@@ -299,6 +301,25 @@ pub async fn deploy_preview(
     let git_dir = tmp_dir.join(".git");
     if git_dir.exists() {
         tokio::fs::remove_dir_all(&git_dir).await.ok();
+    }
+
+    // (4b) Take the deploy manifest out of the served root, now that it has
+    // been read and `build:` (which runs in the checkout) is done.
+    //
+    // `ephpm.yaml` is not dot-prefixed, and for `docroot: "."` the checkout
+    // root IS the web root — so it was served: `GET /ephpm.yaml` → 200 with the
+    // build commands, the enabled services and the whole seed sequence
+    // (switchboard#16). Before the swap, so it is never in a live web root even
+    // briefly. See `manifest::quarantine_manifests` for why the per-site
+    // override cannot cover this.
+    let quarantined = crate::manifest::quarantine_manifests(&tmp_dir).await?;
+    if !quarantined.is_empty() {
+        tracing::info!(
+            %hostname,
+            manifests = %quarantined.join(", "),
+            archive = crate::manifest::MANIFEST_ARCHIVE_DIR,
+            "deploy manifest(s) removed from the served root"
+        );
     }
 
     // (5) The per-site document-root override, written BEFORE the swap.
@@ -519,6 +540,13 @@ async fn run_build(manifest: &AppManifest, checkout: &Path, composer: &str, host
 ///   still a working preview, and failing every Laravel deploy on a node the
 ///   operator has not finished configuring is worse than saying so loudly.
 ///
+/// `docroot: "."` also gets a `warn!` of its own, in every configuration. It
+/// stays **supported** — WordPress genuinely serves from its repository root,
+/// and refusing it would refuse the only app this cluster deploys — but it
+/// means every non-dot-prefixed file in the checkout is public, which is how
+/// switchboard#16 happened. That is a property worth one line per deploy rather
+/// than a footnote in a guide.
+///
 /// # Errors
 ///
 /// Returns an error if the override file cannot be written or removed.
@@ -528,6 +556,18 @@ async fn apply_document_root(
     document_root: &DocumentRoot,
     hostname: &str,
 ) -> anyhow::Result<()> {
+    if !document_root.needs_override_file() {
+        tracing::warn!(
+            %hostname,
+            site_key,
+            "docroot is the repository root (`.`) — every non-dot-prefixed file \
+             in this checkout is publicly served, including anything a build \
+             step wrote. switchboard removes its own artifacts and the deploy \
+             manifest, but it cannot vet the repository's contents \
+             (switchboard#16). Declare a `docroot:` subdirectory to narrow it"
+        );
+    }
+
     let Some(overrides_dir) = ctx.site_overrides_dir else {
         if document_root.needs_override_file() {
             tracing::warn!(
@@ -1083,7 +1123,13 @@ mod tests {
     /// default is `deny` (403). If one ever stops being a dotfile, this fails.
     #[test]
     fn generated_files_are_all_hidden_from_http() {
-        for name in [PREPEND_FILE, DOTENV_FILE, SIDECAR_FILE] {
+        for name in [
+            PREPEND_FILE,
+            DOTENV_FILE,
+            SIDECAR_FILE,
+            // Where the deploy parks the app's own manifest (switchboard#16).
+            crate::manifest::MANIFEST_ARCHIVE_DIR,
+        ] {
             assert!(
                 name.starts_with('.'),
                 "{name} must be dot-prefixed — it can sit in a web-served root"
