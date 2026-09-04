@@ -92,6 +92,30 @@ async fn main() -> anyhow::Result<()> {
              (switchboard#3)"
         );
     }
+    // validate() has already refused to start unless this was acknowledged, so
+    // reaching here means the operator opted in. Say what it costs, once, at
+    // WARN — a teardown that leaves a tenant database behind is data retention.
+    if config.allow_incomplete_teardown {
+        let mut left: Vec<&str> = Vec::new();
+        if config.sqlite_dir.is_none() {
+            left.push("per-site databases (<key>.db and journals)");
+        }
+        if config.site_overrides_dir.is_none() {
+            left.push("docroot override files (<key>.toml)");
+        }
+        if left.is_empty() {
+            info!(
+                "--allow-incomplete-teardown is set but both teardown roots are \
+                 configured — the flag changes nothing on this node"
+            );
+        } else {
+            tracing::warn!(
+                left_behind = %left.join(", "),
+                "--allow-incomplete-teardown is set: teardown will report success \
+                 while leaving these artifacts on disk (switchboard#17)"
+            );
+        }
+    }
 
     if config.github_reporting_enabled() {
         let app_key = config
@@ -439,14 +463,25 @@ async fn handle_teardown(state: &AppState, req: &PreviewRequest) -> anyhow::Resu
         sqlite_dir: state.config.sqlite_dir.as_deref(),
         site_overrides_dir: state.config.site_overrides_dir.as_deref(),
         vhost_temp_base: state.config.vhost_temp_base.as_deref(),
+        state_dir: &state.config.state_dir,
+        allow_incomplete: state.config.allow_incomplete_teardown,
     };
     // The same derivation the deploy used — teardown must remove the artifacts
     // that were actually created, which on a node without a
     // `sites_domain_suffix` are named by the full preview FQDN, not the label.
+    // The API's `applied/` marker is the one artifact keyed by the label
+    // instead, so both names go in.
     let suffix = state.config.effective_sites_domain_suffix();
     let host = req.preview_host(&state.config.preview_domain);
     let key = site_key::site_key(&host, suffix.as_deref())?;
-    teardown::teardown_preview(&key, &ctx).await?;
+    teardown::teardown_preview(
+        &teardown::Preview {
+            site_key: &key,
+            label: &req.label,
+        },
+        &ctx,
+    )
+    .await?;
 
     if let Some(client) = github_client(state, req).await {
         if let Err(e) = client.post_teardown_comment(req).await {

@@ -14,7 +14,25 @@
 //! * `<site_overrides_dir>/<key>.toml` — the docroot override the deploy
 //!   wrote for ePHPm (ephpm#391);
 //! * the per-vhost temp/session state root ePHPm creates under
-//!   `<temp>/ephpm-vhosts/` — sessions, uploads, PHP temp files.
+//!   `<temp>/ephpm-vhosts/` — sessions, uploads, PHP temp files;
+//! * `<state_dir>/applied/<label>` — switchboard-api's record of the desired
+//!   state **this node** has already materialized (issue #19). Keyed by the
+//!   preview *label*, not the site key; see [`Preview`].
+//!
+//! # An unconfigured root is not a quiet skip (issue #17)
+//!
+//! `sqlite_dir` and `site_overrides_dir` are still `Option`, because their
+//! locations are ePHPm's configuration and this daemon cannot derive them. What
+//! changed is what an unset one *means*: the artifact class is named in the
+//! teardown's error and the job fails, so it lands in `queue/claimed/` for an
+//! operator instead of reporting success over a tenant database still on disk.
+//! An operator who genuinely runs without those roots says so once —
+//! `--allow-incomplete-teardown`, surfaced here as [`TeardownContext::allow_incomplete`]
+//! — and then gets a `WARN` per teardown naming what was not attempted.
+//!
+//! The live symptom this closes: the preview cluster's systemd unit passed
+//! neither flag, so every webhook-driven teardown removed the vhost directory,
+//! left `<key>.db` + `-wal` behind, and reported success.
 //!
 //! # Path safety
 //!
@@ -48,25 +66,57 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+/// Directory under `state_dir` holding switchboard-api's per-label record of
+/// the desired state this node has already queued (`<intent>@<sha>`).
+const APPLIED_DIR: &str = "applied";
+
+/// The two names a preview answers to, and why both are needed.
+///
+/// They are *usually* the same string and that is exactly the trap: on a node
+/// with `sites_domain_suffix` configured (what the preview cluster runs) the
+/// site key is the bare label, so a mix-up is invisible. On a node without one
+/// the site key is the full preview FQDN while the API's marker is still filed
+/// under the short label, and a mix-up silently reaps nothing. Named fields
+/// make the two impossible to swap at a call site.
+#[derive(Debug, Clone, Copy)]
+pub struct Preview<'a> {
+    /// ePHPm's **canonical site key** ([`crate::site_key`]) — names every
+    /// artifact ePHPm created: the vhost directory, the database, the override.
+    pub site_key: &'a str,
+    /// switchboard-api's **preview label** (`preview.label` in the job file) —
+    /// names the API's `applied/<label>` desired-state marker.
+    pub label: &'a str,
+}
+
 /// Non-repo inputs to a teardown: where the preview's artifacts live.
 ///
 /// `sqlite_dir` and `site_overrides_dir` mirror ePHPm's `[db.sqlite].dir` and
-/// `[server].site_overrides_dir`; when a knob is `None` that artifact class is
-/// left in place (stated in the log, not silently skipped).
+/// `[server].site_overrides_dir`. When one is `None` the teardown **fails**,
+/// naming the artifact it could not remove, unless `allow_incomplete` says the
+/// operator has accepted that (see the module docs and issue #17).
 pub struct TeardownContext<'a> {
     /// ePHPm sites directory — previews live at `<sites_dir>/<site_key>/`.
     pub sites_dir: &'a Path,
-    /// ePHPm's `[db.sqlite].dir`, where `<site_key>.db` lives. `None` = leave
-    /// database files in place.
+    /// ePHPm's `[db.sqlite].dir`, where `<site_key>.db` lives. `None` = this
+    /// node cannot remove per-site databases at all.
     pub sqlite_dir: Option<&'a Path>,
     /// ePHPm's `site_overrides_dir`, where `<site_key>.toml` lives. `None` =
-    /// leave override files in place.
+    /// this node cannot remove override files at all.
     pub site_overrides_dir: Option<&'a Path>,
     /// The directory ePHPm keeps per-vhost state roots in. `None` = use this
     /// process's `std::env::temp_dir()/ephpm-vhosts`, which matches ePHPm's
     /// default when both processes see the same `TMPDIR` (set the flag
-    /// explicitly when they don't, e.g. systemd `PrivateTmp`).
+    /// explicitly when they don't, e.g. systemd `PrivateTmp`). Unlike the two
+    /// above this default is a real one, so `None` skips nothing.
     pub vhost_temp_base: Option<&'a Path>,
+    /// switchboard-api's state directory (the daemon's `--state-dir`), whose
+    /// `applied/<label>` marker records the desired state this node has queued.
+    /// Always known — it is the queue's own root.
+    pub state_dir: &'a Path,
+    /// The operator has acknowledged (`--allow-incomplete-teardown`) that this
+    /// node leaves some artifact classes behind. Turns the failure above into a
+    /// `WARN` naming the same artifacts.
+    pub allow_incomplete: bool,
 }
 
 /// Remove a preview deployment and every per-site artifact it left behind.
@@ -78,11 +128,21 @@ pub struct TeardownContext<'a> {
 /// earlier one failed, and the failures are reported together at the end so
 /// the job lands in `claimed/` for inspection.
 ///
+/// An artifact class this node is **not configured** to remove counts as a
+/// failure too (issue #17): the phases that can run still run, and the error
+/// names exactly what was left on disk. `ctx.allow_incomplete` downgrades that
+/// to a `WARN` for an operator who has said the incompleteness is intended.
+///
 /// # Errors
 ///
-/// Returns an error if the site key is not one ePHPm would serve, or if
-/// any artifact exists but cannot be removed.
-pub async fn teardown_preview(site_key: &str, ctx: &TeardownContext<'_>) -> anyhow::Result<()> {
+/// Returns an error if the site key is not one ePHPm would serve, if any
+/// artifact exists but cannot be removed, or if an artifact class was skipped
+/// for want of configuration without `allow_incomplete`.
+pub async fn teardown_preview(
+    preview: &Preview<'_>,
+    ctx: &TeardownContext<'_>,
+) -> anyhow::Result<()> {
+    let Preview { site_key, label } = *preview;
     validate_site_key(site_key)?;
 
     let mut failures: Vec<String> = Vec::new();
@@ -117,9 +177,18 @@ pub async fn teardown_preview(site_key: &str, ctx: &TeardownContext<'_>) -> anyh
             }
         }
     } else {
-        // Stated rather than silently skipped, exactly like the old teardown
-        // stated it never tried.
-        tracing::debug!(%site_key, "per-site database left in place (--sqlite-dir not configured)");
+        // The defect this module was rewritten for: an unset root used to be a
+        // DEBUG line and a successful teardown, so a tenant database survived a
+        // closed PR with every signal green.
+        skipped(
+            &mut failures,
+            ctx.allow_incomplete,
+            format!(
+                "per-site database {site_key}.db (and its -wal/-shm/-journal companions) \
+                 was not removed: --sqlite-dir (SWITCHBOARD_SQLITE_DIR) is not configured, \
+                 so this daemon does not know where ePHPm keeps [db.sqlite].dir"
+            ),
+        );
     }
 
     // (3) The docroot override file the deploy wrote for ePHPm.
@@ -133,9 +202,13 @@ pub async fn teardown_preview(site_key: &str, ctx: &TeardownContext<'_>) -> anyh
             Err(e) => failures.push(format!("failed to remove {}: {e}", file.display())),
         }
     } else {
-        tracing::debug!(
-            %site_key,
-            "site override file left in place (--site-overrides-dir not configured)"
+        skipped(
+            &mut failures,
+            ctx.allow_incomplete,
+            format!(
+                "docroot override {site_key}.toml was not removed: \
+                 --site-overrides-dir (SWITCHBOARD_SITE_OVERRIDES_DIR) is not configured"
+            ),
         );
     }
 
@@ -150,12 +223,115 @@ pub async fn teardown_preview(site_key: &str, ctx: &TeardownContext<'_>) -> anyh
         failures.push(format!("{e:#}"));
     }
 
+    // (5) switchboard-api's desired-state marker for this preview. Nothing else
+    // reaps it: the daemon owns removing the site, so it owns retiring the
+    // record that says the site should exist (issue #19).
+    if let Err(e) = remove_applied_marker(ctx.state_dir, label).await {
+        failures.push(format!("{e:#}"));
+    }
+
     anyhow::ensure!(
         failures.is_empty(),
         "teardown of {site_key} left artifacts behind: {}",
         failures.join("; ")
     );
     Ok(())
+}
+
+/// Record an artifact class this node is not configured to remove.
+///
+/// Unacknowledged it is a failure, so the teardown cannot report success while
+/// a tenant database sits on disk. Acknowledged it is a `WARN` carrying the
+/// same sentence — never a silent skip, and never `DEBUG`, because the whole
+/// defect was that nobody saw it.
+fn skipped(failures: &mut Vec<String>, allow_incomplete: bool, what: String) {
+    if allow_incomplete {
+        tracing::warn!(
+            artifact = %what,
+            "incomplete teardown (acknowledged by --allow-incomplete-teardown)"
+        );
+    } else {
+        failures.push(what);
+    }
+}
+
+/// Remove switchboard-api's `applied/<label>` marker for a torn-down preview.
+///
+/// The marker records the last `<intent>@<sha>` **this node** materialized into
+/// its queue; `/drain` skips a label whose desired state still matches it. After
+/// a teardown the site is gone, so a marker that still claims a deploy is a
+/// desired-state record with no backing site — the shape of drift #18 describes
+/// from the other direction.
+///
+/// Two cases are deliberately *not* removed:
+///
+/// * a marker recording a **newer deploy** (`deploy@<sha>`) — the API has
+///   already materialized a redeploy for this label since our teardown job was
+///   queued (a reopened PR, a push after close); dropping it would make the next
+///   `/drain` re-queue that deploy needlessly. Leaving it is the conservative
+///   half of "clear what is stale, keep what is current";
+/// * a label that is not a plain path component. That aborts only this phase,
+///   not the whole teardown — the label names nothing else we remove.
+///
+/// # Errors
+///
+/// Returns an error if the label is unsafe to join, or if the marker exists and
+/// cannot be read or removed.
+async fn remove_applied_marker(state_dir: &Path, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        crate::site_key::is_valid_site_key(label),
+        "refusing to touch the applied/ marker: preview label {label:?} is not a \
+         single plain path component"
+    );
+    let path = state_dir.join(APPLIED_DIR).join(label);
+
+    let recorded = match tokio::fs::read_to_string(&path).await {
+        Ok(recorded) => recorded,
+        // No marker: single-node mode (the webhook path writes none), or a
+        // sibling node already reaped it. Not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("failed to read desired-state marker {}", path.display())
+            });
+        }
+    };
+
+    if marker_records_a_deploy(&recorded) {
+        tracing::info!(
+            %label,
+            marker = %recorded.trim(),
+            path = %path.display(),
+            "leaving switchboard-api's applied/ marker in place — it records a \
+             deploy newer than this teardown"
+        );
+        return Ok(());
+    }
+
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {
+            tracing::info!(%label, path = %path.display(), "removed switchboard-api's desired-state marker");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e)
+            .with_context(|| format!("failed to remove desired-state marker {}", path.display())),
+    }
+}
+
+/// Whether an `applied/<label>` marker body records a *deploy*.
+///
+/// The format is switchboard-api's `<intent>@<sha>`. Anything this cannot read
+/// as a deploy — a teardown, an empty file, a future format — is treated as
+/// stale and removed: the cost of dropping a marker is one redundant `/drain`
+/// materialization, the cost of keeping a stale one is a preview that can come
+/// back from the dead.
+fn marker_records_a_deploy(marker: &str) -> bool {
+    marker
+        .trim()
+        .split('@')
+        .next()
+        .is_some_and(|intent| intent.trim() == "deploy")
 }
 
 /// Remove the vhost state roots for `site_key` under `base`.
@@ -309,6 +485,16 @@ fn sanitize_path_label(name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The common shape: on a node with `sites_domain_suffix` configured the
+    /// site key *is* the label, which is why a key/label mix-up hides there.
+    /// Tests that care about the difference build [`Preview`] by hand.
+    fn preview(name: &str) -> Preview<'_> {
+        Preview {
+            site_key: name,
+            label: name,
+        }
+    }
+
     /// A context pointing every knob at subdirectories of one tempdir.
     struct Fixture {
         _root: tempfile::TempDir,
@@ -316,6 +502,7 @@ mod tests {
         sqlite: PathBuf,
         overrides: PathBuf,
         temp_base: PathBuf,
+        state: PathBuf,
     }
 
     impl Fixture {
@@ -325,15 +512,20 @@ mod tests {
             let sqlite = root.path().join("sqlite");
             let overrides = root.path().join("overrides");
             let temp_base = root.path().join("ephpm-vhosts");
-            for dir in [&sites, &sqlite, &overrides, &temp_base] {
+            let state = root.path().join(".switchboard");
+            for dir in [&sites, &sqlite, &overrides, &temp_base, &state] {
                 tokio::fs::create_dir_all(dir).await.unwrap();
             }
+            tokio::fs::create_dir_all(state.join(APPLIED_DIR))
+                .await
+                .unwrap();
             Self {
                 _root: root,
                 sites,
                 sqlite,
                 overrides,
                 temp_base,
+                state,
             }
         }
 
@@ -343,7 +535,18 @@ mod tests {
                 sqlite_dir: Some(&self.sqlite),
                 site_overrides_dir: Some(&self.overrides),
                 vhost_temp_base: Some(&self.temp_base),
+                state_dir: &self.state,
+                allow_incomplete: false,
             }
+        }
+
+        /// switchboard-api's desired-state marker for a label.
+        fn marker(&self, label: &str) -> PathBuf {
+            self.state.join(APPLIED_DIR).join(label)
+        }
+
+        async fn write_marker(&self, label: &str, body: &str) {
+            tokio::fs::write(self.marker(label), body).await.unwrap();
         }
 
         /// Materialize the full artifact set for `site_key`, exactly as a deploy
@@ -383,7 +586,9 @@ mod tests {
             .await
             .unwrap();
 
-        teardown_preview(site_key, &f.ctx()).await.unwrap();
+        teardown_preview(&preview(site_key), &f.ctx())
+            .await
+            .unwrap();
 
         assert!(
             !f.sites.join(site_key).exists(),
@@ -424,7 +629,9 @@ mod tests {
             .await
             .unwrap();
 
-        teardown_preview(site_key, &f.ctx()).await.unwrap();
+        teardown_preview(&preview(site_key), &f.ctx())
+            .await
+            .unwrap();
         assert!(!f.sqlite.join(format!("{site_key}.db")).exists());
         assert!(!f.overrides.join(format!("{site_key}.toml")).exists());
     }
@@ -440,7 +647,9 @@ mod tests {
         let prefix_neighbour = "ephpm-my-blog-pr-71";
         f.deploy_artifacts(prefix_neighbour).await;
 
-        teardown_preview(site_key, &f.ctx()).await.unwrap();
+        teardown_preview(&preview(site_key), &f.ctx())
+            .await
+            .unwrap();
 
         for survivor in [neighbour, prefix_neighbour] {
             assert!(f.sites.join(survivor).exists(), "{survivor} vhost dir");
@@ -482,7 +691,9 @@ mod tests {
             tokio::fs::create_dir_all(dir).await.unwrap();
         }
 
-        teardown_preview(site_key, &f.ctx()).await.unwrap();
+        teardown_preview(&preview(site_key), &f.ctx())
+            .await
+            .unwrap();
 
         assert!(
             !foreign.exists(),
@@ -498,7 +709,7 @@ mod tests {
         // GitHub sends `closed` for PRs that never deployed, and cluster nodes
         // race teardown of the same preview.
         let f = Fixture::new().await;
-        teardown_preview("ephpm-my-blog-pr-7", &f.ctx())
+        teardown_preview(&preview("ephpm-my-blog-pr-7"), &f.ctx())
             .await
             .expect("absent preview teardown must succeed");
     }
@@ -507,13 +718,19 @@ mod tests {
     async fn teardown_is_ok_when_the_temp_base_does_not_exist() {
         let f = Fixture::new().await;
         tokio::fs::remove_dir_all(&f.temp_base).await.unwrap();
-        teardown_preview("ephpm-my-blog-pr-7", &f.ctx())
+        teardown_preview(&preview("ephpm-my-blog-pr-7"), &f.ctx())
             .await
             .expect("missing vhost temp base is not an error");
     }
 
+    // ── issue #17: an unconfigured root must not pass as success ────────
+
+    /// The live defect: the preview cluster's unit passed neither `--sqlite-dir`
+    /// nor `--site-overrides-dir`, so every webhook teardown removed the vhost
+    /// directory, left the tenant database on disk, and reported success. It
+    /// must now fail, naming the database it did not remove.
     #[tokio::test]
-    async fn unconfigured_knobs_leave_those_artifacts_in_place() {
+    async fn unconfigured_roots_fail_the_teardown_and_name_what_was_left() {
         let f = Fixture::new().await;
         let site_key = "ephpm-my-blog-pr-7";
         f.deploy_artifacts(site_key).await;
@@ -523,8 +740,57 @@ mod tests {
             sqlite_dir: None,
             site_overrides_dir: None,
             vhost_temp_base: Some(&f.temp_base),
+            state_dir: &f.state,
+            allow_incomplete: false,
         };
-        teardown_preview(site_key, &ctx).await.unwrap();
+        let err = teardown_preview(&preview(site_key), &ctx)
+            .await
+            .expect_err("a teardown that abandons a tenant database must not report success");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(site_key),
+            "the error must name the site: {msg}"
+        );
+        assert!(
+            msg.contains("--sqlite-dir"),
+            "the error must name the missing flag: {msg}"
+        );
+        assert!(
+            msg.contains("--site-overrides-dir"),
+            "every skipped class is named, not just the first: {msg}"
+        );
+
+        // Everything it *could* do, it still did — a partial teardown beats no
+        // teardown, and the failure is what surfaces the rest.
+        assert!(
+            !f.sites.join(site_key).exists(),
+            "the vhost dir is still removed"
+        );
+        assert!(
+            f.sqlite.join(format!("{site_key}.db")).exists(),
+            "the database is what the error is about — it is still there"
+        );
+    }
+
+    /// An operator who genuinely has no per-site databases says so once. Then
+    /// the skip is a WARN and the teardown succeeds — the artifacts are still
+    /// left, but nobody is being told a lie about it.
+    #[tokio::test]
+    async fn acknowledged_incompleteness_succeeds_and_leaves_those_artifacts() {
+        let f = Fixture::new().await;
+        let site_key = "ephpm-my-blog-pr-7";
+        f.deploy_artifacts(site_key).await;
+
+        let ctx = TeardownContext {
+            sites_dir: &f.sites,
+            sqlite_dir: None,
+            site_overrides_dir: None,
+            vhost_temp_base: Some(&f.temp_base),
+            state_dir: &f.state,
+            allow_incomplete: true,
+        };
+        teardown_preview(&preview(site_key), &ctx).await.unwrap();
 
         assert!(
             !f.sites.join(site_key).exists(),
@@ -540,6 +806,173 @@ mod tests {
         );
     }
 
+    /// One root configured and one not: the error names only the one that was
+    /// actually skipped, so it stays actionable.
+    #[tokio::test]
+    async fn a_single_unconfigured_root_names_only_itself() {
+        let f = Fixture::new().await;
+        let site_key = "ephpm-my-blog-pr-7";
+        f.deploy_artifacts(site_key).await;
+
+        let ctx = TeardownContext {
+            sites_dir: &f.sites,
+            sqlite_dir: Some(&f.sqlite),
+            site_overrides_dir: None,
+            vhost_temp_base: Some(&f.temp_base),
+            state_dir: &f.state,
+            allow_incomplete: false,
+        };
+        let err = teardown_preview(&preview(site_key), &ctx)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--site-overrides-dir"), "{msg}");
+        assert!(
+            !msg.contains("--sqlite-dir"),
+            "a configured root must not be reported as skipped: {msg}"
+        );
+        assert!(
+            !f.sqlite.join(format!("{site_key}.db")).exists(),
+            "the configured class is still reaped despite the failure"
+        );
+    }
+
+    // ── issue #19: switchboard-api's applied/ marker ────────────────────
+
+    #[tokio::test]
+    async fn teardown_clears_the_api_desired_state_marker() {
+        let f = Fixture::new().await;
+        let site_key = "ephpm-wordpress-sample-pr-1";
+        f.deploy_artifacts(site_key).await;
+        f.write_marker(
+            site_key,
+            "teardown@0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .await;
+
+        teardown_preview(&preview(site_key), &f.ctx())
+            .await
+            .unwrap();
+
+        assert!(
+            !f.marker(site_key).exists(),
+            "a marker with no backing site is a desired-state record that can \
+             resurrect the preview — teardown owns retiring it"
+        );
+    }
+
+    /// The marker is filed under the **label**; every other artifact is filed
+    /// under the site key. On a node with no `sites_domain_suffix` those differ,
+    /// and a teardown that used the key would silently reap nothing.
+    #[tokio::test]
+    async fn the_marker_is_keyed_by_label_not_by_site_key() {
+        let f = Fixture::new().await;
+        let label = "ephpm-wordpress-sample-pr-1";
+        let site_key = "ephpm-wordpress-sample-pr-1.preview.ephpm.dev";
+        f.deploy_artifacts(site_key).await;
+        f.write_marker(label, "teardown@abc").await;
+
+        teardown_preview(&Preview { site_key, label }, &f.ctx())
+            .await
+            .unwrap();
+
+        assert!(
+            !f.marker(label).exists(),
+            "the label-keyed marker is cleared"
+        );
+        assert!(
+            !f.sites.join(site_key).exists(),
+            "the key-named vhost dir is removed"
+        );
+    }
+
+    /// A marker recording a deploy newer than this teardown is current state,
+    /// not drift: dropping it would make the next `/drain` re-queue that deploy.
+    #[tokio::test]
+    async fn a_marker_recording_a_newer_deploy_is_left_alone() {
+        let f = Fixture::new().await;
+        let site_key = "ephpm-my-blog-pr-7";
+        f.write_marker(site_key, "deploy@0123456789abcdef").await;
+
+        teardown_preview(&preview(site_key), &f.ctx())
+            .await
+            .unwrap();
+
+        assert!(
+            f.marker(site_key).exists(),
+            "a deploy marker is the API's current desired state"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_marker_directory_is_not_a_failure() {
+        // Single-node mode writes no markers at all, and a sibling node may
+        // have reaped ours already.
+        let f = Fixture::new().await;
+        tokio::fs::remove_dir_all(f.state.join(APPLIED_DIR))
+            .await
+            .unwrap();
+        teardown_preview(&preview("ephpm-my-blog-pr-7"), &f.ctx())
+            .await
+            .expect("no marker is the common case, not an error");
+    }
+
+    #[tokio::test]
+    async fn a_neighbouring_label_keeps_its_marker() {
+        let f = Fixture::new().await;
+        let site_key = "ephpm-my-blog-pr-7";
+        f.write_marker(site_key, "teardown@a").await;
+        f.write_marker("ephpm-my-blog-pr-71", "deploy@b").await;
+        f.write_marker("ephpm-my-blog-pr-8", "teardown@c").await;
+
+        teardown_preview(&preview(site_key), &f.ctx())
+            .await
+            .unwrap();
+
+        assert!(!f.marker(site_key).exists());
+        assert!(f.marker("ephpm-my-blog-pr-71").exists());
+        assert!(f.marker("ephpm-my-blog-pr-8").exists());
+    }
+
+    /// A label is a path component under the API's state dir. An unsafe one
+    /// fails *that phase* — it names nothing else — rather than the removal of
+    /// artifacts the (valid) site key does name.
+    #[tokio::test]
+    async fn an_unsafe_label_fails_only_the_marker_phase() {
+        let f = Fixture::new().await;
+        let site_key = "ephpm-my-blog-pr-7";
+        f.deploy_artifacts(site_key).await;
+
+        let err = teardown_preview(
+            &Preview {
+                site_key,
+                label: "../../escape",
+            },
+            &f.ctx(),
+        )
+        .await
+        .expect_err("a traversing label must be refused");
+        assert!(format!("{err:#}").contains("applied/ marker"), "{err:#}");
+        assert!(
+            !f.sqlite.join(format!("{site_key}.db")).exists(),
+            "the site's own artifacts are still reaped"
+        );
+    }
+
+    #[test]
+    fn marker_bodies_are_classified_by_intent() {
+        assert!(marker_records_a_deploy("deploy@0123456789abcdef"));
+        assert!(marker_records_a_deploy(" deploy@abc \n"));
+        assert!(!marker_records_a_deploy(
+            "teardown@0123456789abcdef0123456789abcdef01234567"
+        ));
+        // Unreadable bodies count as stale: a redundant re-materialization is
+        // cheaper than a resurrected preview.
+        assert!(!marker_records_a_deploy(""));
+        assert!(!marker_records_a_deploy("deployment@abc"));
+        assert!(!marker_records_a_deploy("whatever the next schema writes"));
+    }
+
     #[tokio::test]
     async fn unsafe_labels_are_refused_before_anything_is_touched() {
         let f = Fixture::new().await;
@@ -547,7 +980,7 @@ mod tests {
         f.deploy_artifacts(canary).await;
 
         for site_key in ["", ".", "..", "a/b", "a\\b", "a:b", "a\0b", "../escape"] {
-            let err = teardown_preview(site_key, &f.ctx())
+            let err = teardown_preview(&preview(site_key), &f.ctx())
                 .await
                 .expect_err(&format!("site_key {site_key:?} must be refused"));
             assert!(err.to_string().contains("refusing teardown"), "{err}");

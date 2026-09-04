@@ -128,12 +128,34 @@ from the site key by exact path — never a glob wider than the one site:
   this process's `<system temp>/ephpm-vhosts`, matching ePHPm's default). The
   directory name embeds a hash ePHPm computed over the container path; the
   daemon reproduces it and additionally sweeps for this site's exact name
-  shape (`<key>-<16 hex>`), so a hash it cannot reproduce still gets reaped.
+  shape (`<key>-<16 hex>`), so a hash it cannot reproduce still gets reaped;
+* switchboard-**api**'s desired-state marker at `<state_dir>/applied/<label>`
+  — the record of what this node last materialized into its own queue. This
+  one is keyed by the preview **label**, not by the site key (they differ on
+  a node with no `sites_domain_suffix`). Nothing else reaps it, so a removed
+  preview used to leave a "this site should exist" record behind on every
+  node. A marker recording a **deploy** newer than the teardown is left
+  alone: that is current desired state, not drift.
 
-Leave `--sqlite-dir` / `--site-overrides-dir` unset and those artifacts are
-left in place (logged, not silent). In cluster mode every node's daemon runs
-the same teardown against its own disk, which is the complete story — each
-node reaps its own replicas.
+In cluster mode every node's daemon runs the same teardown against its own
+disk, which is the complete story — each node reaps its own replicas.
+
+### Teardown is complete or it fails
+
+`--sqlite-dir` and `--site-overrides-dir` have no defaults — they are ePHPm's
+configuration and the daemon cannot derive them — so the daemon **refuses to
+start** without them. Leaving them unset used to be a quiet skip: the vhost
+directory went away, the tenant's `<key>.db` and `-wal` stayed on disk, and the
+teardown reported success. That is data retention, not untidiness, and the live
+preview cluster ran that way for weeks because its systemd unit (which is not in
+this repo) passed neither flag.
+
+Set both, or acknowledge the gap explicitly with `--allow-incomplete-teardown`.
+With the acknowledgement the daemon starts, every teardown logs a `WARN` naming
+the artifact classes it did not attempt, and the job still succeeds. Without it,
+a teardown that cannot reach an artifact class removes everything it *can*, then
+**fails** with a message naming exactly what it left — so the job stays in
+`queue/claimed/` for an operator instead of disappearing.
 
 ### 2. Kick `/drain`
 
@@ -220,8 +242,9 @@ seconds forever.
 | `--secrets-file` | `SWITCHBOARD_SECRETS_FILE` | *(none)* | YAML secret store for `${secret.NAME}` references in a manifest's `env:`. |
 | `--health-timeout-secs` | `SWITCHBOARD_HEALTH_TIMEOUT_SECS` | `60` | How long to poll the manifest's `health:` path for a 200. `0` disables the gate. |
 | `--health-interval-secs` | `SWITCHBOARD_HEALTH_INTERVAL_SECS` | `2` | Seconds between health polls. |
-| `--sqlite-dir` | `SWITCHBOARD_SQLITE_DIR` | *(none)* | ePHPm's `[db.sqlite].dir`. Teardown removes the preview's `<key>.db` (+ journal files) from here; unset, databases accumulate. |
-| `--site-overrides-dir` | `SWITCHBOARD_SITE_OVERRIDES_DIR` | *(none)* | ePHPm's `[server] site_overrides_dir` — a directory **outside** `sites_dir` (ePHPm refuses to start otherwise). The deploy writes each preview's `<key>.toml` document-root override here and teardown removes it. **Unset, a manifest's `docroot:` cannot be honoured** and ePHPm serves the whole checkout — the deploy warns. |
+| `--sqlite-dir` | `SWITCHBOARD_SQLITE_DIR` | *(none)* | ePHPm's `[db.sqlite].dir`. Teardown removes the preview's `<key>.db` (+ journal files) from here. **Required** unless `--allow-incomplete-teardown` is set — see [Teardown is complete or it fails](#teardown-is-complete-or-it-fails). |
+| `--site-overrides-dir` | `SWITCHBOARD_SITE_OVERRIDES_DIR` | *(none)* | ePHPm's `[server] site_overrides_dir` — a directory **outside** `sites_dir` (ePHPm refuses to start otherwise). The deploy writes each preview's `<key>.toml` document-root override here and teardown removes it. **Required** unless `--allow-incomplete-teardown` is set. Unset it also means a manifest's `docroot:` cannot be honoured and ePHPm serves the whole checkout. |
+| `--allow-incomplete-teardown` | `SWITCHBOARD_ALLOW_INCOMPLETE_TEARDOWN` | `false` | Start without the two roots above, and let teardown report success while leaving those artifacts on disk (a `WARN` per teardown names them). An acknowledgement, not a feature. |
 | `--vhost-temp-base` | `SWITCHBOARD_VHOST_TEMP_BASE` | `<system temp>/ephpm-vhosts` | Where ePHPm keeps per-vhost temp/session state roots. Set explicitly when the daemon and ePHPm do not share a temp dir (`PrivateTmp`, differing `TMPDIR`). |
 
 Secrets can also come from `SWITCHBOARD_SECRET_<NAME>` environment variables
@@ -274,20 +297,27 @@ switchboard \
   --state-dir /var/www/sites/switchboard/.switchboard \
   --sites-dir /var/www/sites \
   --preview-domain preview.ephpm.dev \
+  --sqlite-dir /var/lib/ephpm-web/db \
+  --site-overrides-dir /etc/ephpm/sites \
   --drain-host switchboard.ephpm.dev \
   --drain-token-file /var/www/sites/switchboard/.switchboard/drain_secret \
   --app-id 123456 \
   --app-key /etc/switchboard/app.pem
 ```
 
+The two teardown roots must match ePHPm's `[db.sqlite].dir` and
+`[server] site_overrides_dir` on the same node; the daemon will not start
+without them (or `--allow-incomplete-teardown`).
+
 The same invocation runs on every node in a cluster; the PR comment is
 deduplicated by its hidden marker, so all nodes converge on one comment.
 
-Single node, no GitHub App:
+Single node, no GitHub App, no per-site databases to reap:
 
 ```bash
 switchboard --state-dir /var/www/sites/switchboard/.switchboard \
-            --drain-interval-secs 0
+            --drain-interval-secs 0 \
+            --allow-incomplete-teardown
 ```
 
 Logging is `tracing` with an `RUST_LOG`-style `EnvFilter`; the default is
@@ -316,7 +346,7 @@ pinned to the crate's MSRV on the ephpm org's self-hosted fleet.
 | `src/validate.rs` | Claim-time re-validation of a deploy job: the queue-age bound and the current-PR-state check |
 | `src/drain.rs` | The `/drain` kick and the shared-secret file |
 | `src/deployer.rs` | The provisioning pipeline: fetch → manifest → build → env → quarantine the manifest → atomic swap → seed → health |
-| `src/teardown.rs` | Preview teardown: vhost dir, per-site database, override file, vhost temp/session state root |
+| `src/teardown.rs` | Preview teardown: vhost dir, per-site database, override file, vhost temp/session state root, the API's `applied/` marker — and the refusal to call a partial teardown a success |
 | `src/manifest.rs` | The `ephpm.yaml` app manifest schema, and moving it out of the served root once read |
 | `src/secrets.rs` | `${secret.NAME}` resolution from switchboard's own store |
 | `src/github.rs` | PR comments and Deployment statuses (sticky via the hidden marker) |
