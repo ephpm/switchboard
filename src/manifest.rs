@@ -39,6 +39,32 @@ use crate::deployer::Framework;
 /// The only manifest schema version this build understands.
 const SUPPORTED_VERSION: u32 = 1;
 
+/// Every filename [`AppManifest::load`] will read a manifest from, in
+/// precedence order.
+///
+/// This list is also exactly what [`quarantine_manifests`] moves out of the
+/// served checkout, and a test pins the two together — a fourth accepted
+/// filename that is not in this constant would be readable over HTTP the day it
+/// ships (switchboard#16).
+pub const MANIFEST_FILENAMES: [&str; 3] = [YAML_MANIFESTS[0], YAML_MANIFESTS[1], JSON_MANIFEST];
+
+/// The YAML spellings, in precedence order.
+const YAML_MANIFESTS: [&str; 2] = ["ephpm.yaml", "ephpm.yml"];
+
+/// The deprecated POC config.
+const JSON_MANIFEST: &str = "ephpm.json";
+
+/// Where the deploy parks the manifest once it has been read.
+///
+/// Dot-prefixed **and** kept inside the container: ePHPm's `hidden_files`
+/// default is `deny`, and its check rejects a dot-prefixed segment anywhere in
+/// the request path (`has_hidden_segment`), so `/.switchboard/ephpm.yaml` is a
+/// 403 even when the container itself is the web root. Keeping it inside the
+/// container also means the existing teardown — which removes
+/// `<sites_dir>/<key>/` wholesale — still reaps it, and an operator debugging a
+/// preview can still read the manifest the deploy actually used.
+pub const MANIFEST_ARCHIVE_DIR: &str = ".switchboard";
+
 /// A parsed (or synthesized) `ephpm.yaml` application manifest.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppManifest {
@@ -268,7 +294,7 @@ impl AppManifest {
     /// syntax or unsupported version) — a broken contract must not silently
     /// deploy the wrong thing. A missing manifest is not an error.
     pub async fn load(dir: &Path, framework: Framework) -> anyhow::Result<Self> {
-        for name in ["ephpm.yaml", "ephpm.yml"] {
+        for name in YAML_MANIFESTS {
             let path = dir.join(name);
             if let Ok(contents) = tokio::fs::read_to_string(&path).await {
                 tracing::info!(path = %path.display(), "loaded ephpm.yaml manifest");
@@ -277,7 +303,7 @@ impl AppManifest {
             }
         }
 
-        let json_path = dir.join("ephpm.json");
+        let json_path = dir.join(JSON_MANIFEST);
         if let Ok(contents) = tokio::fs::read_to_string(&json_path).await {
             match serde_json::from_str::<LegacyEphpmConfig>(&contents) {
                 Ok(legacy) => {
@@ -316,6 +342,110 @@ impl AppManifest {
                 .join("websocket.php")
                 .exists(),
         }
+    }
+}
+
+/// Move every deploy manifest out of the checkout root, once it has been read.
+///
+/// # Why
+///
+/// `ephpm.yaml` is a plain, non-dot-prefixed file at the repository root, and
+/// for an app declaring `docroot: "."` — WordPress, and most bespoke apps — the
+/// repository root *is* the web root. So the manifest was served: confirmed
+/// live on the preview cluster, `GET /ephpm.yaml` → **200 with full contents**,
+/// exposing the build commands, the enabled services, and the whole seed
+/// sequence (switchboard#16).
+///
+/// The per-site document-root override (switchboard#14) does not close this.
+/// Two independent reasons: a node that has not configured
+/// `--site-overrides-dir` never writes one, and even a fully-wired node cannot
+/// move a file that the manifest itself placed *inside* the declared web root.
+/// A file that must not be public has to stop being in a served directory —
+/// there is no configuration that fixes it from outside.
+///
+/// # Ordering
+///
+/// Called after `build:` (which runs in the checkout and may legitimately read
+/// the manifest) and **before** the atomic swap into `sites_dir`, so the file
+/// is never present in a live web root even momentarily. `seed:` runs after the
+/// swap and therefore sees the archived location, not the original path — a
+/// seed step that reads `./ephpm.yaml` must read
+/// `.switchboard/ephpm.yaml` instead. Nothing else in switchboard re-reads the
+/// manifest: the deploy parses it once into an owned [`AppManifest`], a
+/// redeploy fetches a fresh checkout, and teardown never looks at it.
+///
+/// # Fail-closed, but never fail the deploy over the archive
+///
+/// Archiving is best-effort; *removal from the served root* is not. If the
+/// manifest cannot be moved into [`MANIFEST_ARCHIVE_DIR`] (a repo shipping its
+/// own `.switchboard` file, a cross-device quirk) it is deleted instead and the
+/// deploy warns. Only when it can be neither moved nor deleted does the deploy
+/// fail — publishing it is not an option.
+///
+/// Returns the filenames that were taken out of the served root.
+///
+/// # Errors
+///
+/// Returns an error only when a manifest exists in the served root and can be
+/// neither relocated nor removed.
+pub async fn quarantine_manifests(container: &Path) -> anyhow::Result<Vec<String>> {
+    let archive = container.join(MANIFEST_ARCHIVE_DIR);
+    let mut removed = Vec::new();
+
+    for name in MANIFEST_FILENAMES {
+        let src = container.join(name);
+        // `symlink_metadata` so a manifest that is a dangling symlink still
+        // counts as present — it would be a 404, but leaving tenant-controlled
+        // links in the served root is not something to decide by accident.
+        match tokio::fs::symlink_metadata(&src).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to stat {}", src.display()));
+            }
+        }
+
+        let dest = archive.join(name);
+        let archived = match tokio::fs::create_dir_all(&archive).await {
+            Ok(()) => tokio::fs::rename(&src, &dest).await.is_ok(),
+            Err(_) => false,
+        };
+
+        if archived {
+            tracing::info!(
+                manifest = name,
+                path = %dest.display(),
+                "moved the deploy manifest out of the served root"
+            );
+        } else {
+            remove_path(&src).await.with_context(|| {
+                format!(
+                    "refusing to publish {}: it could be neither archived into {} \
+                     nor removed",
+                    src.display(),
+                    archive.display()
+                )
+            })?;
+            tracing::warn!(
+                manifest = name,
+                path = %src.display(),
+                archive = %archive.display(),
+                "could not archive the deploy manifest — deleted it instead so it \
+                 is not served"
+            );
+        }
+        removed.push(name.to_string());
+    }
+
+    Ok(removed)
+}
+
+/// Remove a path whether it is a file, a symlink, or a directory.
+async fn remove_path(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => tokio::fs::remove_dir_all(path).await,
     }
 }
 
@@ -569,6 +699,183 @@ ini:
             .await
             .unwrap();
         assert!(m.websocket_enabled(dir.path()));
+    }
+
+    // ── switchboard#16: the manifest must not be publicly served ───────
+
+    /// Reproduces the two rules that together decide whether an HTTP request
+    /// can reach a file in a container ePHPm serves as the web root
+    /// (`docroot: "."`):
+    ///
+    /// 1. **hidden files** — `[server.static_files] hidden_files` defaults to
+    ///    `deny`, and ePHPm's `has_hidden_segment` rejects a dot-prefixed
+    ///    segment *anywhere* in the request path, not just the last one;
+    /// 2. **containment** — `serve_file` canonicalizes and requires the target
+    ///    to stay inside the document root.
+    ///
+    /// This is what the issue actually measured (`GET /ephpm.yaml` → 200), and
+    /// it is as close to an end-to-end HTTP assertion as a test without a
+    /// running ePHPm can get.
+    fn servable_from_web_root(web_root: &Path, request_path: &str) -> bool {
+        let trimmed = request_path.trim_start_matches('/');
+        if trimmed
+            .split('/')
+            .any(|s| s.starts_with('.') && s != "." && s != "..")
+        {
+            return false; // 403 by the hidden-file rule
+        }
+        let mut candidate = web_root.to_path_buf();
+        for segment in trimmed.split('/') {
+            candidate.push(segment);
+        }
+        let (Ok(target), Ok(root)) = (candidate.canonicalize(), web_root.canonicalize()) else {
+            return false;
+        };
+        target.starts_with(&root) && target.is_file()
+    }
+
+    /// A `docroot: "."` checkout carrying every manifest spelling — the
+    /// `wordpress-sample` shape, which is where switchboard#16 was confirmed
+    /// live.
+    async fn checkout_with_manifests() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("ephpm.yaml"),
+            "version: 1\ndocroot: \".\"\nseed:\n  - \"wp core install --admin_password=admin\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(dir.path().join("ephpm.json"), r#"{"php": "8.4"}"#)
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("index.php"), "<?php // app")
+            .await
+            .unwrap();
+        dir
+    }
+
+    /// **The regression test for switchboard#16.**
+    ///
+    /// Before the fix `GET /ephpm.yaml` returned 200 with the build commands,
+    /// the services and the whole seed sequence. After it there is no request
+    /// path that reaches any manifest, while the app itself still serves.
+    #[tokio::test]
+    async fn no_manifest_is_reachable_over_http_after_quarantine() {
+        let dir = checkout_with_manifests().await;
+        let root = dir.path();
+
+        // The "before": this is exactly the exposure the issue reported.
+        assert!(
+            servable_from_web_root(root, "/ephpm.yaml"),
+            "the un-quarantined manifest must be servable — otherwise the \
+             assertion below could pass for the wrong reason"
+        );
+
+        let moved = quarantine_manifests(root).await.unwrap();
+        assert_eq!(
+            moved,
+            vec!["ephpm.yaml".to_string(), "ephpm.json".to_string()]
+        );
+
+        for path in [
+            "/ephpm.yaml",
+            "/ephpm.yml",
+            "/ephpm.json",
+            // The archive is dot-prefixed, so ePHPm denies it even though it
+            // lives inside the served container.
+            "/.switchboard/ephpm.yaml",
+            "/.switchboard/ephpm.json",
+        ] {
+            assert!(
+                !servable_from_web_root(root, path),
+                "{path} must not be reachable after the deploy manifest is quarantined"
+            );
+        }
+
+        // ...and the app is untouched.
+        assert!(servable_from_web_root(root, "/index.php"));
+    }
+
+    /// The manifest is *relocated*, not destroyed: an operator debugging a
+    /// preview can still read exactly what the deploy used.
+    #[tokio::test]
+    async fn quarantine_preserves_the_manifest_off_the_served_root() {
+        let dir = checkout_with_manifests().await;
+        quarantine_manifests(dir.path()).await.unwrap();
+
+        let archived = dir.path().join(MANIFEST_ARCHIVE_DIR).join("ephpm.yaml");
+        let text = tokio::fs::read_to_string(&archived)
+            .await
+            .expect("the manifest must survive at its archived path");
+        assert!(text.contains("wp core install"));
+        assert!(!dir.path().join("ephpm.yaml").exists());
+    }
+
+    /// Quarantining a checkout with no manifest at all (the framework-defaults
+    /// path) is a no-op, not an error.
+    #[tokio::test]
+    async fn quarantine_without_a_manifest_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(quarantine_manifests(dir.path()).await.unwrap().is_empty());
+        assert!(
+            !dir.path().join(MANIFEST_ARCHIVE_DIR).exists(),
+            "no manifest means no archive directory to create"
+        );
+    }
+
+    /// If the archive cannot be created — a repo shipping its own
+    /// `.switchboard` *file* — the manifest is deleted rather than served. The
+    /// debug copy is the thing that is expendable; the exposure is not.
+    #[tokio::test]
+    async fn manifest_is_deleted_when_it_cannot_be_archived() {
+        let dir = checkout_with_manifests().await;
+        tokio::fs::write(dir.path().join(MANIFEST_ARCHIVE_DIR), "not a directory")
+            .await
+            .unwrap();
+
+        quarantine_manifests(dir.path()).await.unwrap();
+
+        assert!(
+            !dir.path().join("ephpm.yaml").exists(),
+            "a manifest that cannot be archived must still leave the served root"
+        );
+        assert!(!servable_from_web_root(dir.path(), "/ephpm.yaml"));
+    }
+
+    /// Every filename the loader will read must also be one the deploy takes
+    /// out of the served root. A fourth accepted spelling that is not in
+    /// [`MANIFEST_FILENAMES`] would be a 200 the day it ships.
+    #[tokio::test]
+    async fn every_loadable_manifest_filename_is_quarantined() {
+        for name in MANIFEST_FILENAMES {
+            let dir = tempfile::tempdir().unwrap();
+            let body = if name.ends_with(".json") {
+                r#"{"php": "8.4"}"#.to_string()
+            } else {
+                "version: 1\n".to_string()
+            };
+            tokio::fs::write(dir.path().join(name), &body)
+                .await
+                .unwrap();
+
+            // The loader reads it...
+            AppManifest::load(dir.path(), Framework::Generic)
+                .await
+                .unwrap();
+            // ...and the deploy then takes it out of the served root.
+            assert_eq!(
+                quarantine_manifests(dir.path()).await.unwrap(),
+                vec![name.to_string()]
+            );
+            assert!(!dir.path().join(name).exists(), "{name} was left served");
+        }
+    }
+
+    /// The archive directory has to be dot-prefixed — that is the entire reason
+    /// it is safe to keep it inside a container ePHPm may serve as the web root.
+    #[test]
+    fn manifest_archive_is_hidden_from_http() {
+        assert!(MANIFEST_ARCHIVE_DIR.starts_with('.'));
     }
 
     #[test]

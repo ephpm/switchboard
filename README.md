@@ -73,6 +73,18 @@ trusting a third-party clone URL), builds per the app's `ephpm.yaml` manifest,
 publishes the manifest's `docroot:` as ePHPm's per-site override, and installs
 the result at `<sites_dir>/<key>/` by staging into `<key>.tmp` and renaming.
 
+Before the swap the deploy also takes the manifest itself out of the served
+root: `ephpm.yaml` / `ephpm.yml` / `ephpm.json` are moved to
+`<site>/.switchboard/`. They are ordinary, non-dot-prefixed files at the
+repository root, and for an app declaring `docroot: "."` — WordPress, and most
+bespoke apps — the repository root *is* the web root, so `GET /ephpm.yaml`
+returned 200 with the build commands, the enabled services and the whole seed
+sequence (switchboard#16). The archive is dot-prefixed, so ePHPm's
+`hidden_files` default (`deny`) makes it a 403; it is inside the site directory,
+so the existing teardown reaps it. A `seed:` step that wants the manifest must
+read `.switchboard/ephpm.yaml` — `build:` runs before the move and still sees
+the original path.
+
 A **teardown** removes everything the preview left on this node, each derived
 from the site key by exact path — never a glob wider than the one site:
 
@@ -270,9 +282,9 @@ pinned to the crate's MSRV on the ephpm org's self-hosted fleet.
 | `src/job.rs` | The schema-1 job document: parse, validate, convert to a `PreviewRequest` |
 | `src/queue.rs` | Scan, claim (`link`+`unlink`), coalesce per label, complete |
 | `src/drain.rs` | The `/drain` kick and the shared-secret file |
-| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → build → env → atomic swap → seed → health |
+| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → build → env → quarantine the manifest → atomic swap → seed → health |
 | `src/teardown.rs` | Preview teardown: vhost dir, per-site database, override file, vhost temp/session state root |
-| `src/manifest.rs` | The `ephpm.yaml` app manifest schema |
+| `src/manifest.rs` | The `ephpm.yaml` app manifest schema, and moving it out of the served root once read |
 | `src/secrets.rs` | `${secret.NAME}` resolution from switchboard's own store |
 | `src/github.rs` | PR comments and Deployment statuses (sticky via the hidden marker) |
 | `src/webhook.rs` | Signature verification and payload types for the legacy receiver |
