@@ -5,6 +5,7 @@
 //! values and no config file to keep in sync.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 
@@ -24,6 +25,25 @@ pub struct Config {
     /// Seconds between queue scans.
     #[arg(long, default_value_t = 2, env = "SWITCHBOARD_QUEUE_INTERVAL_SECS")]
     pub queue_interval_secs: u64,
+
+    /// Discard a **deploy** job that has waited longer than this in the queue
+    /// instead of applying it. Zero disables the bound.
+    ///
+    /// A job file states what was true when it was written; a queue can hold
+    /// that statement indefinitely, and a restart drains it as if it were
+    /// current. That is switchboard#18: a `pull_request/opened` job two days
+    /// old was applied on restart and provisioned a preview for a pull request
+    /// that had already merged.
+    ///
+    /// The default is an hour — far beyond any plausible backlog for a daemon
+    /// that scans every couple of seconds, and short enough that a queue
+    /// drained after real downtime does not replay yesterday's intentions. The
+    /// cost of the bound is a deploy that never happens if a node is down
+    /// longer than it, recovered by the next push or an operator re-drain; the
+    /// cost of not having it is a preview for a merged PR. Teardown jobs are
+    /// never discarded by age — an old teardown is still correct.
+    #[arg(long, default_value_t = 3600, env = "SWITCHBOARD_MAX_JOB_AGE_SECS")]
+    pub max_job_age_secs: u64,
 
     // ── drain kick ─────────────────────────────────────────────────────
     /// Seconds between drain kicks. **Zero disables the kick entirely**, which
@@ -197,6 +217,13 @@ impl Config {
     #[must_use]
     pub fn drain_enabled(&self) -> bool {
         self.drain_interval_secs > 0
+    }
+
+    /// How long a deploy job may wait in the queue before it is discarded
+    /// rather than applied, or `None` when the bound is disabled.
+    #[must_use]
+    pub fn max_job_age(&self) -> Option<Duration> {
+        (self.max_job_age_secs > 0).then(|| Duration::from_secs(self.max_job_age_secs))
     }
 
     /// Whether GitHub reporting is possible. Both halves of the App credential
@@ -489,6 +516,34 @@ mod tests {
         );
         assert_eq!(c.vhost_temp_base, Some(PathBuf::from("/tmp/ephpm-vhosts")));
         c.validate().unwrap();
+    }
+
+    // ── claim-time job validation (#18) ─────────────────────────────────
+
+    #[test]
+    fn stale_deploy_jobs_are_bounded_by_default() {
+        let c = parse(&[]);
+        assert_eq!(
+            c.max_job_age_secs, 3600,
+            "the documented default is an hour"
+        );
+        assert_eq!(c.max_job_age(), Some(std::time::Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn a_zero_max_job_age_disables_the_bound() {
+        let c = parse(&["--max-job-age-secs", "0"]);
+        assert_eq!(
+            c.max_job_age(),
+            None,
+            "0 must disable the bound, not discard everything"
+        );
+    }
+
+    #[test]
+    fn max_job_age_is_configurable() {
+        let c = parse(&["--max-job-age-secs", "300"]);
+        assert_eq!(c.max_job_age(), Some(std::time::Duration::from_secs(300)));
     }
 
     #[test]

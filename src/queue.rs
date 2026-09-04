@@ -37,6 +37,11 @@ use crate::job::Job;
 /// passes rather than in one unbounded burst.
 const MAX_BATCH: usize = 256;
 
+/// The exact number of digits in a job filename's millisecond timestamp. The
+/// contract fixes it at 13 (and stays there until 2286), and it is what makes a
+/// lexicographic sort chronological.
+const TIMESTAMP_DIGITS: usize = 13;
+
 /// A job this daemon has claimed: the queue filename, its path under
 /// `claimed/`, and the parsed document.
 #[derive(Debug)]
@@ -47,6 +52,19 @@ pub struct ClaimedJob {
     pub path: PathBuf,
     /// The parsed, schema-validated document.
     pub job: Job,
+    /// When this job was **enqueued on this node**, in Unix milliseconds, from
+    /// the filename's timestamp (falling back to the file's mtime).
+    ///
+    /// Deliberately not the job document's `received_at_ms`: a job materialized
+    /// from cluster desired state gets a *fresh* filename on each node, so this
+    /// measures "how long has it been sitting in this queue", which is the
+    /// staleness issue #18 is about. An event that is old but still current —
+    /// a node materializing desired state it has not seen before — must not be
+    /// dropped by an age bound; that case is the PR-state check's job.
+    ///
+    /// `None` when neither source could be read; see
+    /// [`crate::validate::age_verdict`], which then applies the job.
+    pub enqueued_at_ms: Option<u64>,
 }
 
 /// The queue directories under a state dir.
@@ -211,7 +229,16 @@ impl Queue {
                             "job_id does not match its filename"
                         );
                     }
-                    claimed.push(ClaimedJob { name, path, job });
+                    // Read the enqueue time here, while the file is in hand:
+                    // the filename is the contract, the mtime is the fallback
+                    // for a producer that names files some other way.
+                    let enqueued_at_ms = enqueued_at_ms(&name).or_else(|| file_modified_ms(&path));
+                    claimed.push(ClaimedJob {
+                        name,
+                        path,
+                        job,
+                        enqueued_at_ms,
+                    });
                 }
                 Err(e) => {
                     tracing::error!(job = %name, %e, "rejecting job — left in claimed/ for inspection");
@@ -235,6 +262,39 @@ impl Queue {
             Err(e) => Err(e).with_context(|| format!("failed to remove claimed job {name}")),
         }
     }
+}
+
+/// The enqueue timestamp encoded in a job filename: the leading
+/// `<13-digit millis>` of `<millis>-<16 hex>.json`.
+///
+/// This is the same field [`Queue::pending`] relies on for ordering, so reading
+/// it costs nothing and cannot disagree with arrival order.
+///
+/// Strict on purpose. A short or non-numeric prefix returns `None` (the caller
+/// falls back to the file's mtime) rather than being parsed for whatever digits
+/// it has: reading `7-abc.json` as "7 milliseconds after 1970" would make an
+/// otherwise fine job look ancient and get it discarded.
+#[must_use]
+pub fn enqueued_at_ms(name: &str) -> Option<u64> {
+    let stem = name.strip_suffix(".json")?;
+    let (millis, rest) = stem.split_once('-')?;
+    if rest.is_empty() || millis.len() != TIMESTAMP_DIGITS {
+        return None;
+    }
+    if !millis.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    millis.parse().ok()
+}
+
+/// A file's mtime in Unix milliseconds — the fallback enqueue time.
+///
+/// The claim is a `link()`, which preserves mtime, so the claimed file still
+/// carries the moment the API wrote the job.
+fn file_modified_ms(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(since_epoch.as_millis()).ok()
 }
 
 /// The result of coalescing a batch of claimed jobs.
@@ -442,6 +502,61 @@ mod tests {
         let out = coalesce(Vec::new());
         assert!(out.run.is_empty());
         assert!(out.superseded.is_empty());
+    }
+
+    // ── enqueue time (#18) ──────────────────────────────────────────────
+
+    #[test]
+    fn the_enqueue_time_comes_from_the_filename() {
+        assert_eq!(
+            enqueued_at_ms("1787456737243-b81167e5b47a38b9.json"),
+            Some(1_787_456_737_243)
+        );
+    }
+
+    /// A filename that is not the contract's shape must yield `None` so the
+    /// caller falls back to the mtime. Parsing it loosely is worse than not
+    /// parsing it: `7-abc.json` read as 7ms-after-1970 would look 56 years old
+    /// and get a perfectly good job discarded.
+    #[test]
+    fn a_non_conforming_filename_has_no_enqueue_time() {
+        for name in [
+            "7-abcdef.json",                        // too few digits
+            "17874567372430-abcdef.json",           // too many
+            "1787456737243.json",                   // no random half
+            "1787456737243-.json",                  // empty random half
+            "abcdefghijklm-b81167e5b47a38b9.json",  // not digits
+            "1787456737243-b81167e5b47a38b9",       // not a job file
+            "-1787456737243-b81167e5b47a38b9.json", // leading separator
+        ] {
+            assert_eq!(enqueued_at_ms(name), None, "{name} must not parse");
+        }
+    }
+
+    #[test]
+    fn a_claimed_job_carries_its_enqueue_time() {
+        let (_d, q) = queue();
+        write_job(&q, "1787456737243-bbbbbbbbbbbbbbbb.json", "a", "deploy");
+        let claimed = q.claim_pending().unwrap();
+        assert_eq!(claimed[0].enqueued_at_ms, Some(1_787_456_737_243));
+    }
+
+    /// A producer that names files differently still gets an enqueue time —
+    /// from the mtime — rather than an unbounded one.
+    #[test]
+    fn a_claimed_job_falls_back_to_the_file_mtime() {
+        let (_d, q) = queue();
+        let name = "not-the-contract-shape.json";
+        write_job(&q, name, "a", "deploy");
+        let claimed = q.claim_pending().unwrap();
+        let enqueued = claimed[0]
+            .enqueued_at_ms
+            .expect("mtime is the fallback, so this is never None here");
+        let now = crate::validate::now_ms();
+        assert!(
+            enqueued <= now && now - enqueued < 60_000,
+            "mtime {enqueued} should be about now ({now})"
+        );
     }
 
     #[test]

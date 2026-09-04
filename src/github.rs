@@ -5,6 +5,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde_json::json;
 
 use crate::deployer::{DeployResult, PreviewRequest};
+use crate::validate::{PullRequestState, classify_pull_request};
 
 /// Hidden HTML marker carried by every switchboard comment. It renders as
 /// nothing on GitHub but is what [`GitHubClient::find_existing_comment`] matches
@@ -145,6 +146,52 @@ impl GitHubClient {
             .context("failed to set deployment status")?;
 
         Ok(())
+    }
+
+    /// Ask GitHub what a pull request's state is **right now**.
+    ///
+    /// The authoritative half of the claim-time re-validation (issue #18): a
+    /// job file records what was true when the API wrote it, and a queue can
+    /// hold that statement for days. Uses the `pulls` endpoint rather than
+    /// `issues` because only the former carries `merged`, and "merged" is the
+    /// case worth naming in the log.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or GitHub answers with a non-2xx
+    /// status. Callers treat that as "unknown" and apply the job — see
+    /// [`crate::validate`] on failing open.
+    pub async fn pull_request_state(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> anyhow::Result<PullRequestState> {
+        let url = format!("https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}");
+        let resp = self
+            .client
+            .get(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", self.token))
+            .header(USER_AGENT, "switchboard")
+            .header(ACCEPT, "application/vnd.github+json")
+            .send()
+            .await
+            .with_context(|| format!("failed to read {owner}/{repo}#{pr_number}"))?;
+
+        anyhow::ensure!(
+            resp.status().is_success(),
+            "GitHub returned {} for {owner}/{repo}#{pr_number}",
+            resp.status()
+        );
+
+        let body: serde_json::Value = resp.json().await?;
+        let state = body["state"]
+            .as_str()
+            .context("pull request response missing 'state'")?;
+        // Absent `merged` is not "merged" — the field is always present on this
+        // endpoint, and guessing true would discard a live preview's deploy.
+        let merged = body["merged"].as_bool().unwrap_or(false);
+        Ok(classify_pull_request(state, merged))
     }
 
     /// Find an existing switchboard comment on a PR.

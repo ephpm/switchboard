@@ -50,6 +50,37 @@ owned by switchboard-api's README, sections **"The job file contract"** and
 `preview.label` is **authoritative and never recomputed** — with
 `--preview-domain` appended it is the preview host ePHPm resolves.
 
+#### A claimed job is re-checked against current state
+
+A job file states what was true when switchboard-api wrote it, and a queue can
+hold that statement indefinitely. A `pull_request/opened` job that had sat
+unclaimed for two days was applied during a restart and provisioned a preview
+for a pull request that had already **merged** — restarts are exactly when this
+fires, because a restart drains a backlog of statements about the past.
+
+So a **deploy** job is validated at *claim* time, not trusted from *enqueue*
+time. Two checks, deliberately different in kind:
+
+| Check | Cost | Fails |
+|---|---|---|
+| **Age** — has this job been sitting in the queue longer than `--max-job-age-secs`? | offline arithmetic on the filename's timestamp | closed (discards the job) |
+| **PR state** — is the pull request still open, per GitHub *now*? | one API call, needs the App credentials | **open** (applies the job) |
+
+The age bound runs on every node, including one with no GitHub App configured
+(the e2e cluster). The state check is authoritative but best-effort: a GitHub
+outage, a rate limit, or a `state` value this daemon does not recognise applies
+the job with a `WARN` rather than dropping it, because refusing to deploy
+because a third party is unreachable is its own kind of drift.
+
+A discarded job is **resolved, not failed**: it is cleared from `claimed/` like
+a successful one, with the reason logged at `WARN`.
+
+**Teardown jobs are never validated.** A teardown is idempotent, removes drift
+rather than creating it, and is never wrong to apply late — the preview it names
+should not exist either way. Refusing a stale one would strand exactly the
+artifacts teardown exists to remove, the same reasoning that makes fork
+teardowns unconditional.
+
 ### The site key
 
 Every per-site artifact is named by the **canonical site key**, which is ePHPm's
@@ -72,6 +103,18 @@ A **deploy** fetches `refs/pull/<n>/head` at the recorded `head.sha` from the
 trusting a third-party clone URL), builds per the app's `ephpm.yaml` manifest,
 publishes the manifest's `docroot:` as ePHPm's per-site override, and installs
 the result at `<sites_dir>/<key>/` by staging into `<key>.tmp` and renaming.
+
+Before the swap the deploy also takes the manifest itself out of the served
+root: `ephpm.yaml` / `ephpm.yml` / `ephpm.json` are moved to
+`<site>/.switchboard/`. They are ordinary, non-dot-prefixed files at the
+repository root, and for an app declaring `docroot: "."` — WordPress, and most
+bespoke apps — the repository root *is* the web root, so `GET /ephpm.yaml`
+returned 200 with the build commands, the enabled services and the whole seed
+sequence (switchboard#16). The archive is dot-prefixed, so ePHPm's
+`hidden_files` default (`deny`) makes it a 403; it is inside the site directory,
+so the existing teardown reaps it. A `seed:` step that wants the manifest must
+read `.switchboard/ephpm.yaml` — `build:` runs before the move and still sees
+the original path.
 
 A **teardown** removes everything the preview left on this node, each derived
 from the site key by exact path — never a glob wider than the one site:
@@ -174,6 +217,7 @@ no config file to keep in sync. `switchboard --help` prints the same list.
 |---|---|---|---|
 | `--state-dir` | `SWITCHBOARD_STATE_DIR` | *(required)* | switchboard-api's `.switchboard/` directory. Jobs are consumed from `<state_dir>/queue/`. |
 | `--queue-interval-secs` | `SWITCHBOARD_QUEUE_INTERVAL_SECS` | `2` | Seconds between queue scans. |
+| `--max-job-age-secs` | `SWITCHBOARD_MAX_JOB_AGE_SECS` | `3600` | Discard a **deploy** job that has waited longer than this in the queue rather than applying it. **`0` disables the bound.** Teardown jobs are never discarded by age. See [A claimed job is re-checked against current state](#a-claimed-job-is-re-checked-against-current-state). |
 
 ### Drain kick
 
@@ -298,11 +342,12 @@ pinned to the crate's MSRV on the ephpm org's self-hosted fleet.
 | `src/main.rs` | Startup, the queue loop, the drain loop, GitHub token minting, the legacy receiver |
 | `src/config.rs` | Every flag and env var, plus the cross-field validation clap cannot express |
 | `src/job.rs` | The schema-1 job document: parse, validate, convert to a `PreviewRequest` |
-| `src/queue.rs` | Scan, claim (`link`+`unlink`), coalesce per label, complete |
+| `src/queue.rs` | Scan, claim (`link`+`unlink`), coalesce per label, complete; the enqueue timestamp a claimed job carries |
+| `src/validate.rs` | Claim-time re-validation of a deploy job: the queue-age bound and the current-PR-state check |
 | `src/drain.rs` | The `/drain` kick and the shared-secret file |
-| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → build → env → atomic swap → seed → health |
+| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → build → env → quarantine the manifest → atomic swap → seed → health |
 | `src/teardown.rs` | Preview teardown: vhost dir, per-site database, override file, vhost temp/session state root, the API's `applied/` marker — and the refusal to call a partial teardown a success |
-| `src/manifest.rs` | The `ephpm.yaml` app manifest schema |
+| `src/manifest.rs` | The `ephpm.yaml` app manifest schema, and moving it out of the served root once read |
 | `src/secrets.rs` | `${secret.NAME}` resolution from switchboard's own store |
 | `src/github.rs` | PR comments and Deployment statuses (sticky via the hidden marker) |
 | `src/webhook.rs` | Signature verification and payload types for the legacy receiver |
