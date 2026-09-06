@@ -16,7 +16,9 @@
 //! * the per-vhost temp/session state root ePHPm creates under
 //!   `<temp>/ephpm-vhosts/` — sessions, uploads, PHP temp files;
 //! * `<state_dir>/applied/<label>` — switchboard-api's record of the desired
-//!   state **this node** has already materialized (issue #19). Keyed by the
+//!   state **this node** has already materialized (issue #19), but only when it
+//!   is unparseable drift. A marker recording this teardown is deliberately
+//!   *kept* (switchboard#24) — see [`remove_applied_marker`]. Keyed by the
 //!   preview *label*, not the site key; see [`Preview`].
 //!
 //! # An unconfigured root is not a quiet skip (issue #17)
@@ -61,6 +63,16 @@
 //! daemon runs this teardown against its own disk. Per-node local removal is
 //! therefore the complete story: replicated per-site database files and state
 //! roots on other nodes are removed by those nodes' own daemons.
+//!
+//! That "every node materializes it" is a property of switchboard-api, not a
+//! given, and it is what makes the `applied/<label>` receipt load-bearing here.
+//! A teardown is published to the cluster KV once; each node must notice it
+//! independently, so the published desired state has to outlive the *first*
+//! node's drain. It follows that the desired state is still on offer when this
+//! teardown finishes, and a node that deletes its own receipt will be handed
+//! the same teardown again on its next drain, and the next. Keeping the receipt
+//! is the whole brake. See switchboard#24, and switchboard-api's `DrainHandler`
+//! for the other half of the contract.
 
 use std::path::{Path, PathBuf};
 
@@ -255,23 +267,39 @@ fn skipped(failures: &mut Vec<String>, allow_incomplete: bool, what: String) {
     }
 }
 
-/// Remove switchboard-api's `applied/<label>` marker for a torn-down preview.
+/// Retire switchboard-api's `applied/<label>` marker if — and only if — it has
+/// become unreadable drift.
 ///
 /// The marker records the last `<intent>@<sha>` **this node** materialized into
-/// its queue; `/drain` skips a label whose desired state still matches it. After
-/// a teardown the site is gone, so a marker that still claims a deploy is a
-/// desired-state record with no backing site — the shape of drift #18 describes
-/// from the other direction.
+/// its queue; `/drain` skips a label whose published desired state still matches
+/// it. That makes the marker this node's *receipt*, and a receipt is only useful
+/// for as long as the thing it acknowledges is still being offered.
 ///
-/// Two cases are deliberately *not* removed:
+/// Three cases, and only the last one is removed:
 ///
 /// * a marker recording a **newer deploy** (`deploy@<sha>`) — the API has
 ///   already materialized a redeploy for this label since our teardown job was
 ///   queued (a reopened PR, a push after close); dropping it would make the next
 ///   `/drain` re-queue that deploy needlessly. Leaving it is the conservative
 ///   half of "clear what is stale, keep what is current";
-/// * a label that is not a plain path component. That aborts only this phase,
-///   not the whole teardown — the label names nothing else we remove.
+/// * a marker recording **this teardown** (`teardown@<sha>`) — kept, which is
+///   the opposite of what this function used to do (switchboard#24). A teardown
+///   is published to the cluster once and must be materialized independently by
+///   *every* node, so `switchboard:preview:<label>` now outlives the first
+///   node's drain rather than being deleted by it. With the desired state still
+///   published, deleting our receipt makes the very next `/drain` two seconds
+///   later see `teardown@<sha>` != *(no marker)*, re-queue the identical
+///   teardown, tear down nothing, delete the receipt again — a hot loop for the
+///   lifetime of the key. The receipt is the loop's only brake. It costs ~50
+///   bytes per label and is superseded in place by the next `deploy@<sha>` if
+///   the PR is reopened;
+/// * anything this cannot parse as `<intent>@<sha>` — an empty file, a
+///   truncated write, a future format. That is genuine drift with no meaning to
+///   either side, and the cost of dropping it is one redundant (idempotent)
+///   `/drain` materialization.
+///
+/// A label that is not a plain path component aborts only this phase, not the
+/// whole teardown — the label names nothing else we remove.
 ///
 /// # Errors
 ///
@@ -297,20 +325,40 @@ async fn remove_applied_marker(state_dir: &Path, label: &str) -> anyhow::Result<
         }
     };
 
-    if marker_records_a_deploy(&recorded) {
-        tracing::info!(
-            %label,
-            marker = %recorded.trim(),
-            path = %path.display(),
-            "leaving switchboard-api's applied/ marker in place — it records a \
-             deploy newer than this teardown"
-        );
-        return Ok(());
+    match marker_intent(&recorded) {
+        Some(MarkerIntent::Deploy) => {
+            tracing::info!(
+                %label,
+                marker = %recorded.trim(),
+                path = %path.display(),
+                "leaving switchboard-api's applied/ marker in place — it records a \
+                 deploy newer than this teardown"
+            );
+            return Ok(());
+        }
+        Some(MarkerIntent::Teardown) => {
+            tracing::debug!(
+                %label,
+                marker = %recorded.trim(),
+                path = %path.display(),
+                "leaving switchboard-api's applied/ marker in place — it is this \
+                 node's receipt for the teardown just performed, and removing it \
+                 would make /drain re-queue the teardown every interval while the \
+                 desired state is still published (switchboard#24)"
+            );
+            return Ok(());
+        }
+        None => {}
     }
 
     match tokio::fs::remove_file(&path).await {
         Ok(()) => {
-            tracing::info!(%label, path = %path.display(), "removed switchboard-api's desired-state marker");
+            tracing::info!(
+                %label,
+                marker = %recorded.trim(),
+                path = %path.display(),
+                "removed an unparseable switchboard-api desired-state marker"
+            );
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -319,19 +367,24 @@ async fn remove_applied_marker(state_dir: &Path, label: &str) -> anyhow::Result<
     }
 }
 
-/// Whether an `applied/<label>` marker body records a *deploy*.
+/// The intent half of an `applied/<label>` marker body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerIntent {
+    Deploy,
+    Teardown,
+}
+
+/// Parse the intent out of an `applied/<label>` marker body.
 ///
-/// The format is switchboard-api's `<intent>@<sha>`. Anything this cannot read
-/// as a deploy — a teardown, an empty file, a future format — is treated as
-/// stale and removed: the cost of dropping a marker is one redundant `/drain`
-/// materialization, the cost of keeping a stale one is a preview that can come
-/// back from the dead.
-fn marker_records_a_deploy(marker: &str) -> bool {
-    marker
-        .trim()
-        .split('@')
-        .next()
-        .is_some_and(|intent| intent.trim() == "deploy")
+/// The format is switchboard-api's `<intent>@<sha>`. `None` means the body is
+/// neither — an empty file, a partial write, a format this build predates —
+/// which [`remove_applied_marker`] treats as drift and reaps.
+fn marker_intent(marker: &str) -> Option<MarkerIntent> {
+    match marker.trim().split('@').next().map(str::trim) {
+        Some("deploy") => Some(MarkerIntent::Deploy),
+        Some("teardown") => Some(MarkerIntent::Teardown),
+        _ => None,
+    }
 }
 
 /// Remove the vhost state roots for `site_key` under `base`.
@@ -839,16 +892,45 @@ mod tests {
 
     // ── issue #19: switchboard-api's applied/ marker ────────────────────
 
+    /// switchboard#24: the receipt for the teardown we just performed must
+    /// survive it. The shared desired state (`switchboard:preview:<label>`)
+    /// stays published until every node has had a chance to materialize it, so
+    /// a node that deletes its own receipt re-queues the same teardown on its
+    /// next `/drain` — every interval, forever.
     #[tokio::test]
-    async fn teardown_clears_the_api_desired_state_marker() {
+    async fn teardown_keeps_its_own_receipt_marker() {
+        let f = Fixture::new().await;
+        let site_key = "ephpm-wordpress-sample-pr-1";
+        let marker = "teardown@0123456789abcdef0123456789abcdef01234567";
+        f.deploy_artifacts(site_key).await;
+        f.write_marker(site_key, &format!("{marker}\n")).await;
+
+        teardown_preview(&preview(site_key), &f.ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(f.marker(site_key))
+                .await
+                .expect("the teardown receipt must survive the teardown")
+                .trim(),
+            marker,
+            "deleting the receipt makes /drain re-queue this teardown every \
+             interval while the desired state is still published"
+        );
+        assert!(
+            !f.sites.join(site_key).exists(),
+            "the preview itself is still removed"
+        );
+    }
+
+    /// A marker body neither side can parse is drift, and is still reaped.
+    #[tokio::test]
+    async fn teardown_clears_an_unparseable_desired_state_marker() {
         let f = Fixture::new().await;
         let site_key = "ephpm-wordpress-sample-pr-1";
         f.deploy_artifacts(site_key).await;
-        f.write_marker(
-            site_key,
-            "teardown@0123456789abcdef0123456789abcdef01234567\n",
-        )
-        .await;
+        f.write_marker(site_key, "").await;
 
         teardown_preview(&preview(site_key), &f.ctx())
             .await
@@ -870,7 +952,9 @@ mod tests {
         let label = "ephpm-wordpress-sample-pr-1";
         let site_key = "ephpm-wordpress-sample-pr-1.preview.ephpm.dev";
         f.deploy_artifacts(site_key).await;
-        f.write_marker(label, "teardown@abc").await;
+        // Unparseable, so this exercises the branch that *does* touch the file
+        // — the keying bug it guards against is invisible on a no-op branch.
+        f.write_marker(label, "garbage").await;
 
         teardown_preview(&Preview { site_key, label }, &f.ctx())
             .await
@@ -878,7 +962,7 @@ mod tests {
 
         assert!(
             !f.marker(label).exists(),
-            "the label-keyed marker is cleared"
+            "the label-keyed marker is the one consulted, not a key-named one"
         );
         assert!(
             !f.sites.join(site_key).exists(),
@@ -921,16 +1005,22 @@ mod tests {
     async fn a_neighbouring_label_keeps_its_marker() {
         let f = Fixture::new().await;
         let site_key = "ephpm-my-blog-pr-7";
-        f.write_marker(site_key, "teardown@a").await;
-        f.write_marker("ephpm-my-blog-pr-71", "deploy@b").await;
-        f.write_marker("ephpm-my-blog-pr-8", "teardown@c").await;
+        // Unparseable, so the one branch that removes a file actually runs —
+        // a teardown marker is now kept, and a no-op branch cannot show that
+        // the removal is scoped to exactly one label.
+        f.write_marker(site_key, "garbage").await;
+        f.write_marker("ephpm-my-blog-pr-71", "garbage").await;
+        f.write_marker("ephpm-my-blog-pr-8", "garbage").await;
 
         teardown_preview(&preview(site_key), &f.ctx())
             .await
             .unwrap();
 
         assert!(!f.marker(site_key).exists());
-        assert!(f.marker("ephpm-my-blog-pr-71").exists());
+        assert!(
+            f.marker("ephpm-my-blog-pr-71").exists(),
+            "a label with the target as a prefix is a different label"
+        );
         assert!(f.marker("ephpm-my-blog-pr-8").exists());
     }
 
@@ -961,16 +1051,24 @@ mod tests {
 
     #[test]
     fn marker_bodies_are_classified_by_intent() {
-        assert!(marker_records_a_deploy("deploy@0123456789abcdef"));
-        assert!(marker_records_a_deploy(" deploy@abc \n"));
-        assert!(!marker_records_a_deploy(
-            "teardown@0123456789abcdef0123456789abcdef01234567"
-        ));
-        // Unreadable bodies count as stale: a redundant re-materialization is
-        // cheaper than a resurrected preview.
-        assert!(!marker_records_a_deploy(""));
-        assert!(!marker_records_a_deploy("deployment@abc"));
-        assert!(!marker_records_a_deploy("whatever the next schema writes"));
+        assert_eq!(
+            marker_intent("deploy@0123456789abcdef"),
+            Some(MarkerIntent::Deploy)
+        );
+        assert_eq!(marker_intent(" deploy@abc \n"), Some(MarkerIntent::Deploy));
+        assert_eq!(
+            marker_intent("teardown@0123456789abcdef0123456789abcdef01234567"),
+            Some(MarkerIntent::Teardown)
+        );
+        assert_eq!(
+            marker_intent("\tteardown@abc\n"),
+            Some(MarkerIntent::Teardown)
+        );
+        // Unreadable bodies are drift and get reaped: a redundant (idempotent)
+        // re-materialization is cheaper than a marker nobody can interpret.
+        assert_eq!(marker_intent(""), None);
+        assert_eq!(marker_intent("deployment@abc"), None);
+        assert_eq!(marker_intent("whatever the next schema writes"), None);
     }
 
     #[tokio::test]
