@@ -99,6 +99,35 @@ pub struct Config {
     #[arg(long, default_value = "composer", env = "SWITCHBOARD_COMPOSER")]
     pub composer: String,
 
+    /// The `ephpm` binary used to run manifest `build:` / `seed:` steps inside
+    /// the tenant sandbox (`ephpm exec --site`).
+    ///
+    /// Every build/seed step runs as `ephpm exec --config <ephpm-config> --site
+    /// <key> -- sh -c "<step>"`, which drops to the tenant uid, applies Landlock,
+    /// and arms the host egress firewall (ephpm#484). This is the primitive that
+    /// closes the root-RCE the old `sh -c` path exposed, so the binary must
+    /// support `exec` — a build/seed **refuses to run** on an `ephpm` that does
+    /// not (see the deployer), rather than falling back to root.
+    ///
+    /// Defaults to `ephpm` on `PATH`; set an absolute path (e.g.
+    /// `/usr/local/bin/ephpm`) when the daemon's `PATH` does not include it.
+    #[arg(long, default_value = "ephpm", env = "SWITCHBOARD_EPHPM_BIN")]
+    pub ephpm_bin: PathBuf,
+
+    /// Path to the node's ePHPm configuration, passed to `ephpm exec --config`.
+    ///
+    /// `ephpm exec` reads `[server] sites_dir` and the per-site derivation from
+    /// this file to reconstruct the tenant's on-disk boundary (the same
+    /// derivation an HTTP request goes through). It must be the **same**
+    /// `ephpm.toml` the running server on this node uses, or the sandbox would
+    /// scope a different tenant. Defaults to ePHPm's own default location.
+    #[arg(
+        long,
+        default_value = "/etc/ephpm/ephpm.toml",
+        env = "SWITCHBOARD_EPHPM_CONFIG"
+    )]
+    pub ephpm_config: PathBuf,
+
     /// Path to switchboard's secrets file (YAML) for resolving `${secret.NAME}`
     /// references in an app manifest's `env:` map. Optional — secrets can also
     /// come from `SWITCHBOARD_SECRET_*` environment variables.
@@ -380,6 +409,10 @@ mod tests {
         assert_eq!(c.sites_dir, PathBuf::from("/var/www/sites"));
         assert_eq!(c.preview_domain, "preview.ephpm.dev");
         assert_eq!(c.composer, "composer");
+        // Build/seed run through `ephpm exec` — the binary defaults to PATH and
+        // the config to ePHPm's own default location.
+        assert_eq!(c.ephpm_bin, PathBuf::from("ephpm"));
+        assert_eq!(c.ephpm_config, PathBuf::from("/etc/ephpm/ephpm.toml"));
         assert_eq!(c.health_timeout_secs, 60);
         assert_eq!(c.health_interval_secs, 2);
         assert!(c.secrets_file.is_none());
@@ -495,6 +528,19 @@ mod tests {
             .validate()
             .expect_err("a dotless suffix must not be accepted");
         assert!(err.to_string().contains("must begin with a dot"), "{err}");
+    }
+
+    #[test]
+    fn ephpm_exec_knobs_parse_and_override() {
+        let c = parse_single_node(&[
+            "--ephpm-bin",
+            "/usr/local/bin/ephpm",
+            "--ephpm-config",
+            "/srv/ephpm/ephpm.toml",
+        ]);
+        assert_eq!(c.ephpm_bin, PathBuf::from("/usr/local/bin/ephpm"));
+        assert_eq!(c.ephpm_config, PathBuf::from("/srv/ephpm/ephpm.toml"));
+        c.validate().unwrap();
     }
 
     #[test]

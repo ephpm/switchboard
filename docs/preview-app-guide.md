@@ -43,7 +43,7 @@ from your detected framework, so an unconfigured repo still gets a preview.
 version: 1                       # required — only 1 is accepted
 php: "8.5"                       # default "8.5"
 docroot: "."                     # default "." — see the caveat below
-build:                           # default [] — run before the site goes live
+build:                           # default [] — run after the swap, sandboxed
   - "composer install --no-dev --optimize-autoloader --no-interaction"
 services:
   database: "turso"              # default "turso"; false / "none" to disable
@@ -67,11 +67,11 @@ matter and forgiving about the rest:
 | `version` | int | **required** | Only `1`. A missing or unknown version **fails the deploy** — a broken contract must not silently deploy the wrong thing. |
 | `php` | string | `"8.5"` | Selects which PHP instance serves you. `8.5` → `https://<host>`; older minors get a port: `8.4` → `:8084`, `8.3` → `:8083` (formula `8080 + minor`). A version that is not `8.<minor>` falls back to the default URL rather than emitting a bogus port. |
 | `docroot` | string | `"."` | Relative to the repo root, and **the web root ePHPm serves** — switchboard publishes it as ePHPm's per-site document-root override. Also sets the WebSocket auto-detect path and the working directory of `seed:` steps. A value ePHPm would refuse (`..`, absolute, non-existent) **fails the deploy**. The default `"."` means your **entire repository is web-served** — supported, warned about on every deploy, and narrowed only by declaring a subdirectory. See [§5](#5-docroot-is-your-web-root). |
-| `build` | list of strings | `[]` | Shell commands (`sh -c`) run in the checkout, in order, **before** the site goes live. A failing step is logged and the deploy **continues**. If `build` is empty and a `composer.json` exists, an implicit `composer install --no-dev --no-interaction --optimize-autoloader --quiet` runs instead. |
+| `build` | list of strings | `[]` | Shell commands run in order at the container root, **after** the atomic swap, each **sandboxed** via `ephpm exec --site` (tenant uid + Landlock + egress firewall — see [§8](#8-build-and-seed-run-sandboxed-outside-an-ephpm-request)), never as root. A failing step is logged and the deploy **continues**. If `build` is empty and a `composer.json` exists, an implicit `composer install --no-dev --no-interaction --optimize-autoloader --quiet` runs instead. |
 | `services.database` | `"turso"` \| `false` | `"turso"` | `"turso"` (case-insensitive), `true`, `false`, or `"none"`. Any other string is a parse error naming the field. |
 | `services.kv` | bool | `true` | Requests the embedded KV store. |
 | `services.websocket` | bool | *auto* | Unset means: enabled if `websocket.php` exists at `<repo>/<docroot>`. An explicit `true`/`false` always wins. |
-| `seed` | list of strings | `[]` | Shell commands run **after** the swap, with the working directory `<site>/<docroot>`, and `$PREVIEW_URL`, `$PREVIEW_HOST`, `$PR` in the environment. Failures are logged and the deploy continues. |
+| `seed` | list of strings | `[]` | Shell commands run **after** the swap, **sandboxed** via `ephpm exec --site` (see [§8](#8-build-and-seed-run-sandboxed-outside-an-ephpm-request)), with the working directory `<site>/<docroot>`, and `$PREVIEW_URL`, `$PREVIEW_HOST`, `$PR` in the environment. Failures are logged and the deploy continues. |
 | `env` | map | `{}` | Values are literals or `${secret.NAME}`. See [§3](#3-the-env-block-and-what-actually-reaches-php). |
 | `health` | string | `"/"` | Appended to the preview URL and polled for HTTP 200 before the deploy is reported ready. |
 | `ini` | map | `{}` | **Advisory in v1.** Recorded in a sidecar file; nothing applies it to the running server. Setting `memory_limit` here does nothing today. |
@@ -97,7 +97,8 @@ or `wp-config-sample.php` → WordPress; then `composer.json` containing
 
 The Laravel/Symfony/Drupal rows depend on the operator having configured
 `--site-overrides-dir` — read [§5](#5-docroot-is-your-web-root). Read
-[§8](#8-build-and-seed-run-outside-ephpm) before relying on their `seed:` steps.
+[§8](#8-build-and-seed-run-sandboxed-outside-an-ephpm-request) before relying on
+their `seed:` steps.
 
 `ephpm/wordpress-sample` ships a conforming manifest —
 [`ephpm.yaml`](https://github.com/ephpm/wordpress-sample/blob/main/ephpm.yaml)
@@ -385,9 +386,10 @@ Two things switchboard does about it, and one it cannot:
 * your `ephpm.yaml` (and `ephpm.yml` / `ephpm.json`) is **moved to
   `.switchboard/` before the site goes live**, so it is never served. It used to
   be: `GET /ephpm.yaml` returned 200 with your build commands, your enabled
-  services and your entire seed sequence (switchboard#16). Read it at
-  `.switchboard/ephpm.yaml` if a `seed:` step needs it — `build:` runs before
-  the move and still sees `./ephpm.yaml`;
+  services and your entire seed sequence (switchboard#16). Both `build:` and
+  `seed:` run **after** the manifest is moved (and after the atomic swap), so a
+  step that needs the manifest must read it at `.switchboard/ephpm.yaml`, not
+  `./ephpm.yaml`;
 * everything switchboard itself generates (`.env`, the prepend, the sidecar) is
   dot-prefixed and therefore already a 403;
 * it cannot vet **your** files. A `docroot: "."` preview publishes
@@ -403,9 +405,10 @@ The deploy **fails loudly** rather than silently serving your whole checkout if
 * a plain relative path (`public`, `web`, `app/htdocs`) — no `..`, no leading
   `/`, no drive letter, no backslashes;
 * characters from `[A-Za-z0-9._/-]` only;
-* it must **exist** in the built checkout and be a directory. If your web root
-  is produced by a `build:` step, that step has to run first — it does: `build:`
-  runs before this check.
+* it must **exist** in the checkout as fetched, and be a directory. `docroot:`
+  is validated **before** `build:` runs (and before the swap), so a web root that
+  only a `build:` step would create is not supported — commit the directory (even
+  empty) or have your framework ship it.
 * a symlink is fine as long as it resolves inside your checkout.
 
 ### Two things to check with your operator
@@ -618,14 +621,22 @@ Details: [Native WebSockets](https://ephpm.dev/guides/websockets/).
 
 ---
 
-## 8. Build and seed run *outside* ePHPm
+## 8. Build and seed run sandboxed, outside an ePHPm request
 
-**Verified.** `build:` and `seed:` are `sh -c` commands run by switchboard as
-ordinary child processes. They are not ePHPm requests. That means:
+`build:` and `seed:` are shell commands, not ePHPm requests. They are **not** run
+as root: switchboard runs each one through ePHPm's sandboxed execution primitive
+(`ephpm exec --site <your key>`), which drops to the unprivileged tenant uid,
+confines the filesystem to your vhost with Landlock, and puts your command behind
+the host's per-tenant **egress firewall**. `build:` runs at your container root
+(where `composer.json` is); `seed:` runs at your document root. That means:
 
 - They get **no** `$_SERVER['DB_*']`. There is no way for a shell command to
   learn your preview's database password — it exists only in the server's
   memory and is minted per request.
+- Your preview's own database and KV listeners are on `127.0.0.1`, and the
+  egress firewall **drops loopback** for the tenant uid — so a `seed:` step
+  cannot reach them directly even by guessing the port. Touch the database the
+  way a request does (below), not with `mysql -h 127.0.0.1`.
 - `ephpm php` (the bundled CLI) does not help: it is a separate process with no
   server config. **Verified** — `ephpm php -r 'ephpm_db_query("SELECT 1")'`
   returns `ephpm_db: no embedded database is active (requires [db.sqlite])`.
@@ -868,7 +879,7 @@ Labelled so you do not build on them.
 
 | Item | Status |
 |---|---|
-| Your `ephpm.yaml` at the web root | **Moved, not served.** The deploy relocates `ephpm.yaml` / `ephpm.yml` / `ephpm.json` to `.switchboard/` before the site goes live. It used to be a public 200 on `docroot: "."` sites. A `seed:` step that reads the manifest must use the new path; `build:` is unaffected. [switchboard#16](https://github.com/ephpm/switchboard/issues/16). |
+| Your `ephpm.yaml` at the web root | **Moved, not served.** The deploy relocates `ephpm.yaml` / `ephpm.yml` / `ephpm.json` to `.switchboard/` before the site goes live. It used to be a public 200 on `docroot: "."` sites. Both `build:` and `seed:` now run after the move (and after the swap), so either that reads the manifest must use the new path. [switchboard#16](https://github.com/ephpm/switchboard/issues/16). |
 | `docroot: "."` | **Supported, and it publishes your whole repository.** Warned on every deploy. Nothing narrows it except declaring a subdirectory — switchboard removes its own artifacts and your manifest, but cannot vet your files. |
 | Per-site document root (`docroot:` routing) | **Shipped both sides.** ePHPm reads an operator-owned override outside the tenant checkout (`[server] site_overrides_dir`); switchboard generates it from your `ephpm.yaml` `docroot:`. **Requires the operator to set `--site-overrides-dir`** — unset, ePHPm serves the whole checkout and the deploy warns. |
 | `auto_prepend_file` per site | **Not available.** ePHPm's per-site override channel understands `document_root` and nothing else, so the generated `.ephpm-preview-prepend.php` is never auto-loaded. Apps that need it `require_once` it (§3). [switchboard#4](https://github.com/ephpm/switchboard/issues/4). |

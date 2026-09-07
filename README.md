@@ -100,21 +100,48 @@ resolved derivation at startup.
 
 A **deploy** fetches `refs/pull/<n>/head` at the recorded `head.sha` from the
 **base** repository (which works for forks, and for deleted forks, without
-trusting a third-party clone URL), builds per the app's `ephpm.yaml` manifest,
-publishes the manifest's `docroot:` as ePHPm's per-site override, and installs
-the result at `<sites_dir>/<key>/` by staging into `<key>.tmp` and renaming.
+trusting a third-party clone URL), materializes the app's `env:` and the
+manifest's `docroot:` override, installs the result at `<sites_dir>/<key>/` by
+staging into `<key>.tmp` and renaming, and only then runs the manifest's
+`build:` and `seed:` steps — sandboxed (see below).
 
-Before the swap the deploy also takes the manifest itself out of the served
-root: `ephpm.yaml` / `ephpm.yml` / `ephpm.json` are moved to
-`<site>/.switchboard/`. They are ordinary, non-dot-prefixed files at the
-repository root, and for an app declaring `docroot: "."` — WordPress, and most
-bespoke apps — the repository root *is* the web root, so `GET /ephpm.yaml`
-returned 200 with the build commands, the enabled services and the whole seed
-sequence (switchboard#16). The archive is dot-prefixed, so ePHPm's
-`hidden_files` default (`deny`) makes it a 403; it is inside the site directory,
-so the existing teardown reaps it. A `seed:` step that wants the manifest must
-read `.switchboard/ephpm.yaml` — `build:` runs before the move and still sees
-the original path.
+Before the swap the deploy takes the manifest itself out of the served root:
+`ephpm.yaml` / `ephpm.yml` / `ephpm.json` are moved to `<site>/.switchboard/`.
+They are ordinary, non-dot-prefixed files at the repository root, and for an app
+declaring `docroot: "."` — WordPress, and most bespoke apps — the repository
+root *is* the web root, so `GET /ephpm.yaml` returned 200 with the build
+commands, the enabled services and the whole seed sequence (switchboard#16). The
+archive is dot-prefixed, so ePHPm's `hidden_files` default (`deny`) makes it a
+403; it is inside the site directory, so the existing teardown reaps it. A
+`build:` or `seed:` step that wants the manifest must read
+`.switchboard/ephpm.yaml`.
+
+### `build:` and `seed:` run sandboxed, not as root
+
+`build:` and `seed:` execute **untrusted code from a pull request**. They used
+to run as **root** via `sh -c` — a confirmed root-RCE on the preview cluster.
+Every such step now runs through ePHPm's sandboxed execution primitive
+(`ephpm exec --site`, ephpm#484):
+
+```text
+ephpm exec --config <ephpm.toml> --site <key> -- sh -c "cd <workdir> && <step>"
+```
+
+which drops to the tenant uid, applies a Landlock filesystem scope (the vhost
+container + its private temp/session root, and nothing else — not `/etc/ephpm`,
+not `/root`), and arms the host's uid-keyed egress firewall. `build:` runs at the
+container root (where `composer.json` lives); `seed:` runs at the document root.
+The step's environment (`PREVIEW_URL`, `PREVIEW_HOST`, `PR`,
+`COMPOSER_NO_INTERACTION`, …) is inherited through `ephpm exec`. This is why
+`build:` moved to **after** the atomic swap: `ephpm exec --site <key>` sandboxes
+a command in the *existing* vhost directory, which does not exist until the swap.
+
+**This fails closed.** If the configured `ephpm` (`--ephpm-bin`) does not support
+`exec` — an ePHPm predating #484 — a deploy **refuses** rather than falling back
+to running the step as root. There is deliberately no unsandboxed fallback. That
+makes the rollout order a hard requirement: **deploy the ePHPm carrying #484 to a
+node before deploying this switchboard to it.** In the wrong order switchboard
+refuses to deploy previews (the safe direction) until ePHPm is upgraded.
 
 A **teardown** removes everything the preview left on this node, each derived
 from the site key by exact path — never a glob wider than the one site:
@@ -239,6 +266,8 @@ seconds forever.
 | `--preview-domain` | `SWITCHBOARD_PREVIEW_DOMAIN` | `preview.ephpm.dev` | Suffix appended to the label to form the preview host. |
 | `--sites-domain-suffix` | `SWITCHBOARD_SITES_DOMAIN_SUFFIX` | `.<preview-domain>` | ePHPm's `[server] sites_domain_suffix` **on this node**. Decides the site key (see above). Pass `""` for a node that configures no suffix. Must begin with a dot — ePHPm refuses a dotless one (ephpm#397). |
 | `--composer` | `SWITCHBOARD_COMPOSER` | `composer` | Composer command or path. |
+| `--ephpm-bin` | `SWITCHBOARD_EPHPM_BIN` | `ephpm` | The `ephpm` binary used to run `build:`/`seed:` steps sandboxed (`ephpm exec --site`). Must support `exec` (ephpm#484) — a deploy **refuses** otherwise rather than running steps as root. Set an absolute path if it is not on the daemon's `PATH`. |
+| `--ephpm-config` | `SWITCHBOARD_EPHPM_CONFIG` | `/etc/ephpm/ephpm.toml` | The node's `ephpm.toml`, passed to `ephpm exec --config`. Must be the same config the running server uses, so the sandbox resolves the same per-site boundary. |
 | `--secrets-file` | `SWITCHBOARD_SECRETS_FILE` | *(none)* | YAML secret store for `${secret.NAME}` references in a manifest's `env:`. |
 | `--health-timeout-secs` | `SWITCHBOARD_HEALTH_TIMEOUT_SECS` | `60` | How long to poll the manifest's `health:` path for a 200. `0` disables the gate. |
 | `--health-interval-secs` | `SWITCHBOARD_HEALTH_INTERVAL_SECS` | `2` | Seconds between health polls. |
@@ -345,7 +374,7 @@ pinned to the crate's MSRV on the ephpm org's self-hosted fleet.
 | `src/queue.rs` | Scan, claim (`link`+`unlink`), coalesce per label, complete; the enqueue timestamp a claimed job carries |
 | `src/validate.rs` | Claim-time re-validation of a deploy job: the queue-age bound and the current-PR-state check |
 | `src/drain.rs` | The `/drain` kick and the shared-secret file |
-| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → build → env → quarantine the manifest → atomic swap → seed → health |
+| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → env → quarantine the manifest → atomic swap → build → seed → health. `build:`/`seed:` run sandboxed via `ephpm exec --site` (fail-closed if unsupported). |
 | `src/teardown.rs` | Preview teardown: vhost dir, per-site database, override file, vhost temp/session state root, the API's `applied/` marker — and the refusal to call a partial teardown a success |
 | `src/manifest.rs` | The `ephpm.yaml` app manifest schema, and moving it out of the served root once read |
 | `src/secrets.rs` | `${secret.NAME}` resolution from switchboard's own store |

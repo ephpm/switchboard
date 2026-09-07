@@ -431,6 +431,8 @@ async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result
         sites_domain_suffix: suffix.as_deref(),
         site_overrides_dir: state.config.site_overrides_dir.as_deref(),
         composer: &state.config.composer,
+        ephpm_bin: &state.config.ephpm_bin,
+        ephpm_config: &state.config.ephpm_config,
         secrets,
         health_timeout: Duration::from_secs(state.config.health_timeout_secs),
         health_interval: Duration::from_secs(state.config.health_interval_secs),

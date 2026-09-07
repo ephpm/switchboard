@@ -1,10 +1,37 @@
-//! Preview deployment pipeline: clone, load manifest, build, materialize env,
-//! atomic swap, seed, and health-gate.
+//! Preview deployment pipeline: clone, load manifest, materialize env, atomic
+//! swap, build, seed, and health-gate.
 //!
-//! The order is a contract (see [`deploy_preview`]): everything that mutates
-//! the checkout (`build:`, env materialization) happens BEFORE the atomic swap
-//! into `sites_dir`; everything that needs the site live (`seed:`, the health
-//! poll) happens AFTER.
+//! The order is a contract (see [`deploy_preview`]): env materialization, the
+//! per-site override and the manifest quarantine all happen BEFORE the atomic
+//! swap into `sites_dir`, so the vhost is never briefly served with a container
+//! web root or without its `env:`. `build:` and `seed:` — the two steps that run
+//! **untrusted tenant commands** — happen AFTER the swap, because both go
+//! through `ephpm exec --site <key>` and that primitive sandboxes a command in
+//! an *existing* vhost (`sites_dir/<key>`, not the pre-swap `.tmp` staging dir).
+//!
+//! # Untrusted steps run sandboxed, or not at all
+//!
+//! `build:` and `seed:` used to run as **root** via `sh -c` — a confirmed
+//! root-RCE, since a preview builds arbitrary code from a pull request. Every
+//! such step now runs as:
+//!
+//! ```text
+//! ephpm exec --config <ephpm.toml> --site <key> -- sh -c "cd <workdir> && <step>"
+//! ```
+//!
+//! which drops to the tenant uid, applies a Landlock filesystem scope, and arms
+//! the host's uid-keyed egress firewall (ephpm#484). Env (`PREVIEW_URL`,
+//! `COMPOSER_NO_INTERACTION`, …) reaches the step by *inheritance*: `ephpm exec`
+//! `execvp`s the command, so anything set on the `ephpm exec` child's
+//! environment is inherited by the step. The working directory is set explicitly
+//! with a `cd` prefix (the container root for `build:`, the document root for
+//! `seed:`) rather than relying on `ephpm exec`'s own chdir.
+//!
+//! **Fail closed:** if the configured `ephpm` binary does not support `exec`
+//! (an ePHPm predating #484), a deploy **refuses** rather than falling back to
+//! running the step as root — see [`ensure_sandboxed_exec`]. That makes the
+//! deploy-ordering constraint explicit: the ePHPm carrying #484 must be rolled
+//! out to a node before this switchboard is.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -183,6 +210,13 @@ pub struct DeployContext<'a> {
     pub site_overrides_dir: Option<&'a Path>,
     /// Composer command (or path).
     pub composer: &'a str,
+    /// The `ephpm` binary that runs `build:` / `seed:` steps inside the tenant
+    /// sandbox (`ephpm exec --site`). A build/seed refuses to run if this binary
+    /// does not support `exec` — it is never bypassed to run steps as root.
+    pub ephpm_bin: &'a Path,
+    /// The node's `ephpm.toml`, passed to `ephpm exec --config` so the sandbox
+    /// resolves the same per-site boundary the running server does.
+    pub ephpm_config: &'a Path,
     /// Switchboard's own secret store for `${secret.NAME}` resolution.
     pub secrets: &'a Secrets,
     /// How long to poll `health:` for a 200 before giving up. Zero disables the
@@ -212,29 +246,48 @@ pub struct DeployResult {
 /// Pipeline order:
 /// 1. Fetch the PR head (`refs/pull/<n>/head` from the base repo) at its SHA.
 /// 2. Detect the framework and load the `ephpm.yaml` manifest (or synthesize).
-/// 3. Run `build:` commands in the checkout, in order (failures logged, deploy
-///    continues — matching the POC's composer behavior).
-/// 4. Materialize `env:` — resolve `${secret.NAME}` from switchboard's own
-///    secret store and write it where the app can read it.
-///    Then move the deploy manifest out of the served root (switchboard#16) —
-///    after `build:` has had it, before it could ever be requested.
+/// 3. Materialize `env:` — resolve `${secret.NAME}` from switchboard's own
+///    secret store and write it where the app can read it (`.env` for
+///    build/seed shell steps, the PHP prepend for the app).
+/// 4. Move the deploy manifest out of the served root (switchboard#16) and
+///    strip `.git`, before it could ever be requested.
 /// 5. Write (or clear) the per-site document-root override, **before** the swap
 ///    so the vhost is never briefly served with its container as the web root.
 /// 6. Atomic swap the checkout into `sites_dir`.
-/// 7. Run `seed:` commands with `$PREVIEW_URL`/`$PREVIEW_HOST`/`$PR` set.
-/// 8. Poll `health:` until it returns 200 or the timeout elapses, so the PR
+/// 7. Run `build:` commands — now that the code lives at `sites_dir/<key>`,
+///    each runs sandboxed via `ephpm exec --site` (failures logged, deploy
+///    continues, matching the POC's composer behavior).
+/// 8. Run `seed:` commands with `$PREVIEW_URL`/`$PREVIEW_HOST`/`$PR` set, also
+///    sandboxed via `ephpm exec --site`.
+/// 9. Poll `health:` until it returns 200 or the timeout elapses, so the PR
 ///    comment is only posted once the site is ready.
+///
+/// **`build:` moved after the swap** (it used to run pre-swap on the `.tmp`
+/// staging tree) because `ephpm exec --site <key>` sandboxes a command in the
+/// *existing* vhost directory `sites_dir/<key>`, which does not exist until the
+/// swap. The site is therefore routable while `build:` runs; the health gate
+/// (step 9) still withholds the PR comment until the site serves a 200, so the
+/// URL is not advertised before it is ready. See the module docs.
 ///
 /// # Errors
 ///
-/// Returns an error if cloning, manifest loading (present-but-invalid),
-/// document-root validation, or the atomic swap fails.
+/// Returns an error if the configured `ephpm` cannot run sandboxed steps
+/// (fail-closed — see [`ensure_sandboxed_exec`]), or if cloning, manifest
+/// loading (present-but-invalid), document-root validation, or the atomic swap
+/// fails.
 pub async fn deploy_preview(
     req: &PreviewRequest,
     ctx: &DeployContext<'_>,
 ) -> anyhow::Result<DeployResult> {
     let start = Instant::now();
     let hostname = req.preview_host(ctx.preview_domain);
+
+    // Fail CLOSED before touching disk: `build:`/`seed:` must run through
+    // `ephpm exec --site` (uid drop + Landlock + egress). An `ephpm` predating
+    // #484 has no `exec`, and the only safe answer is to refuse the deploy —
+    // never to fall back to running untrusted tenant commands as root. This is
+    // also what enforces the rollout order: ship the ePHPm with `exec` first.
+    ensure_sandboxed_exec(ctx.ephpm_bin).await?;
     // The **site key** names every per-site artifact, and it is ePHPm's
     // derivation, not ours: the preview host with the node's
     // `sites_domain_suffix` stripped, or the full host when the node has none.
@@ -281,11 +334,11 @@ pub async fn deploy_preview(
         "loaded app manifest"
     );
 
-    // (3) Run build: commands (or fall back to implicit composer install).
-    run_build(&manifest, &tmp_dir, ctx.composer, &hostname).await;
-
-    // (4) Materialize env: resolve secrets and write env for the app to read.
-    // Reference the FINAL (post-swap) prepend path in the effective ini.
+    // (3) Materialize env: resolve secrets and write env for the app to read.
+    // Reference the FINAL (post-swap) prepend path in the effective ini. This
+    // runs BEFORE the swap (so `.env`/prepend travel with the tree) and now also
+    // before `build:`, which moved after the swap — so a build step reads the
+    // preview's resolved `.env` where it used to run before it existed.
     let final_prepend = site_dir.join(PREPEND_FILE);
     materialize_env(
         &req.repo_full_name,
@@ -303,8 +356,10 @@ pub async fn deploy_preview(
         tokio::fs::remove_dir_all(&git_dir).await.ok();
     }
 
-    // (4b) Take the deploy manifest out of the served root, now that it has
-    // been read and `build:` (which runs in the checkout) is done.
+    // (4) Take the deploy manifest out of the served root, now that it has been
+    // read. (`build:` runs after the swap now, sandboxed, and reads the manifest
+    // from switchboard's parsed copy — not from the served tree — so quarantine
+    // no longer has to wait for it.)
     //
     // `ephpm.yaml` is not dot-prefixed, and for `docroot: "."` the checkout
     // root IS the web root — so it was served: `GET /ephpm.yaml` → 200 with the
@@ -343,12 +398,36 @@ pub async fn deploy_preview(
         .await
         .context("failed to move preview into place")?;
 
-    // (7) Run seed: commands now that the site is live and its per-site DB can
+    // The sandbox handle for every untrusted step: `ephpm exec --config … --site
+    // <key> -- …`. Both `build:` and `seed:` run through it, so both inherit the
+    // uid drop, Landlock scope, and egress lock. The site key is ePHPm's own
+    // canonical derivation (computed above), and `ephpm exec` re-normalizes and
+    // allowlist-checks it, so it is a bare vhost name here.
+    let sandbox = SandboxExec {
+        ephpm_bin: ctx.ephpm_bin,
+        ephpm_config: ctx.ephpm_config,
+        site_key: &site_key,
+    };
+
+    // (7) Run build: commands now that the code lives at `sites_dir/<key>` — the
+    // vhost `ephpm exec --site` sandboxes. Runs at the container root (where
+    // `composer.json` lives), not the document root.
+    run_build(&manifest, &site_dir, ctx.composer, sandbox, &hostname).await;
+
+    // (8) Run seed: commands now that the site is live and its per-site DB can
     // be created on first access.
     let preview_url = preview_url(&hostname, Some(manifest.php.as_str()));
-    run_seed(&manifest, &site_dir, &preview_url, &hostname, req.pr_number).await;
+    run_seed(
+        &manifest,
+        &site_dir,
+        sandbox,
+        &preview_url,
+        &hostname,
+        req.pr_number,
+    )
+    .await;
 
-    // (8) Health-gate: only report ready once the site serves a 200.
+    // (9) Health-gate: only report ready once the site serves a 200.
     let healthy = wait_healthy(&preview_url, &manifest.health, ctx).await;
 
     let duration = start.elapsed();
@@ -470,23 +549,144 @@ async fn run_git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the manifest's `build:` commands in order. If the manifest declares no
-/// build steps, fall back to an implicit `composer install` when a
-/// `composer.json` exists (POC compatibility). Failures are logged and the
-/// deploy continues.
-async fn run_build(manifest: &AppManifest, checkout: &Path, composer: &str, hostname: &str) {
+/// The `ephpm exec --site` sandbox handle for one preview.
+///
+/// Turns a tenant shell command into an `ephpm exec` invocation that runs it as
+/// the tenant uid, under Landlock, behind the egress firewall. Env for the step
+/// is set on the returned [`Command`] and reaches the step by inheritance
+/// (`ephpm exec` `execvp`s it); the working directory is fixed with an explicit
+/// `cd` prefix rather than relying on `ephpm exec`'s own chdir.
+#[derive(Clone, Copy)]
+struct SandboxExec<'a> {
+    ephpm_bin: &'a Path,
+    ephpm_config: &'a Path,
+    site_key: &'a str,
+}
+
+impl SandboxExec<'_> {
+    /// The `ephpm` argv that runs `shell_cmd` with `cwd = workdir` inside the
+    /// tenant sandbox. Pure (spawns nothing) so the exact invocation is
+    /// assertable in tests.
+    ///
+    /// `workdir` is an absolute path *inside the site container* (the container
+    /// root for `build:`, the document root for `seed:`) — both are within the
+    /// Landlock read/write grant, so the `cd` succeeds after the uid drop.
+    fn argv(self, workdir: &Path, shell_cmd: &str) -> Vec<String> {
+        let inner = format!(
+            "cd {} && {shell_cmd}",
+            posix_single_quote(&workdir.to_string_lossy())
+        );
+        vec![
+            "exec".to_owned(),
+            "--config".to_owned(),
+            self.ephpm_config.to_string_lossy().into_owned(),
+            "--site".to_owned(),
+            self.site_key.to_owned(),
+            "--".to_owned(),
+            "sh".to_owned(),
+            "-c".to_owned(),
+            inner,
+        ]
+    }
+
+    /// A [`Command`] for [`Self::argv`], ready for the caller to attach env and
+    /// stdio before spawning.
+    fn command(self, workdir: &Path, shell_cmd: &str) -> Command {
+        let mut c = Command::new(self.ephpm_bin);
+        c.args(self.argv(workdir, shell_cmd));
+        c
+    }
+}
+
+/// POSIX single-quote a string so it survives one round of `sh -c` word
+/// splitting. `'` is closed, escaped, and reopened (`'\''`).
+fn posix_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Whether `ephpm --help` output advertises the `exec` subcommand.
+///
+/// clap lists subcommands one per line, name first, under `Commands:`. An
+/// `ephpm` predating #484 has no such line. This is the version probe that keeps
+/// the deploy fail-closed.
+fn help_advertises_exec(help: &str) -> bool {
+    help.lines().any(|line| {
+        let t = line.trim_start();
+        t == "exec" || t.starts_with("exec ") || t.starts_with("exec\t")
+    })
+}
+
+/// Probe whether `ephpm_bin` supports `ephpm exec` (ephpm#484).
+///
+/// Runs `ephpm_bin --help` and inspects the subcommand list. A binary that
+/// cannot even be spawned is a hard error (propagated), so a missing or
+/// mis-pathed `ephpm` fails the deploy rather than silently degrading.
+///
+/// # Errors
+///
+/// Returns an error if the binary cannot be executed.
+async fn ephpm_exec_supported(ephpm_bin: &Path) -> anyhow::Result<bool> {
+    let output = Command::new(ephpm_bin)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("failed to run {} --help", ephpm_bin.display()))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(help_advertises_exec(&text))
+}
+
+/// Refuse the deploy unless `ephpm_bin` can run steps sandboxed (has `exec`).
+///
+/// This is the fail-closed gate: `build:`/`seed:` run untrusted PR code, and the
+/// only two options are "sandboxed via `ephpm exec`" or "not at all". Falling
+/// back to the old root `sh -c` path would re-open the exact root-RCE this
+/// change closes, so there is deliberately no such fallback.
+///
+/// # Errors
+///
+/// Returns an error if `ephpm_bin` cannot be spawned, or runs but does not
+/// advertise the `exec` subcommand (an ePHPm predating #484).
+async fn ensure_sandboxed_exec(ephpm_bin: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        ephpm_exec_supported(ephpm_bin).await?,
+        "the configured ephpm binary ({}) does not support `ephpm exec` — \
+         refusing to deploy. build:/seed: steps run untrusted pull-request code \
+         and must run sandboxed (uid drop + Landlock + egress, ephpm#484); \
+         switchboard will NOT fall back to running them as root. Deploy an ePHPm \
+         that carries #484 to this node first, then this switchboard. Set \
+         --ephpm-bin (SWITCHBOARD_EPHPM_BIN) if the binary is elsewhere.",
+        ephpm_bin.display()
+    );
+    Ok(())
+}
+
+/// Run the manifest's `build:` commands in order, each sandboxed via
+/// `ephpm exec --site`. If the manifest declares no build steps, fall back to an
+/// implicit `composer install` when a `composer.json` exists (POC
+/// compatibility). Failures are logged and the deploy continues.
+///
+/// Every step runs at the **container root** (`site_dir`) — where
+/// `composer.json` and the project files live — not the document root, as the
+/// pre-sandbox path did (it ran `sh -c` with `current_dir(checkout)`).
+async fn run_build(
+    manifest: &AppManifest,
+    site_dir: &Path,
+    composer: &str,
+    sandbox: SandboxExec<'_>,
+    hostname: &str,
+) {
     if manifest.build.is_empty() {
-        if checkout.join("composer.json").exists() {
-            tracing::info!(%hostname, "no build steps declared — running implicit composer install");
-            let status = Command::new(composer)
-                .args([
-                    "install",
-                    "--no-dev",
-                    "--no-interaction",
-                    "--optimize-autoloader",
-                    "--quiet",
-                ])
-                .current_dir(checkout)
+        if site_dir.join("composer.json").exists() {
+            tracing::info!(%hostname, "no build steps declared — running implicit composer install (sandboxed)");
+            let cmd = format!(
+                "{} install --no-dev --no-interaction --optimize-autoloader --quiet",
+                posix_single_quote(composer)
+            );
+            let status = sandbox
+                .command(site_dir, &cmd)
                 .env("COMPOSER_NO_INTERACTION", "1")
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
@@ -503,10 +703,9 @@ async fn run_build(manifest: &AppManifest, checkout: &Path, composer: &str, host
     }
 
     for (i, cmd) in manifest.build.iter().enumerate() {
-        tracing::info!(%hostname, step = i + 1, command = %cmd, "running build step");
-        let status = Command::new("sh")
-            .args(["-c", cmd])
-            .current_dir(checkout)
+        tracing::info!(%hostname, step = i + 1, command = %cmd, "running build step (sandboxed)");
+        let status = sandbox
+            .command(site_dir, cmd)
             .env("COMPOSER_NO_INTERACTION", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -735,22 +934,23 @@ fn render_dotenv(env: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// Run the manifest's `seed:` commands in order, in the live site directory,
-/// with `$PREVIEW_URL`/`$PREVIEW_HOST`/`$PR` set. Failures are logged and the
-/// deploy continues.
+/// Run the manifest's `seed:` commands in order, each sandboxed via
+/// `ephpm exec --site`, at the live site's **document root**, with
+/// `$PREVIEW_URL`/`$PREVIEW_HOST`/`$PR` set (these reach the step by inheritance
+/// through `ephpm exec`). Failures are logged and the deploy continues.
 async fn run_seed(
     manifest: &AppManifest,
     site_dir: &Path,
+    sandbox: SandboxExec<'_>,
     preview_url: &str,
     hostname: &str,
     pr_number: u64,
 ) {
     let workdir = site_dir.join(&manifest.docroot);
     for (i, cmd) in manifest.seed.iter().enumerate() {
-        tracing::info!(%hostname, step = i + 1, command = %cmd, "running seed step");
-        let status = Command::new("sh")
-            .args(["-c", cmd])
-            .current_dir(&workdir)
+        tracing::info!(%hostname, step = i + 1, command = %cmd, "running seed step (sandboxed)");
+        let status = sandbox
+            .command(&workdir, cmd)
             .env("PREVIEW_URL", preview_url)
             .env("PREVIEW_HOST", hostname)
             .env("PR", pr_number.to_string())
@@ -1265,6 +1465,8 @@ mod tests {
             sites_domain_suffix: Some(".preview.ephpm.dev"),
             site_overrides_dir: None,
             composer: "composer",
+            ephpm_bin: Path::new("ephpm"),
+            ephpm_config: Path::new("/etc/ephpm/ephpm.toml"),
             secrets: &secrets,
             health_timeout: Duration::ZERO,
             health_interval: Duration::from_secs(1),
@@ -1287,6 +1489,8 @@ mod tests {
             sites_domain_suffix: Some(".preview.ephpm.dev"),
             site_overrides_dir: overrides,
             composer: "composer",
+            ephpm_bin: Path::new("ephpm"),
+            ephpm_config: Path::new("/etc/ephpm/ephpm.toml"),
             secrets,
             health_timeout: Duration::ZERO,
             health_interval: Duration::from_secs(1),
@@ -1356,5 +1560,143 @@ mod tests {
         apply_document_root(&ctx, "app-pr-1", &root, "app-pr-1.preview.ephpm.dev")
             .await
             .expect("an unconfigured overrides dir must not fail the deploy");
+    }
+
+    // ── build/seed run through `ephpm exec --site` (the root-RCE fix) ────
+
+    fn sandbox() -> SandboxExec<'static> {
+        SandboxExec {
+            ephpm_bin: Path::new("/usr/local/bin/ephpm"),
+            ephpm_config: Path::new("/etc/ephpm/ephpm.toml"),
+            site_key: "app-pr-1",
+        }
+    }
+
+    /// A build step must become `ephpm exec --config … --site <key> -- sh -c
+    /// "cd <container> && <step>"` — never a bare `sh -c`. The working directory
+    /// is the container root, where `composer.json` lives.
+    #[test]
+    fn build_step_becomes_an_ephpm_exec_invocation() {
+        let argv = sandbox().argv(Path::new("/var/www/sites/app-pr-1"), "composer install");
+        assert_eq!(
+            argv,
+            vec![
+                "exec".to_owned(),
+                "--config".to_owned(),
+                "/etc/ephpm/ephpm.toml".to_owned(),
+                "--site".to_owned(),
+                "app-pr-1".to_owned(),
+                "--".to_owned(),
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "cd '/var/www/sites/app-pr-1' && composer install".to_owned(),
+            ]
+        );
+    }
+
+    /// A seed step runs at the document root (`site_dir/<docroot>`) — same
+    /// sandbox, different `cd`.
+    #[test]
+    fn seed_step_runs_at_the_document_root_under_the_sandbox() {
+        let argv = sandbox().argv(
+            Path::new("/var/www/sites/app-pr-1/public"),
+            "php artisan migrate --force",
+        );
+        assert_eq!(argv[0], "exec");
+        assert_eq!(argv[3], "--site");
+        assert_eq!(argv[4], "app-pr-1");
+        assert_eq!(argv[5], "--");
+        assert_eq!(argv[6], "sh");
+        assert_eq!(
+            argv[8],
+            "cd '/var/www/sites/app-pr-1/public' && php artisan migrate --force"
+        );
+    }
+
+    /// The whole point: no build/seed path spawns a bare `sh`/`composer` — every
+    /// tenant command is fronted by `ephpm exec`, whose program is `ephpm_bin`.
+    #[test]
+    fn the_sandbox_command_program_is_the_ephpm_binary() {
+        let cmd = sandbox().command(Path::new("/var/www/sites/app-pr-1"), "true");
+        let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+        assert_eq!(program, "/usr/local/bin/ephpm");
+    }
+
+    /// A workdir carrying a single quote is still one safe shell word.
+    #[test]
+    fn workdir_with_a_quote_is_escaped() {
+        assert_eq!(posix_single_quote("/a'b"), "'/a'\\''b'");
+        let argv = sandbox().argv(Path::new("/a'b"), "true");
+        assert_eq!(argv[8], "cd '/a'\\''b' && true");
+    }
+
+    #[test]
+    fn help_text_detects_the_exec_subcommand() {
+        let with = "Commands:\n  serve  Run the server\n  exec   Run in a sandbox\n  kv  KV\n";
+        assert!(help_advertises_exec(with));
+        // An ePHPm predating #484: no exec line. (A stray mention of the word
+        // "exec" inside another description must not count — only a subcommand
+        // line, name first.)
+        let without =
+            "Commands:\n  serve  Run the server\n  kv  Inspect the store (can exec queries)\n";
+        assert!(!help_advertises_exec(without));
+    }
+
+    /// Fail-closed: an `ephpm` that cannot even be spawned refuses the deploy
+    /// rather than letting build/seed fall back to root.
+    #[tokio::test]
+    async fn ensure_sandboxed_exec_errors_on_a_missing_binary() {
+        let err = ensure_sandboxed_exec(Path::new(
+            "/nonexistent/switchboard-probe/definitely-not-ephpm",
+        ))
+        .await
+        .expect_err("a missing ephpm must fail the deploy, not bypass the sandbox");
+        assert!(err.to_string().contains("--help") || err.to_string().contains("does not support"));
+    }
+
+    /// Fail-closed against a real binary that runs but lacks `exec`: a fake
+    /// `ephpm` whose `--help` advertises no `exec` subcommand must be refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_sandboxed_exec_refuses_an_ephpm_without_exec() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("ephpm-old");
+        // Prints a help without an `exec` subcommand, like an ePHPm pre-#484.
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nprintf 'Commands:\\n  serve  Run\\n  kv  KV\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!ephpm_exec_supported(&bin).await.unwrap());
+        let err = ensure_sandboxed_exec(&bin)
+            .await
+            .expect_err("an ephpm without `exec` must refuse the deploy");
+        assert!(err.to_string().contains("does not support"), "{err}");
+    }
+
+    /// The positive side of the probe: a fake `ephpm` that DOES advertise `exec`
+    /// is accepted, so the gate does not refuse a correctly-upgraded node.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_sandboxed_exec_accepts_an_ephpm_with_exec() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("ephpm-new");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nprintf 'Commands:\\n  serve  Run\\n  exec  Sandboxed exec\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(ephpm_exec_supported(&bin).await.unwrap());
+        ensure_sandboxed_exec(&bin)
+            .await
+            .expect("an ephpm advertising `exec` must be accepted");
     }
 }
