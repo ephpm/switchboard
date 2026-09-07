@@ -100,10 +100,11 @@ resolved derivation at startup.
 
 A **deploy** fetches `refs/pull/<n>/head` at the recorded `head.sha` from the
 **base** repository (which works for forks, and for deleted forks, without
-trusting a third-party clone URL), materializes the app's `env:` and the
-manifest's `docroot:` override, installs the result at `<sites_dir>/<key>/` by
-staging into `<key>.tmp` and renaming, and only then runs the manifest's
-`build:` and `seed:` steps — sandboxed (see below).
+trusting a third-party clone URL), materializes the app's `env:`, publishes the
+manifest's `docroot:` **and** the generated env prepend as ePHPm's per-site
+override, installs the result at `<sites_dir>/<key>/` by staging into `<key>.tmp`
+and renaming, and only then runs the manifest's `build:` and `seed:` steps —
+sandboxed (see below).
 
 Before the swap the deploy takes the manifest itself out of the served root:
 `ephpm.yaml` / `ephpm.yml` / `ephpm.json` are moved to `<site>/.switchboard/`.
@@ -150,7 +151,8 @@ from the site key by exact path — never a glob wider than the one site:
 * the per-site database `<key>.db` + `-wal`/`-shm`/`-journal` under
   `--sqlite-dir` (ePHPm's `[db.sqlite].dir`) — the dominant disk consumer on a
   WordPress preview;
-* the `<key>.toml` docroot override under `--site-overrides-dir`;
+* the `<key>.toml` per-site override (document root + `auto_prepend_file`)
+  under `--site-overrides-dir`;
 * the per-vhost temp/session state root under `--vhost-temp-base` (default:
   this process's `<system temp>/ephpm-vhosts`, matching ePHPm's default). The
   directory name embeds a hash ePHPm computed over the container path; the
@@ -272,7 +274,7 @@ seconds forever.
 | `--health-timeout-secs` | `SWITCHBOARD_HEALTH_TIMEOUT_SECS` | `60` | How long to poll the manifest's `health:` path for a 200. `0` disables the gate. |
 | `--health-interval-secs` | `SWITCHBOARD_HEALTH_INTERVAL_SECS` | `2` | Seconds between health polls. |
 | `--sqlite-dir` | `SWITCHBOARD_SQLITE_DIR` | *(none)* | ePHPm's `[db.sqlite].dir`. Teardown removes the preview's `<key>.db` (+ journal files) from here. **Required** unless `--allow-incomplete-teardown` is set — see [Teardown is complete or it fails](#teardown-is-complete-or-it-fails). |
-| `--site-overrides-dir` | `SWITCHBOARD_SITE_OVERRIDES_DIR` | *(none)* | ePHPm's `[server] site_overrides_dir` — a directory **outside** `sites_dir` (ePHPm refuses to start otherwise). The deploy writes each preview's `<key>.toml` document-root override here and teardown removes it. **Required** unless `--allow-incomplete-teardown` is set. Unset it also means a manifest's `docroot:` cannot be honoured and ePHPm serves the whole checkout. |
+| `--site-overrides-dir` | `SWITCHBOARD_SITE_OVERRIDES_DIR` | *(none)* | ePHPm's `[server] site_overrides_dir` — a directory **outside** `sites_dir` (ePHPm refuses to start otherwise). The deploy writes each preview's `<key>.toml` override here — its `document_root` and the `auto_prepend_file` that delivers the manifest's `env:` to PHP — and teardown removes it. Written atomically (temp + rename): as of ephpm#472 a half-written override takes that site to a 503, not to a warning. **Required** unless `--allow-incomplete-teardown` is set. Unset it also means a manifest's `docroot:` cannot be honoured (ePHPm serves the whole checkout) and its `env:` reaches PHP only through the generated `.env`. |
 | `--allow-incomplete-teardown` | `SWITCHBOARD_ALLOW_INCOMPLETE_TEARDOWN` | `false` | Start without the two roots above, and let teardown report success while leaving those artifacts on disk (a `WARN` per teardown names them). An acknowledgement, not a feature. |
 | `--vhost-temp-base` | `SWITCHBOARD_VHOST_TEMP_BASE` | `<system temp>/ephpm-vhosts` | Where ePHPm keeps per-vhost temp/session state roots. Set explicitly when the daemon and ePHPm do not share a temp dir (`PrivateTmp`, differing `TMPDIR`). |
 
@@ -374,7 +376,8 @@ pinned to the crate's MSRV on the ephpm org's self-hosted fleet.
 | `src/queue.rs` | Scan, claim (`link`+`unlink`), coalesce per label, complete; the enqueue timestamp a claimed job carries |
 | `src/validate.rs` | Claim-time re-validation of a deploy job: the queue-age bound and the current-PR-state check |
 | `src/drain.rs` | The `/drain` kick and the shared-secret file |
-| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → env → quarantine the manifest → atomic swap → build → seed → health. `build:`/`seed:` run sandboxed via `ephpm exec --site` (fail-closed if unsupported). |
+| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → env → quarantine the manifest → per-site override → atomic swap → chown to tenant → build → seed → health. `build:`/`seed:` run sandboxed via `ephpm exec --site` (fail-closed if unsupported). |
+| `src/site_override.rs` | The per-site override ePHPm reads: validating `docroot:` and the env prepend against ePHPm's own containment rules, rendering the TOML, and writing it atomically |
 | `src/teardown.rs` | Preview teardown: vhost dir, per-site database, override file, vhost temp/session state root, the API's `applied/` marker — and the refusal to call a partial teardown a success |
 | `src/manifest.rs` | The `ephpm.yaml` app manifest schema, and moving it out of the served root once read |
 | `src/secrets.rs` | `${secret.NAME}` resolution from switchboard's own store |

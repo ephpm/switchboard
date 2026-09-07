@@ -203,22 +203,24 @@ pub async fn teardown_preview(
         );
     }
 
-    // (3) The docroot override file the deploy wrote for ePHPm.
+    // (3) The per-site override file the deploy wrote for ePHPm — the document
+    // root and the `auto_prepend_file` naming the generated env prepend. The
+    // path is derived by `site_override` rather than re-joined here, so one
+    // module owns the one filename ePHPm reads.
     if let Some(overrides_dir) = ctx.site_overrides_dir {
-        let file = overrides_dir.join(format!("{site_key}.toml"));
-        match tokio::fs::remove_file(&file).await {
+        let file = crate::site_override::override_path(overrides_dir, site_key);
+        match crate::site_override::remove_override(overrides_dir, site_key).await {
             Ok(()) => {
                 tracing::info!(%site_key, path = %file.display(), "removed site override file")
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => failures.push(format!("failed to remove {}: {e}", file.display())),
+            Err(e) => failures.push(format!("{e:#}")),
         }
     } else {
         skipped(
             &mut failures,
             ctx.allow_incomplete,
             format!(
-                "docroot override {site_key}.toml was not removed: \
+                "per-site override {site_key}.toml was not removed: \
                  --site-overrides-dir (SWITCHBOARD_SITE_OVERRIDES_DIR) is not configured"
             ),
         );
