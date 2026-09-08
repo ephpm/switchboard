@@ -4,8 +4,9 @@
 
 **Specified, not implemented in switchboard.** The clean enforcement point is in
 **ePHPm**, not switchboard, so this PR delivers Part A (authenticated fetch) and
-this written design for Part B. The enforcement change is tracked as a companion
-ePHPm issue; the switchboard-side piece (generate a per-preview credential, write
+this written design for Part B. The enforcement change is tracked as companion
+ePHPm issue **ephpm/ephpm#487**; the switchboard-side piece (generate a
+per-preview credential, write
 it into the per-site override, surface it in the PR comment) lands **after** that
 ePHPm key exists — writing it sooner would be an inert, bypassable gate, which is
 worse than an honestly-documented gap.
@@ -130,7 +131,7 @@ wiring.
 
 - **This PR (switchboard):** Part A only — the authenticated fetch — plus this
   design.
-- **Companion ePHPm issue:** the request-phase per-site access gate (option 1
+- **Companion ePHPm issue (ephpm/ephpm#487):** the request-phase per-site access gate (option 1
   above): a new per-site override key carrying a Basic-auth verifier, enforced on
   both the static and PHP paths, failing closed, with unit tests that a request
   with no/!wrong credential gets `401` and a request with the right credential is

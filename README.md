@@ -189,7 +189,7 @@ The gate belongs in ePHPm, not switchboard — it has to cover the static-file
 path as well as PHP and fail closed, which is the request-phase middleware layer
 ePHPm already has, and switchboard's only per-site channel (the two-key override
 file) is deliberately closed. The full design, threat model, and the companion
-ePHPm issue it depends on are in [`docs/preview-access-gate.md`](docs/preview-access-gate.md).
+ePHPm issue it depends on (ephpm/ephpm#487) are in [`docs/preview-access-gate.md`](docs/preview-access-gate.md).
 Until that lands, treat previews as world-readable and do not preview a
 repository whose mere contents are sensitive.
 
