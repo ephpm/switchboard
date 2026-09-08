@@ -253,7 +253,9 @@ pub struct DeployResult {
 ///    strip `.git`, before it could ever be requested.
 /// 5. Write (or clear) the per-site document-root override, **before** the swap
 ///    so the vhost is never briefly served with its container as the web root.
-/// 6. Atomic swap the checkout into `sites_dir`.
+/// 6. Atomic swap the checkout into `sites_dir`, then `chown -R` the swapped
+///    tree to the tenant owner (derived from `sites_dir`'s own ownership) so the
+///    sandboxed build — which runs as that uid — can write its own container.
 /// 7. Run `build:` commands — now that the code lives at `sites_dir/<key>`,
 ///    each runs sandboxed via `ephpm exec --site` (failures logged, deploy
 ///    continues, matching the POC's composer behavior).
@@ -397,6 +399,39 @@ pub async fn deploy_preview(
     tokio::fs::rename(&tmp_dir, &site_dir)
         .await
         .context("failed to move preview into place")?;
+
+    // (6b) Hand the swapped tree to the tenant uid, BEFORE the sandboxed build.
+    //
+    // switchboard runs as root and lays the site directory down root-owned, but
+    // since #28 `build:`/`seed:` run through `ephpm exec --site`, which drops to
+    // the tenant uid. A root-owned tree the tenant cannot write means
+    // `assemble.sh` can't populate the docroot and the seed can't write its log:
+    // every step fails "Permission denied" in milliseconds and the preview
+    // serves 404. The build must own the container it writes, so the tree is
+    // chowned to the tenant here — after the swap (the tree is now at its final
+    // path) and before `run_build`.
+    //
+    // The tenant owner is DERIVED, not configured: it is whoever owns
+    // `sites_dir` itself (`ephpm-web:ephpm-web` on the nodes — the uid
+    // `ephpm exec` drops to and the per-vhost state root is already chowned to).
+    // A freshly-created site directory should match its parent's ownership, so
+    // there is no second source of truth for the tenant uid and nothing is
+    // hardcoded. The recursion never follows a symlink (`lchown`, and it
+    // descends only into real directories) — the fetched checkout is
+    // attacker-influenced, and a `chown -R` that followed a planted symlink is
+    // the same privesc class fixed in `ephpm exec` (#484).
+    //
+    // Fail-closed: if the chown cannot be applied the deploy fails loudly rather
+    // than proceeding to a build that would 404 anyway.
+    chown_site_tree_to_tenant(ctx.sites_dir, &site_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to hand the swapped site tree {} to the tenant owner; \
+                 refusing to run the sandboxed build as a uid that cannot write it",
+                site_dir.display()
+            )
+        })?;
 
     // The sandbox handle for every untrusted step: `ephpm exec --config … --site
     // <key> -- …`. Both `build:` and `seed:` run through it, so both inherit the
@@ -547,6 +582,121 @@ async fn run_git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
         .with_context(|| format!("failed to run git {}", args.join(" ")))?;
     anyhow::ensure!(status.success(), "git {} failed", args.join(" "));
     Ok(())
+}
+
+/// Recursively hand the swapped site tree at `site_dir` to the tenant owner so
+/// the sandboxed `build:`/`seed:` steps — which `ephpm exec` runs as the tenant
+/// uid — can write into their own container.
+///
+/// The tenant `(uid, gid)` is **derived** from `sites_dir` itself, not
+/// configured: previews live directly under `sites_dir`, which ePHPm owns as the
+/// tenant user (`ephpm-web:ephpm-web` on the nodes), and a fresh site directory
+/// should carry that same ownership. Deriving it here avoids a second source of
+/// truth for the tenant uid and avoids hardcoding `ephpm-web`/997.
+///
+/// The per-vhost state root (`$TMPDIR/ephpm-vhosts/<key>`) is **not** touched
+/// here: `ephpm exec` creates and chowns it to the tenant itself (ephpm#484), so
+/// doing it again would be redundant (and racy — that path is outside the site
+/// tree). Only the deploy tree is switchboard's to hand over.
+///
+/// The walk is symlink-safe (see [`chown_tree_no_follow`]).
+///
+/// # Errors
+///
+/// Returns an error if `sites_dir` cannot be stat'd for its owner, or if any
+/// `lchown` in the tree fails — the caller turns that into a failed deploy
+/// rather than building as a uid that cannot write the tree.
+#[cfg(unix)]
+async fn chown_site_tree_to_tenant(sites_dir: &Path, site_dir: &Path) -> anyhow::Result<()> {
+    let (uid, gid) = tenant_owner(sites_dir)?;
+    let root = site_dir.to_path_buf();
+    // The recursive walk is blocking filesystem work; keep it off the async
+    // reactor. The tree is a checkout, so bounded but not tiny.
+    tokio::task::spawn_blocking(move || chown_tree_no_follow(&root, uid, gid))
+        .await
+        .context("chown task panicked")?
+        .with_context(|| format!("failed to chown the site tree to tenant {uid}:{gid}"))?;
+    tracing::info!(
+        site_dir = %site_dir.display(),
+        uid,
+        gid,
+        "handed the swapped site tree to the tenant owner (derived from sites_dir)"
+    );
+    Ok(())
+}
+
+/// Non-unix stub: there is no ownership model to hand over, and the tenant
+/// sandbox is Unix-only, so this is a no-op that keeps the pipeline portable for
+/// `cargo check`/tests on a developer's Windows machine.
+#[cfg(not(unix))]
+#[allow(clippy::unused_async)]
+async fn chown_site_tree_to_tenant(_sites_dir: &Path, _site_dir: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// The `(uid, gid)` owning `sites_dir` — the tenant identity every preview under
+/// it should carry. Stat (not `lstat`): `sites_dir` is operator-configured
+/// infrastructure, not attacker content, and following it to its target is the
+/// intended read.
+#[cfg(unix)]
+fn tenant_owner(sites_dir: &Path) -> anyhow::Result<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let md = std::fs::metadata(sites_dir).with_context(|| {
+        format!(
+            "failed to stat sites_dir {} to derive the tenant owner",
+            sites_dir.display()
+        )
+    })?;
+    Ok((md.uid(), md.gid()))
+}
+
+/// Recursively `lchown` `root` and every descendant to `(uid, gid)` **without
+/// ever following a symlink**.
+///
+/// `lchown` changes the symlink itself, never its target; the set of paths comes
+/// from [`walk_no_follow`], which descends only into *real* directories. A
+/// `chown -R` that followed a symlink planted in the fetched
+/// (attacker-influenced) checkout could redirect ownership onto a file outside
+/// the deploy tree — the same privesc class fixed in `ephpm exec` (#484) — which
+/// this avoids. Mirrors `ephpm-server`'s `privdrop::chown_tree`.
+#[cfg(unix)]
+fn chown_tree_no_follow(root: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::lchown;
+    for path in walk_no_follow(root)? {
+        lchown(&path, Some(uid), Some(gid))?;
+    }
+    Ok(())
+}
+
+/// Every path a symlink-safe recursive chown of `root` touches: `root` itself
+/// plus each descendant, **never following a symlink**. A symlink is included
+/// (so it is `lchown`ed as a link) but its target is not visited, and a
+/// symlinked directory is not descended into — `DirEntry::file_type` reports the
+/// entry's own type without following, and only real directories are recursed.
+///
+/// Split out from [`chown_tree_no_follow`] so the traversal — the symlink-safety
+/// property — is assertable without needing root to observe an actual `lchown`.
+#[cfg(unix)]
+fn walk_no_follow(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut out = vec![root.to_path_buf()];
+    // Only push a path onto the descend stack if it is a REAL directory.
+    let mut stack = if std::fs::symlink_metadata(root)?.is_dir() {
+        vec![root.to_path_buf()]
+    } else {
+        Vec::new()
+    };
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let is_real_dir = entry.file_type()?.is_dir();
+            out.push(path.clone());
+            if is_real_dir {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The `ephpm exec --site` sandbox handle for one preview.
@@ -1698,5 +1848,207 @@ mod tests {
         ensure_sandboxed_exec(&bin)
             .await
             .expect("an ephpm advertising `exec` must be accepted");
+    }
+
+    // ── the swapped tree is handed to the tenant before the build (#28 404) ──
+
+    /// The tenant owner is DERIVED from `sites_dir`, never hardcoded: whoever
+    /// owns the sites directory is who each preview under it is chowned to.
+    #[cfg(unix)]
+    #[test]
+    fn tenant_owner_is_read_from_sites_dir() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let md = std::fs::metadata(dir.path()).unwrap();
+        assert_eq!(
+            tenant_owner(dir.path()).unwrap(),
+            (md.uid(), md.gid()),
+            "the tenant owner must be exactly sites_dir's own uid/gid"
+        );
+    }
+
+    /// End-to-end of the fix's mechanism: after the swap, the whole site tree is
+    /// chowned to the owner derived from `sites_dir`. A non-root test cannot
+    /// chown to a *different* uid, but `sites_dir` is owned by the test's own
+    /// uid, so this exercises the real derive-then-apply path (a chown-to-self,
+    /// which is permitted) across a populated tree and asserts it succeeds —
+    /// which is exactly what unblocks the sandboxed build.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chown_hands_the_whole_swapped_tree_to_the_tenant_owner() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let sites = tempfile::tempdir().unwrap();
+        let want = std::fs::metadata(sites.path()).unwrap();
+        let site_dir = sites.path().join("app-pr-1");
+        // A small container: docroot, a nested dir, and a couple of files —
+        // exactly the shape a build would need to write into.
+        std::fs::create_dir_all(site_dir.join("public")).unwrap();
+        std::fs::create_dir_all(site_dir.join("vendor/pkg")).unwrap();
+        std::fs::write(site_dir.join("composer.json"), "{}").unwrap();
+        std::fs::write(site_dir.join("public/index.php"), "<?php").unwrap();
+        std::fs::write(site_dir.join("vendor/pkg/a.php"), "<?php").unwrap();
+
+        chown_site_tree_to_tenant(sites.path(), &site_dir)
+            .await
+            .expect("chowning the swapped tree to the tenant owner must succeed");
+
+        // Every node now carries the derived owner (== the test uid here).
+        for rel in [
+            "",
+            "composer.json",
+            "public",
+            "public/index.php",
+            "vendor/pkg/a.php",
+        ] {
+            let md = std::fs::symlink_metadata(site_dir.join(rel)).unwrap();
+            assert_eq!(
+                (md.uid(), md.gid()),
+                (want.uid(), want.gid()),
+                "{rel:?} must be owned by the tenant (sites_dir's owner)"
+            );
+        }
+    }
+
+    /// Fail-closed: a `sites_dir` that does not exist cannot yield a tenant
+    /// owner, so the deploy fails loudly rather than building a tree it never
+    /// handed over.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chown_fails_loudly_when_sites_dir_owner_is_unreadable() {
+        let missing = Path::new("/nonexistent/switchboard-probe/sites-dir");
+        let dir = tempfile::tempdir().unwrap();
+        let site_dir = dir.path().join("app-pr-1");
+        std::fs::create_dir_all(&site_dir).unwrap();
+        chown_site_tree_to_tenant(missing, &site_dir)
+            .await
+            .expect_err("an unstattable sites_dir must fail the deploy, not proceed");
+    }
+
+    /// Symlink safety: the walk that drives the chown includes each symlink
+    /// (chowned as a link via `lchown`) but NEVER visits a symlink's target and
+    /// NEVER descends through a symlinked directory. A `chown -R` that followed a
+    /// symlink planted in attacker-influenced PR content is the #484 privesc
+    /// class; this asserts we do not.
+    #[cfg(unix)]
+    #[test]
+    fn walk_is_symlink_safe() {
+        let outside = tempfile::tempdir().unwrap();
+        // A file and a directory-with-a-child that live OUTSIDE the deploy tree.
+        std::fs::write(outside.path().join("secret"), "root-owned").unwrap();
+        std::fs::create_dir_all(outside.path().join("etc")).unwrap();
+        std::fs::write(outside.path().join("etc/shadow"), "x").unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("sub")).unwrap();
+        std::fs::write(root.path().join("sub/real.php"), "<?php").unwrap();
+        // Attacker-planted symlinks in the fetched checkout.
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("evil-file"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("etc"), root.path().join("evil-dir"))
+            .unwrap();
+
+        let touched = walk_no_follow(root.path()).unwrap();
+
+        // The symlinks themselves are touched (so they get lchown'd as links)…
+        assert!(touched.contains(&root.path().join("evil-file")));
+        assert!(touched.contains(&root.path().join("evil-dir")));
+        // …but NOTHING outside the tree is: not the target file, not the
+        // symlinked directory's contents.
+        assert!(
+            touched.iter().all(|p| !p.starts_with(outside.path())),
+            "the walk must never step outside the deploy tree via a symlink: {touched:?}"
+        );
+        assert!(
+            !touched.contains(&root.path().join("evil-dir").join("shadow")),
+            "a symlinked directory must not be descended into"
+        );
+        // Real content is still fully covered.
+        assert!(touched.contains(&root.path().to_path_buf()));
+        assert!(touched.contains(&root.path().join("sub")));
+        assert!(touched.contains(&root.path().join("sub/real.php")));
+    }
+
+    /// The chown itself must not follow the planted symlinks either: a
+    /// chown-to-self across the tree above succeeds and leaves the OUTSIDE
+    /// targets untouched (their ownership is the test uid regardless, but the
+    /// operation completing without error over a tree full of dangling/hostile
+    /// links is the property — `lchown` never dereferences).
+    #[cfg(unix)]
+    #[test]
+    fn chown_tree_over_symlinks_does_not_follow_them() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.php"), "<?php").unwrap();
+        // A dangling symlink: if the chown dereferenced it, the lchown would
+        // instead try to chown a nonexistent target and could error.
+        std::os::unix::fs::symlink(
+            "/nonexistent/switchboard-probe/x",
+            root.path().join("dangling"),
+        )
+        .unwrap();
+        let md = std::fs::metadata(root.path()).unwrap();
+        chown_tree_no_follow(root.path(), md.uid(), md.gid())
+            .expect("lchown over a dangling symlink must succeed (it never dereferences)");
+    }
+
+    /// The real cross-uid proof, exercised for real when the test runs
+    /// privileged (as root / with `CAP_CHOWN`) and **skipped otherwise** so it is
+    /// safe in an unprivileged CI or on a developer machine. It chowns a
+    /// populated tree — including a symlink that escapes to a file OUTSIDE the
+    /// tree — to a foreign uid and asserts: every real node moved to the foreign
+    /// uid, the symlink itself moved (it was `lchown`ed as a link), and the
+    /// symlink's outside target did **not** move. That is precisely the property
+    /// that lets the sandboxed build (running as that foreign/tenant uid) write
+    /// its own container while a planted symlink cannot redirect ownership out of
+    /// the tree.
+    #[cfg(unix)]
+    #[test]
+    fn chown_moves_ownership_to_a_foreign_uid_when_privileged() {
+        use std::os::unix::fs::{MetadataExt as _, lchown};
+
+        const FOREIGN_UID: u32 = 60000;
+        const FOREIGN_GID: u32 = 60000;
+
+        // Capability probe: only root / CAP_CHOWN may chown to a foreign uid.
+        let probe = tempfile::NamedTempFile::new().unwrap();
+        if lchown(probe.path(), Some(FOREIGN_UID), Some(FOREIGN_GID)).is_err() {
+            eprintln!(
+                "skipping chown_moves_ownership_to_a_foreign_uid_when_privileged: \
+                 not privileged to chown to a foreign uid (need root/CAP_CHOWN)"
+            );
+            return;
+        }
+
+        // A file OUTSIDE the deploy tree, owned by the current (root) uid.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret");
+        std::fs::write(&outside_file, "outside").unwrap();
+        let outside_owner_before = std::fs::symlink_metadata(&outside_file).unwrap().uid();
+
+        // The swapped site tree, with a symlink escaping to that outside file.
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("public")).unwrap();
+        std::fs::write(site.path().join("public/index.php"), "<?php").unwrap();
+        std::os::unix::fs::symlink(&outside_file, site.path().join("evil")).unwrap();
+
+        chown_tree_no_follow(site.path(), FOREIGN_UID, FOREIGN_GID).unwrap();
+
+        // Real nodes moved to the foreign (tenant) uid…
+        for rel in ["", "public", "public/index.php", "evil"] {
+            let md = std::fs::symlink_metadata(site.path().join(rel)).unwrap();
+            assert_eq!(
+                (md.uid(), md.gid()),
+                (FOREIGN_UID, FOREIGN_GID),
+                "{rel:?} must have moved to the tenant uid"
+            );
+        }
+        // …but the symlink's OUTSIDE target did NOT move: lchown never followed
+        // it. This is the #484 privesc class, not reproduced.
+        assert_eq!(
+            std::fs::symlink_metadata(&outside_file).unwrap().uid(),
+            outside_owner_before,
+            "the chown must not have followed the symlink out of the tree"
+        );
     }
 }
