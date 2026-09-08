@@ -13,7 +13,8 @@ things about the environment, because it is not a normal PHP host:
 3. `open_basedir` confines you to your own checkout. `shell_exec` and friends
    are gone.
 4. **Persistent connections are disabled.** Redis `pconnect`, mysqli `p:`.
-5. `docroot:` is your web root — but only when the operator has configured
+5. `docroot:` is your web root, and your `env:` is loaded into `$_SERVER` before
+   your code runs — both only when the operator has configured
    `--site-overrides-dir` on the preview host.
 6. Build and seed commands run **outside** ePHPm, so they cannot reach your
    preview's database directly.
@@ -211,7 +212,7 @@ repository root:
 | File | When | Web-reachable? |
 |---|---|---|
 | `.env` | always | No — dot-prefixed paths return **403** |
-| `.ephpm-preview-prepend.php` | always | No — **403** |
+| `.ephpm-preview-prepend.php` | always — and **loaded for you**, see below | No — **403** |
 | `.switchboard-preview.json` | always (env **keys** only, never values) | No — **403** |
 | `.switchboard/ephpm.yaml` | always — this is where your manifest is moved to | No — **403** |
 
@@ -222,46 +223,89 @@ That is what makes writing the `.env` there safe — and it is why your manifest
 is relocated rather than left at `./ephpm.yaml`, where it was being served
 (switchboard#16).
 
+### The prepend is loaded for you
+
+`.ephpm-preview-prepend.php` is ePHPm's **`auto_prepend_file`** for your site:
+the server runs it before your own script on every request, so your `env:`
+values are in `$_SERVER` (and `$_ENV`, and `putenv()`) before your front
+controller's first line. **You do not have to do anything.**
+
+The wiring is the per-site override the deploy writes for your site, outside
+your checkout where you cannot edit it:
+
+```toml
+# <site_overrides_dir>/<your-site-key>.toml — written by switchboard
+document_root     = "public"                      # omitted when docroot is "."
+auto_prepend_file = ".ephpm-preview-prepend.php"
+```
+
+This is what [switchboard#4](https://github.com/ephpm/switchboard/issues/4)
+closed. It needed a change in ePHPm itself
+([ephpm#463](https://github.com/ephpm/ephpm/issues/463)), so it works only on a
+preview host running an ePHPm that carries that key. **On an older host the key
+is ignored with a warning** and your site still serves — your `env:` then
+arrives only through `.env`, and the manual `require_once` below is still the
+way to get it everywhere. Ask your operator which they are running, or check for
+yourself:
+
+```php
+ini_get('auto_prepend_file')   // '' on an older host, an absolute path on a current one
+```
+
 So:
 
+- **Any app** gets its `env:` values in `$_SERVER` with no work, on a host new
+  enough to honour the key.
 - **Any app whose framework reads a `.env`** (Laravel, Symfony, Drupal, and
-  anything using `vlucas/phpdotenv` or `symfony/dotenv`) gets its `env:` values
-  with no work. ⚠️ **switchboard overwrites `.env`.** If your repo commits one,
+  anything using `vlucas/phpdotenv` or `symfony/dotenv`) gets them with no work
+  on *any* host. ⚠️ **switchboard overwrites `.env`.** If your repo commits one,
   it is replaced by the preview's — put preview values in `env:`. The deploy
   logs a warning when it replaces a committed file.
-- **Apps that do not read a `.env`** (WordPress, most bespoke apps) need one
-  line — see below. There is no `auto_prepend_file` on this host:
-  ePHPm's per-site override channel understands `document_root` and nothing
-  else, so nothing loads the prepend for you
-  ([switchboard#4](https://github.com/ephpm/switchboard/issues/4) tracks
-  closing that, which needs a change in ePHPm itself).
-  **Verified:** `ini_get('auto_prepend_file')` on a live preview returns `''`.
+- **`build:` and `seed:` steps** run outside ePHPm ([§8](#8-build-and-seed-run-sandboxed-outside-an-ephpm-request)),
+  where no `auto_prepend_file` exists. `.env` is how a `wp-cli` or `artisan`
+  step reads your `env:`. That is why both files are written, and it is not
+  duplication: one covers requests, the other covers shell steps.
 
-### If your framework does not read `.env` — load the prepend yourself
+### ⚠️ `env:` cannot override your database or KV credentials
 
-**Verified working** on a live preview:
+The prepend now runs on every request, *after* ePHPm has injected this vhost's
+live `DB_*` and `EPHPM_*` values into `$_SERVER`. Those credentials rotate (§2),
+so an `env:` entry whose name starts with `DB_` or `EPHPM_` is deliberately **not
+allowed to replace them in `$_SERVER`** — the host's value wins, and the deploy
+logs a warning naming the keys. The declared value is still set in `$_ENV` and
+`putenv()`, so an app that genuinely wants an external database can read it from
+there; everything else should keep reading `$_SERVER` as §2 says.
+
+### Loading the prepend yourself is still supported
+
+If you want the values regardless of the host's ePHPm version — or you are
+running the same code off-preview — this still works and is still correct:
 
 ```php
 // wp-config.php (or your front controller), at the very top
 $__preview = __DIR__ . '/.ephpm-preview-prepend.php';
 if (is_file($__preview)) {
-    require_once $__preview;   // sets putenv() + $_ENV + $_SERVER
+    require_once $__preview;   // sets $_SERVER + $_ENV + putenv()
 }
 ```
 
-Measured before and after that line on a live vhost:
+**Verified working** on a live preview. Measured before and after that line:
 
 ```
 before: getenv=false     server=NULL
 after:  getenv='staging' server='staging' env='staging'
 ```
 
-The file is generated only on the preview host, so the `is_file` guard keeps
-this a no-op in development and production. It is not web-reachable (403), so
-including it does not expose your secrets.
+Keeping this line on a host that *does* auto-load the file is harmless: the
+prepend only assigns the same values again, so running it twice and running it
+once are the same outcome. (`require_once` should skip it outright — PHP records
+an auto-prepended file in `included_files` by realpath — but you do not have to
+rely on that.) The filename is deliberately unchanged from the workaround this
+replaces, so nothing you already wrote needs editing.
 
-*(A first-class fix belongs in switchboard/ePHPm rather than in every app — see
-[§11](#11-known-gaps-and-in-flight-work).)*
+The file is generated only on the preview host, so the `is_file` guard keeps it
+inert in development and production, and it is not web-reachable (403), so
+including it does not expose your secrets.
 
 ---
 
@@ -881,10 +925,10 @@ Labelled so you do not build on them.
 |---|---|
 | Your `ephpm.yaml` at the web root | **Moved, not served.** The deploy relocates `ephpm.yaml` / `ephpm.yml` / `ephpm.json` to `.switchboard/` before the site goes live. It used to be a public 200 on `docroot: "."` sites. Both `build:` and `seed:` now run after the move (and after the swap), so either that reads the manifest must use the new path. [switchboard#16](https://github.com/ephpm/switchboard/issues/16). |
 | `docroot: "."` | **Supported, and it publishes your whole repository.** Warned on every deploy. Nothing narrows it except declaring a subdirectory — switchboard removes its own artifacts and your manifest, but cannot vet your files. |
-| Per-site document root (`docroot:` routing) | **Shipped both sides.** ePHPm reads an operator-owned override outside the tenant checkout (`[server] site_overrides_dir`); switchboard generates it from your `ephpm.yaml` `docroot:`. **Requires the operator to set `--site-overrides-dir`** — unset, ePHPm serves the whole checkout and the deploy warns. |
-| `auto_prepend_file` per site | **Not available.** ePHPm's per-site override channel understands `document_root` and nothing else, so the generated `.ephpm-preview-prepend.php` is never auto-loaded. Apps that need it `require_once` it (§3). [switchboard#4](https://github.com/ephpm/switchboard/issues/4). |
-| `ini:` block | **Advisory only.** Recorded in a sidecar; nothing applies it. `memory_limit` in your manifest does nothing. The deploy warns when you set it. |
-| `env:` | Delivered via a generated `.env` for every `docroot:` shape. **Overwrites a committed `.env`** (logged). Apps that do not read a `.env` need the one-line `require_once` in §3. |
+| Per-site document root (`docroot:` routing) | **Shipped both sides.** ePHPm reads an operator-owned override outside the tenant checkout (`[server] site_overrides_dir`); switchboard generates it from your `ephpm.yaml` `docroot:`. **Requires the operator to set `--site-overrides-dir`** — unset, ePHPm serves the whole checkout, your prepend is not auto-loaded, and the deploy warns about both. |
+| `auto_prepend_file` per site | **Shipped both sides — needs a current host.** switchboard writes `auto_prepend_file` into the per-site override, and ePHPm honours it as of [ephpm#463](https://github.com/ephpm/ephpm/issues/463) (PR #472). On a host predating that, the key is ignored *with a warning* and the site still serves — use the `require_once` in §3. Not available at all under ePHPm `[php] mode = "worker"`: a worker script owns the request loop, so there is no per-request prepend position. [switchboard#4](https://github.com/ephpm/switchboard/issues/4). |
+| `ini:` block | **Advisory only.** Recorded in a sidecar; nothing applies it. `memory_limit` in your manifest does nothing. The deploy warns when you set it. `auto_prepend_file` is the one exception, and it is not set through `ini:` — switchboard owns it. |
+| `env:` | Delivered by the auto-loaded prepend (§3) and by a generated `.env` for every `docroot:` shape. **Overwrites a committed `.env`** (logged). Keys starting `DB_`/`EPHPM_` cannot replace the host's injected credentials in `$_SERVER` (logged). |
 | Auth gate for private previews | **Not available.** Middleware for gating previews behind HTTP Basic / signed session cookies / GitHub OAuth was proposed upstream (ePHPm PRs #387, #388, #389) and **closed unmerged** — there is no basic-auth, session-cookie or OAuth builtin today. Assume your preview URL is public. |
 | Seeding via KV-sourced credentials in multi-tenant mode | **Not possible today** (ePHPm issue #384) — the RESP listener has no operator-scoped path in multi-tenant mode. |
 | Clustered / multi-node previews | Per-site database isolation is **single-node only**. |

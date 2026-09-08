@@ -1,5 +1,5 @@
-//! The per-site document-root override — the operator-owned artifact that makes
-//! `docroot:` mean what it reads as.
+//! The per-site override — the operator-owned artifact that makes `docroot:`
+//! mean what it reads as, and that wires the generated env prepend into PHP.
 //!
 //! # Why the manifest cannot simply be read by the server
 //!
@@ -19,21 +19,42 @@
 //!
 //! ```toml
 //! # <site_overrides_dir>/<site-key>.toml
-//! document_root = "public"
+//! document_root     = "public"
+//! auto_prepend_file = ".ephpm-preview-prepend.php"
 //! ```
 //!
 //! Generating that file from the manifest is switchboard's half of the contract,
-//! and it is the half that was never written (switchboard#3). This module is it.
+//! and it is the half that was never written (switchboard#3, then #4). This
+//! module is it.
 //!
-//! # Validation is not "the daemon already checked"
+//! # `auto_prepend_file` is the delivery path for `env:` (switchboard#4)
 //!
-//! ePHPm re-validates every declaration it reads and falls back to serving the
-//! container when one fails — safely, but *silently*. So we validate with the
-//! same rules before writing, and fail the deploy loudly when a manifest
-//! declares something that would be rejected. The alternative is a preview that
-//! looks deployed and is quietly serving its `vendor/` directory.
+//! `document_root` alone left the manifest's `env:` block with no in-request
+//! delivery mechanism for the common shape. switchboard writes a PHP prepend
+//! into the checkout that exports the resolved values into `$_SERVER` (and
+//! `$_ENV`/`putenv` for older code), but nothing loaded it: the sidecar it was
+//! announced in is a file ePHPm never reads, so `ini_get('auto_prepend_file')`
+//! on a live preview returned `''`. Apps had to `require_once` it by hand,
+//! which the guide documented and `docroot: "."` apps mostly did not do — so
+//! `EPHPM_SEED_TOKEN` never reached PHP and `wordpress-sample` came up as stock
+//! WordPress.
 //!
-//! The checks mirror ePHPm's `validate_declared_root`
+//! ephpm#463 (PR #472) made `auto_prepend_file` a **typed, enforced** key in
+//! this same file. Writing it here is the fix.
+//!
+//! # Validation is not "the daemon already checked" — and the stakes moved
+//!
+//! ePHPm re-validates every declaration it reads. It used to fall back to
+//! serving the container when one failed — safely, but *silently*. As of #472 a
+//! declaration it understands and cannot honour takes **that one site out of
+//! service** (503 + `Retry-After`) instead. Both directions argue for the same
+//! thing: validate with ePHPm's rules before writing, and fail the deploy loudly
+//! when a manifest declares something that would be rejected. What changed is
+//! the cost of getting it wrong — a silently-wide web root became a visible
+//! outage — and that is why [`write_override`] is **atomic**: a half-written
+//! file is no longer a warning, it is a down site.
+//!
+//! The checks mirror ePHPm's `validate_declared_root` / `validate_declared_prepend`
 //! (`crates/ephpm-server/src/site_overrides.rs`):
 //!
 //! 1. **Lexical** — plain relative path, `Component::Normal` segments only. That
@@ -45,20 +66,44 @@
 //!    hand-rolled TOML writer turns into a TOML injection, and no real document
 //!    root needs anything outside that set.
 //! 3. **Canonical containment** — join onto the container, canonicalize both
-//!    sides, require the target to be a directory inside the container. This is
-//!    what catches a symlink escape, which the lexical check cannot see through.
+//!    sides, require the target to be inside the container, and to be a
+//!    directory (`document_root`) or a regular file (`auto_prepend_file`). This
+//!    is what catches a symlink escape, which the lexical check cannot see
+//!    through.
+//!
+//! Both paths resolve against the **container**, not the web root — matching
+//! ePHPm — so a prepend may live above the document root where no URL reaches
+//! it.
 
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
 
-/// The characters a declared document root may contain.
+/// The characters a declared path (document root or prepend) may contain.
 ///
 /// Deliberately narrower than "any filename": we serialize this value into TOML
-/// by hand, and the tenant supplies it. Anything outside this set is rejected
-/// rather than escaped, so there is no escaping bug to have.
-fn is_allowed_docroot_char(c: char) -> bool {
+/// by hand, and for `docroot:` the tenant supplies it. Anything outside this set
+/// is rejected rather than escaped, so there is no escaping bug to have.
+fn is_allowed_path_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')
+}
+
+/// What a declared path has to *be* once it resolves — mirrors ePHPm's `Expect`.
+#[derive(Debug, Clone, Copy)]
+enum Expect {
+    /// A directory — `document_root`.
+    Directory,
+    /// A regular file — `auto_prepend_file`.
+    File,
+}
+
+impl Expect {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Directory => "is not a directory",
+            Self::File => "is not a regular file",
+        }
+    }
 }
 
 /// A validated document-root declaration, ready to be written.
@@ -80,9 +125,13 @@ pub enum DocumentRoot {
 }
 
 impl DocumentRoot {
-    /// Whether this declaration needs an override file written for it.
+    /// Whether this declaration narrows the web root below the container.
+    ///
+    /// Not "whether a file is written" any more — since switchboard#4 an
+    /// override file is written for **every** preview, because it also carries
+    /// `auto_prepend_file`, which a `docroot: "."` site needs most.
     #[must_use]
-    pub fn needs_override_file(&self) -> bool {
+    pub fn narrows_the_web_root(&self) -> bool {
         matches!(self, Self::Subdirectory { .. })
     }
 
@@ -94,6 +143,47 @@ impl DocumentRoot {
             Self::Subdirectory { declared, .. } => declared,
         }
     }
+}
+
+/// A validated `auto_prepend_file` declaration, ready to be written.
+///
+/// Unlike [`DocumentRoot`] this is never tenant-supplied: switchboard picks the
+/// filename and writes the file itself. It is validated anyway, with ePHPm's own
+/// rules, because ePHPm now takes the site **out of service** for a value it
+/// cannot honour — so an unvalidated write turns a repository that happens to
+/// ship a symlink or a directory at that name into a 503 discovered by a user
+/// rather than an error discovered by the deploy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrependFile {
+    /// The declaration exactly as it will appear in the override file —
+    /// relative to the **container**, `/`-separated.
+    declared: String,
+    /// The canonicalized absolute path it resolved to, for logging and tests.
+    /// ePHPm resolves it again itself.
+    resolved: PathBuf,
+}
+
+impl PrependFile {
+    /// The declared value, as it appears in the override file.
+    #[must_use]
+    pub fn declared(&self) -> &str {
+        &self.declared
+    }
+}
+
+/// Everything switchboard declares for one site, in one file.
+///
+/// One struct rather than two writers because ePHPm reads **one** file per site:
+/// writing `document_root` and `auto_prepend_file` separately would mean one of
+/// them clobbering the other's file, which is the failure mode that makes a site
+/// serve its `vendor/` or lose its env.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteOverride {
+    /// Where this site's web root is.
+    pub document_root: DocumentRoot,
+    /// The PHP file ePHPm runs before every request for this site, or `None`
+    /// when this deploy has nothing to prepend.
+    pub auto_prepend_file: Option<PrependFile>,
 }
 
 /// Validate a manifest's `docroot:` against the checkout it describes.
@@ -127,49 +217,12 @@ pub fn validate_docroot(container: &Path, declared: &str) -> anyhow::Result<Docu
          absolute paths are not permitted"
     );
 
-    anyhow::ensure!(
-        !trimmed.contains('\\'),
-        "docroot {declared:?}: backslashes are not permitted — use `/` as the \
-         separator on all platforms"
-    );
-    anyhow::ensure!(
-        trimmed.chars().all(is_allowed_docroot_char),
-        "docroot {declared:?}: only [A-Za-z0-9._/-] are permitted in a document root"
-    );
-
-    let relative = Path::new(trimmed);
-    anyhow::ensure!(
-        !relative.is_absolute(),
-        "docroot {declared:?}: absolute paths are not permitted — declare a path \
-         relative to the repository root"
-    );
-    anyhow::ensure!(
-        relative
-            .components()
-            .all(|c| matches!(c, Component::Normal(_))),
-        "docroot {declared:?}: must be a plain relative path with no `..`, `.`, \
-         drive prefix or root component"
-    );
-
-    let candidate = container.join(relative);
-    let resolved = candidate.canonicalize().with_context(|| {
-        format!(
-            "docroot {declared:?}: {} does not exist in the checkout",
-            candidate.display()
-        )
-    })?;
-    let canonical_container = container
-        .canonicalize()
-        .with_context(|| format!("failed to resolve {}", container.display()))?;
-
-    anyhow::ensure!(
-        resolved.starts_with(&canonical_container),
-        "docroot {declared:?}: resolves outside the repository (symlink escape)"
-    );
-    anyhow::ensure!(
-        resolved.is_dir(),
-        "docroot {declared:?}: is not a directory"
-    );
+    let resolved = validate_contained(
+        container,
+        trimmed,
+        &format!("docroot {declared:?}"),
+        Expect::Directory,
+    )?;
 
     Ok(DocumentRoot::Subdirectory {
         declared: trimmed.to_string(),
@@ -177,48 +230,194 @@ pub fn validate_docroot(container: &Path, declared: &str) -> anyhow::Result<Docu
     })
 }
 
-/// Render the override file's contents for a validated declaration.
+/// Validate the generated env prepend against the checkout it will ship in.
 ///
-/// Only `document_root` is emitted. ePHPm ignores keys it does not understand
-/// (so an override written by a newer daemon never breaks a site on an older
-/// server), which makes it tempting to write forward-looking keys here — don't:
-/// a key nothing acts on is a silent no-op dressed as a feature.
-#[must_use]
-pub fn render_override(document_root: &DocumentRoot) -> String {
-    format!(
-        "# Generated by switchboard from the preview's ephpm.yaml `docroot:`.\n\
-         # Operator-owned: ePHPm reads this, never the tenant's manifest.\n\
-         document_root = \"{}\"\n",
-        document_root.declared()
-    )
-}
-
-/// Write `<overrides_dir>/<site_key>.toml` for a validated declaration.
+/// `declared` is relative to the **container** (the staging directory during a
+/// deploy), matching how ePHPm resolves it — so a prepend may sit above the
+/// document root, out of reach of any URL.
 ///
 /// # Errors
 ///
-/// Returns an error if the overrides directory cannot be created or the file
-/// cannot be written.
+/// Returns an error for any declaration ePHPm would refuse. Since ephpm#472 a
+/// refused `auto_prepend_file` makes the whole override unusable and takes the
+/// site to a 503, so this has to fail the deploy, not warn.
+pub fn validate_prepend(container: &Path, declared: &str) -> anyhow::Result<PrependFile> {
+    let trimmed = declared.trim().trim_end_matches('/');
+    anyhow::ensure!(
+        !trimmed.is_empty() && trimmed != ".",
+        "auto_prepend_file {declared:?}: must name a regular file inside the checkout"
+    );
+    let resolved = validate_contained(
+        container,
+        trimmed,
+        &format!("auto_prepend_file {declared:?}"),
+        Expect::File,
+    )?;
+    Ok(PrependFile {
+        declared: trimmed.to_string(),
+        resolved,
+    })
+}
+
+/// The containment core both declared paths share, mirroring ePHPm's
+/// `resolve_contained`.
+fn validate_contained(
+    container: &Path,
+    trimmed: &str,
+    key: &str,
+    expect: Expect,
+) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        !trimmed.contains('\\'),
+        "{key}: backslashes are not permitted — use `/` as the separator on all platforms"
+    );
+    anyhow::ensure!(
+        trimmed.chars().all(is_allowed_path_char),
+        "{key}: only [A-Za-z0-9._/-] are permitted"
+    );
+
+    let relative = Path::new(trimmed);
+    anyhow::ensure!(
+        !relative.is_absolute(),
+        "{key}: absolute paths are not permitted — declare a path relative to the \
+         repository root"
+    );
+    anyhow::ensure!(
+        relative
+            .components()
+            .all(|c| matches!(c, Component::Normal(_))),
+        "{key}: must be a plain relative path with no `..`, `.`, drive prefix or \
+         root component"
+    );
+
+    let candidate = container.join(relative);
+    let resolved = candidate.canonicalize().with_context(|| {
+        format!(
+            "{key}: {} does not exist in the checkout",
+            candidate.display()
+        )
+    })?;
+    // `canonicalize` also resolves `..` — but the lexical check above already
+    // refused those, so this only ever resolves symlinks here.
+    let canonical_container = container
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", container.display()))?;
+
+    anyhow::ensure!(
+        resolved.starts_with(&canonical_container),
+        "{key}: resolves outside the repository (symlink escape)"
+    );
+    let shape_ok = match expect {
+        Expect::Directory => resolved.is_dir(),
+        Expect::File => resolved.is_file(),
+    };
+    anyhow::ensure!(shape_ok, "{key}: {}", expect.describe());
+
+    Ok(resolved)
+}
+
+/// Render the override file's contents for a validated declaration.
+///
+/// Two keys, both of which ePHPm implements as typed fields since #472 — no
+/// forward-looking keys. `document_root` is emitted only when it *narrows* the
+/// web root: ePHPm reads an absent key and an explicit `"."` identically, and
+/// the absent spelling is the one every ePHPm ever shipped agrees on.
+#[must_use]
+pub fn render_override(over: &SiteOverride) -> String {
+    let mut out = String::from(
+        "# Generated by switchboard from the preview's ephpm.yaml.\n\
+         # Operator-owned: ePHPm reads this, never the tenant's manifest.\n",
+    );
+    if over.document_root.narrows_the_web_root() {
+        out.push_str(&format!(
+            "document_root = \"{}\"\n",
+            over.document_root.declared()
+        ));
+    }
+    if let Some(prepend) = &over.auto_prepend_file {
+        out.push_str(&format!("auto_prepend_file = \"{}\"\n", prepend.declared()));
+    }
+    out
+}
+
+/// Write `<overrides_dir>/<site_key>.toml` for a validated declaration,
+/// **atomically**.
+///
+/// Write-then-rename rather than `write`, and this is not decoration. Since
+/// ephpm#472 an override file that cannot be parsed takes its site out of
+/// service with a 503 instead of falling back to serving the container, and
+/// ePHPm re-reads the file every couple of seconds — so a plain `write`, which
+/// truncates first and can be interrupted by a crash, a full disk or a signal,
+/// has a window in which the live file is a truncated TOML fragment and the
+/// preview is *down*. `rename(2)` within one directory is atomic: a reader sees
+/// either the whole old file or the whole new one.
+///
+/// The temporary is dot-prefixed and `.tmp`-suffixed so it can never collide
+/// with `<some_key>.toml` for any site key, and carries the pid so two writers
+/// cannot share one temp file (which would reintroduce exactly the torn read
+/// this exists to prevent).
+///
+/// # Errors
+///
+/// Returns an error if the overrides directory cannot be created, or the file
+/// cannot be written, flushed or renamed into place.
 pub async fn write_override(
     overrides_dir: &Path,
     site_key: &str,
-    document_root: &DocumentRoot,
+    over: &SiteOverride,
 ) -> anyhow::Result<PathBuf> {
     let path = override_path(overrides_dir, site_key);
     tokio::fs::create_dir_all(overrides_dir)
         .await
         .with_context(|| format!("failed to create {}", overrides_dir.display()))?;
-    tokio::fs::write(&path, render_override(document_root))
+
+    let tmp = overrides_dir.join(format!(
+        ".{site_key}.toml.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    match write_then_rename(&tmp, &path, &render_override(over)).await {
+        Ok(()) => Ok(path),
+        Err(e) => {
+            // Never leave a partial temp behind for the next operator to find.
+            tokio::fs::remove_file(&tmp).await.ok();
+            Err(e)
+        }
+    }
+}
+
+/// Write `contents` to `tmp`, flush it to disk, then rename it onto `path`.
+///
+/// The `sync_all` is what makes the rename meaningful across a host crash: the
+/// rename can otherwise be durable before the data is, leaving a zero-length
+/// override in place — which is *valid* TOML declaring nothing, so the site
+/// would come back serving its whole container with no error anywhere.
+async fn write_then_rename(tmp: &Path, path: &Path, contents: &str) -> anyhow::Result<()> {
+    let mut file = tokio::fs::File::create(tmp)
         .await
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(path)
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    {
+        use tokio::io::AsyncWriteExt as _;
+        file.write_all(contents.as_bytes())
+            .await
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("failed to flush {}", tmp.display()))?;
+    }
+    drop(file);
+    tokio::fs::rename(tmp, path)
+        .await
+        .with_context(|| format!("failed to move {} into place", path.display()))?;
+    Ok(())
 }
 
 /// Remove `<overrides_dir>/<site_key>.toml` if it exists.
 ///
-/// A preview whose docroot changed from `public` back to `.` must not keep the
-/// stale override — that would serve a subdirectory the new checkout may not
-/// even have, and ePHPm's rejection of it is silent.
+/// Teardown's job now — a *deploy* always writes the file, because it carries
+/// the env prepend even when the container is the web root.
 ///
 /// # Errors
 ///
@@ -362,7 +561,7 @@ mod tests {
         std::fs::create_dir_all(c.root.join("app").join("htdocs")).unwrap();
         let root = validate_docroot(&c.root, "app/htdocs").unwrap();
         assert_eq!(root.declared(), "app/htdocs");
-        assert!(root.needs_override_file());
+        assert!(root.narrows_the_web_root());
     }
 
     #[test]
@@ -453,26 +652,208 @@ mod tests {
         }
     }
 
+    fn try_symlink_file(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
+
+    // ── auto_prepend_file (switchboard#4) ──────────────────────────────
+
+    /// Drop the generated prepend into a checkout, as the deploy does.
+    fn write_prepend(root: &Path, relative: &str) -> PathBuf {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"<?php // generated").unwrap();
+        path
+    }
+
+    /// **The path-shape test.** ePHPm refuses an `auto_prepend_file` that is
+    /// not a plain relative path naming a regular file inside the container —
+    /// and since #472 a refusal is a **503 for the site**, not a no-op. So the
+    /// exact name switchboard ships must satisfy every rule ePHPm applies.
+    #[test]
+    fn the_generated_prepend_name_satisfies_ephpms_containment_rules() {
+        let c = laravel_checkout();
+        let declared = crate::deployer::PREPEND_FILE;
+        let script = write_prepend(&c.root, declared);
+
+        // Re-stated here rather than only exercised, because these are ePHPm's
+        // rules and this test is what stops the constant drifting off them.
+        assert!(
+            !Path::new(declared).is_absolute(),
+            "absolute prepend paths are refused"
+        );
+        assert!(
+            Path::new(declared)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_))),
+            "`..`, `.`, root and drive components are refused"
+        );
+        assert!(!declared.contains('\\'), "backslashes are refused");
+        assert!(
+            declared.starts_with('.'),
+            "the prepend must be dot-prefixed so ePHPm's `hidden_files` default \
+             keeps it off the HTTP surface — it gates serving, never `include`"
+        );
+
+        let validated = validate_prepend(&c.root, declared).expect("must be honoured by ePHPm");
+        assert_eq!(validated.declared(), declared);
+        assert_eq!(validated.resolved, script.canonicalize().unwrap());
+    }
+
+    /// The prepend resolves against the **container**, not the web root, so a
+    /// Laravel-shaped preview can keep it out of `public/` entirely.
+    #[test]
+    fn a_prepend_above_the_document_root_is_accepted() {
+        let c = laravel_checkout();
+        write_prepend(&c.root, ".ephpm-preview-prepend.php");
+        assert!(validate_prepend(&c.root, ".ephpm-preview-prepend.php").is_ok());
+        // ...and it is genuinely outside the web root ePHPm will serve.
+        let DocumentRoot::Subdirectory { resolved, .. } =
+            validate_docroot(&c.root, "public").unwrap()
+        else {
+            panic!("`public` must resolve to a subdirectory");
+        };
+        assert!(!reachable_under(&resolved, "/.ephpm-preview-prepend.php"));
+    }
+
+    #[test]
+    fn prepend_escaping_the_container_is_refused() {
+        let c = laravel_checkout();
+        // Make the traversal targets real, so only containment can refuse them.
+        std::fs::write(c.root.parent().unwrap().join("evil.php"), b"<?php").unwrap();
+        for bad in [
+            "..",
+            "../evil.php",
+            "../../etc/passwd",
+            "public/../../evil.php",
+            r"..\..\evil.php",
+            "/etc/passwd",
+            "/",
+            r"C:\Windows\win.ini",
+            r"\\server\share\evil.php",
+            "",
+            ".",
+        ] {
+            assert!(
+                validate_prepend(&c.root, bad).is_err(),
+                "prepend {bad:?} escapes the container and must be refused"
+            );
+        }
+    }
+
+    /// A repository that ships a symlink at the generated prepend's name must
+    /// not turn into an override ePHPm refuses (503). The deploy unlinks before
+    /// writing, so the validated path is always a regular file we created —
+    /// this pins that a symlink escape would in fact be caught if it were not.
+    #[test]
+    fn prepend_symlinked_out_of_the_checkout_is_refused() {
+        let c = laravel_checkout();
+        let outside = c.root.parent().unwrap().join("credentials.php");
+        std::fs::write(&outside, b"<?php const P = 'hunter2';").unwrap();
+        if !try_symlink_file(&outside, &c.root.join(".ephpm-preview-prepend.php")) {
+            return; // platform refuses symlinks
+        }
+        assert!(validate_prepend(&c.root, ".ephpm-preview-prepend.php").is_err());
+    }
+
+    #[test]
+    fn prepend_naming_a_directory_or_a_missing_file_is_refused() {
+        let c = laravel_checkout();
+        assert!(
+            validate_prepend(&c.root, "public").is_err(),
+            "a directory is not a script"
+        );
+        assert!(validate_prepend(&c.root, ".nope.php").is_err());
+    }
+
+    /// Same charset gate as `docroot:` — we hand-write the TOML for this key too.
+    #[test]
+    fn prepend_toml_injection_attempts_are_refused() {
+        let c = laravel_checkout();
+        for bad in [
+            "a.php\"\ndocument_root = \"..",
+            "a\"b.php",
+            "a.php\u{0}",
+            "a.php # comment",
+        ] {
+            assert!(validate_prepend(&c.root, bad).is_err(), "{bad:?}");
+        }
+    }
+
     // ── the file itself ────────────────────────────────────────────────
 
+    fn over(document_root: DocumentRoot, auto_prepend_file: Option<PrependFile>) -> SiteOverride {
+        SiteOverride {
+            document_root,
+            auto_prepend_file,
+        }
+    }
+
     /// The rendered file must be exactly what ePHPm's `site_overrides::load`
-    /// parses: a TOML table with a `document_root` string.
+    /// parses, and must round-trip through a TOML parser as the two typed keys
+    /// #472 declares. Rendering something ePHPm cannot parse is now a 503.
     #[test]
     fn rendered_override_is_the_documented_shape() {
         let c = laravel_checkout();
         let root = validate_docroot(&c.root, "public").unwrap();
-        let text = render_override(&root);
+        let script = write_prepend(&c.root, ".ephpm-preview-prepend.php");
+        let prepend = validate_prepend(&c.root, ".ephpm-preview-prepend.php").unwrap();
+        assert!(script.is_file());
+
+        let text = render_override(&over(root, Some(prepend)));
         assert!(
             text.contains("document_root = \"public\"\n"),
             "unexpected render: {text}"
         );
-        // Exactly one key — no forward-looking no-ops.
-        assert_eq!(
-            text.lines()
-                .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
-                .count(),
-            1
+        assert!(
+            text.contains("auto_prepend_file = \".ephpm-preview-prepend.php\"\n"),
+            "unexpected render: {text}"
         );
+        // Exactly two keys — both typed in ePHPm, no forward-looking no-ops.
+        assert_eq!(keys(&text), vec!["auto_prepend_file", "document_root"]);
+    }
+
+    /// **The switchboard#4 shape.** `docroot: "."` writes no `document_root`
+    /// (absent and `"."` are identical to ePHPm, and absent is the spelling
+    /// every ePHPm release agrees on) but must still write the prepend — this
+    /// is the shape that had no `env:` delivery path at all.
+    #[test]
+    fn docroot_dot_still_gets_an_override_carrying_the_prepend() {
+        let c = laravel_checkout();
+        write_prepend(&c.root, ".ephpm-preview-prepend.php");
+        let prepend = validate_prepend(&c.root, ".ephpm-preview-prepend.php").unwrap();
+
+        let text = render_override(&over(DocumentRoot::Container, Some(prepend)));
+        assert_eq!(keys(&text), vec!["auto_prepend_file"]);
+        assert!(
+            !text.contains("document_root"),
+            "an absent document_root is how `.` is spelled: {text}"
+        );
+    }
+
+    /// Nothing to declare renders a comment-only file rather than a stray key.
+    #[test]
+    fn nothing_declared_renders_no_keys() {
+        assert!(keys(&render_override(&over(DocumentRoot::Container, None))).is_empty());
+    }
+
+    /// The rendered keys, sorted — a stand-in for "what ePHPm's TOML parser
+    /// would see", without taking a `toml` dependency for one assertion.
+    fn keys(text: &str) -> Vec<&str> {
+        let mut keys: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .map(|l| l.split('=').next().unwrap().trim())
+            .collect();
+        keys.sort_unstable();
+        keys
     }
 
     #[tokio::test]
@@ -482,7 +863,7 @@ mod tests {
         let c = laravel_checkout();
         let root = validate_docroot(&c.root, "public").unwrap();
 
-        let path = write_override(&overrides, "ephpm-app-pr-1", &root)
+        let path = write_override(&overrides, "ephpm-app-pr-1", &over(root, None))
             .await
             .unwrap();
         assert_eq!(path, overrides.join("ephpm-app-pr-1.toml"));
@@ -494,6 +875,51 @@ mod tests {
         remove_override(&overrides, "ephpm-app-pr-1").await.unwrap();
     }
 
+    /// **Atomicity.** ePHPm re-reads this file every couple of seconds and, as
+    /// of #472, 503s the site if it cannot parse it — so the write must never
+    /// be observable half-done. Two things are checked: the directory is left
+    /// with no temporary litter, and a rewrite replaces the file rather than
+    /// truncating it in place (a truncate-in-place is precisely the window
+    /// where a reader sees a fragment).
+    #[tokio::test]
+    async fn the_override_is_replaced_atomically_leaving_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = laravel_checkout();
+        write_prepend(&c.root, ".ephpm-preview-prepend.php");
+        let prepend = validate_prepend(&c.root, ".ephpm-preview-prepend.php").unwrap();
+        let root = validate_docroot(&c.root, "public").unwrap();
+
+        let first = write_override(dir.path(), "app-pr-1", &over(root, None))
+            .await
+            .unwrap();
+        let second = write_override(
+            dir.path(),
+            "app-pr-1",
+            &over(DocumentRoot::Container, Some(prepend)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, second, "a rewrite targets the same path");
+
+        let text = tokio::fs::read_to_string(&second).await.unwrap();
+        assert_eq!(
+            keys(&text),
+            vec!["auto_prepend_file"],
+            "stale keys survived"
+        );
+
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(
+            names,
+            vec!["app-pr-1.toml".to_string()],
+            "the overrides dir must contain only the override — no .tmp litter"
+        );
+    }
+
     /// A full-FQDN site key (the shape on a node with no `sites_domain_suffix`)
     /// names the override file just as well — ePHPm reads `<key>.toml` for
     /// whatever key it resolved.
@@ -502,9 +928,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = laravel_checkout();
         let root = validate_docroot(&c.root, "public").unwrap();
-        let path = write_override(dir.path(), "app-pr-1.preview.ephpm.dev", &root)
+        let path = write_override(dir.path(), "app-pr-1.preview.ephpm.dev", &over(root, None))
             .await
             .unwrap();
         assert_eq!(path.file_name().unwrap(), "app-pr-1.preview.ephpm.dev.toml");
+        // The temporary must never have been mistakable for another site's
+        // override: dot-prefixed and `.tmp`-suffixed, so `<key>.toml` is the
+        // only file ePHPm can read here.
+        assert!(path.exists());
     }
 }

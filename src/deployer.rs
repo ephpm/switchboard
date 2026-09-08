@@ -43,26 +43,54 @@ use tokio::process::Command;
 
 use crate::manifest::AppManifest;
 use crate::secrets::Secrets;
-use crate::site_override::{self, DocumentRoot};
+use crate::site_override;
 
 /// Generated file (at the checkout/site root) that exports the resolved preview
-/// env into PHP via `putenv`/`$_ENV`/`$_SERVER`.
+/// env into PHP via `$_SERVER` — plus `$_ENV`/`putenv` for older code.
 ///
-/// **Not auto-loaded.** ePHPm has no per-site `auto_prepend_file` channel — the
-/// per-site override file it does read understands `document_root` and nothing
-/// else — so an app that wants this must `require_once` it (switchboard#4). It
-/// is written regardless because that require is the documented workaround and
-/// needs the file to exist.
-const PREPEND_FILE: &str = ".ephpm-preview-prepend.php";
+/// **Auto-loaded** since switchboard#4: the per-site override this deploy writes
+/// names it in ePHPm's `auto_prepend_file` key (ephpm#463 / PR #472), so ePHPm
+/// runs it before the site's own script on every request. It is written into the
+/// checkout, so it is inside the vhost's `open_basedir` and runs with exactly
+/// the reach the tenant's own `index.php` already has.
+///
+/// Three properties of this constant are load-bearing, and all three are pinned
+/// by tests in [`crate::site_override`]:
+///
+/// * **Dot-prefixed** — ePHPm's `hidden_files` default is `deny`, so it is a 403
+///   over HTTP even when the repository root *is* the web root. `hidden_files`
+///   gates *serving*; it never gates PHP's own `include`, so the file still runs.
+/// * **A plain relative name at the container root** — no `..`, no backslash, no
+///   drive prefix. ePHPm resolves the declaration against the container and
+///   refuses anything else, and since #472 a refusal is a **503 for that site**
+///   rather than a silent no-op.
+/// * **Stable across deploys and switchboard versions.** Apps that adopted the
+///   documented `require_once` workaround name this exact path, so renaming it
+///   would break them for no gain. Keeping both mechanisms is safe because the
+///   prepend only assigns values: running it twice is the same outcome as
+///   running it once. It is also why a *redeploy* stays consistent — the
+///   previous container carries the same filename while the new override is
+///   written, so the declaration never names a file that is not there.
+pub(crate) const PREPEND_FILE: &str = ".ephpm-preview-prepend.php";
 /// Generated dotenv file (checkout/site root) for framework-native `.env`
-/// loaders.
+/// loaders, and for the `build:` / `seed:` shell steps.
+///
+/// **Kept, deliberately, now that the prepend is auto-loaded** — the two do not
+/// overlap. `auto_prepend_file` only exists inside an ePHPm *request*, and
+/// `build:` and `seed:` run as shell commands outside the server (guide §8:
+/// they get no `$_SERVER['DB_*']` and no prepend). A `wp-cli` or `artisan` step
+/// that needs the preview's `env:` can only read it from a file, and this is
+/// that file. It is also what carries `env:` on a node whose ePHPm predates
+/// #472, where `auto_prepend_file` is ignored with a warning.
+///
+/// The prepend wins where both apply: it runs before the front controller, and
+/// phpdotenv/symfony-dotenv are immutable by default (`$_SERVER` set first is
+/// not overwritten), so there is no ordering to reason about.
 ///
 /// Written for **every** docroot shape. It used to be skipped for
 /// `docroot: "."` on the grounds that the project root is web-served — but the
 /// file is dot-prefixed, and ePHPm's `hidden_files` default is `deny`, so it is
-/// a 403 either way (verified against the live preview cluster). Skipping it
-/// left `docroot: "."` apps — the common shape, including WordPress — with no
-/// `env:` delivery path at all (switchboard#4).
+/// a 403 either way (verified against the live preview cluster).
 const DOTENV_FILE: &str = ".env";
 /// Generated sidecar capturing the effective, non-secret manifest for ePHPm /
 /// debugging. Contains env KEYS only — never secret values.
@@ -251,8 +279,10 @@ pub struct DeployResult {
 ///    build/seed shell steps, the PHP prepend for the app).
 /// 4. Move the deploy manifest out of the served root (switchboard#16) and
 ///    strip `.git`, before it could ever be requested.
-/// 5. Write (or clear) the per-site document-root override, **before** the swap
-///    so the vhost is never briefly served with its container as the web root.
+/// 5. Write the per-site override — document root AND the `auto_prepend_file`
+///    that delivers `env:` (switchboard#4) — **before** the swap so the vhost is
+///    never briefly served with its container as the web root or without its
+///    `env:`.
 /// 6. Atomic swap the checkout into `sites_dir`, then `chown -R` the swapped
 ///    tree to the tenant owner (derived from `sites_dir`'s own ownership) so the
 ///    sandboxed build — which runs as that uid — can write its own container.
@@ -337,10 +367,11 @@ pub async fn deploy_preview(
     );
 
     // (3) Materialize env: resolve secrets and write env for the app to read.
-    // Reference the FINAL (post-swap) prepend path in the effective ini. This
-    // runs BEFORE the swap (so `.env`/prepend travel with the tree) and now also
-    // before `build:`, which moved after the swap — so a build step reads the
-    // preview's resolved `.env` where it used to run before it existed.
+    // Reference the FINAL (post-swap) prepend path in the sidecar. This runs
+    // BEFORE the swap (so `.env`/prepend travel with the tree into `site_dir`,
+    // where #29's post-swap chown then hands them to the tenant) and now also
+    // before `build:`, which moved after the swap (#28) — so a build step reads
+    // the preview's resolved `.env` where it used to run before it existed.
     let final_prepend = site_dir.join(PREPEND_FILE);
     materialize_env(
         &req.repo_full_name,
@@ -351,6 +382,13 @@ pub async fn deploy_preview(
         websocket,
     )
     .await?;
+
+    // (4a) Validate the prepend we just wrote with ePHPm's own rules, against
+    // the staged tree — the same tree the declaration will be resolved against
+    // once it is swapped into place. A value ePHPm refuses now takes the site
+    // to a 503 (ephpm#472), so this fails the deploy rather than shipping an
+    // override that puts the preview out of service.
+    let prepend = site_override::validate_prepend(&tmp_dir, PREPEND_FILE)?;
 
     // Remove .git to save disk before the swap.
     let git_dir = tmp_dir.join(".git");
@@ -379,16 +417,27 @@ pub async fn deploy_preview(
         );
     }
 
-    // (5) The per-site document-root override, written BEFORE the swap.
+    // (5) The per-site override — document root AND env prepend — written
+    // BEFORE the swap.
     //
     // Order matters: ePHPm resolves a vhost's roots on first request and caches
     // them briefly, so writing the override after the swap leaves a window in
     // which a fresh preview serves its container — `vendor/`, `config/`,
-    // `storage/logs/*.log` and all. Writing it first means the directory
-    // appears already carrying its web root. ePHPm validates the declaration
-    // against the container, and until the swap the container does not exist,
-    // so it simply serves nothing for that host in the meantime.
-    apply_document_root(ctx, &site_key, &document_root, &hostname).await?;
+    // `storage/logs/*.log` and all — and boots without its `env:`. Writing it
+    // first means the directory appears already carrying both. ePHPm validates
+    // the declarations against the container, and until the swap the container
+    // does not exist, so there is no vhost for that host to resolve in the
+    // meantime.
+    //
+    // On a **redeploy** the previous container is still live while this is
+    // written, and it also carries `PREPEND_FILE` (every deploy writes it under
+    // that same constant name), so the declaration stays resolvable throughout.
+    // That is the second reason the filename must not become deploy-specific.
+    let over = site_override::SiteOverride {
+        document_root,
+        auto_prepend_file: Some(prepend),
+    };
+    apply_site_override(ctx, &site_key, &over, &hostname).await?;
 
     // (6) Atomic swap: remove old site dir (if any), rename tmp into place.
     if site_dir.exists() {
@@ -873,21 +922,29 @@ async fn run_build(
     }
 }
 
-/// Publish (or clear) the preview's document root through ePHPm's per-site
-/// override file.
+/// Publish the preview's per-site override — its document root and the env
+/// prepend ePHPm auto-loads.
 ///
-/// Three outcomes, all of them stated in the log rather than inferred:
+/// # One file, always written
 ///
-/// * declaration is `"."` → any stale override from a previous deploy is
-///   removed, so the site does not keep serving a subdirectory this checkout may
-///   no longer have;
-/// * declaration is a subdirectory and `--site-overrides-dir` is set → the
-///   override is written;
-/// * declaration is a subdirectory and `--site-overrides-dir` is **not** set →
-///   a `warn!`, because ePHPm will serve the whole checkout and that is the
-///   exposure switchboard#3 is about. Not an error: a docroot-less preview is
-///   still a working preview, and failing every Laravel deploy on a node the
-///   operator has not finished configuring is worse than saying so loudly.
+/// This used to *remove* the override for `docroot: "."`, on the reasoning that
+/// an absent file and "the container is the web root" are the same thing to
+/// ePHPm. They are — for routing. They stopped being the same thing when the
+/// file gained `auto_prepend_file`: `docroot: "."` is precisely the shape with
+/// nowhere else to put a bootstrap hook, and removing its override is what left
+/// `env:` with no delivery path at all (switchboard#4). So the file is written
+/// for every preview, and `docroot: "."` is expressed by *not emitting*
+/// `document_root` rather than by not writing the file.
+///
+/// Two outcomes, both stated in the log rather than inferred:
+///
+/// * `--site-overrides-dir` is set → the override is written atomically;
+/// * `--site-overrides-dir` is **not** set → a `warn!` naming both consequences:
+///   ePHPm serves the whole checkout (the exposure switchboard#3 is about) and
+///   the manifest's `env:` reaches PHP only through the generated `.env`. Not an
+///   error: a preview without either is still a working preview, and failing
+///   every deploy on a node the operator has not finished configuring is worse
+///   than saying so loudly.
 ///
 /// `docroot: "."` also gets a `warn!` of its own, in every configuration. It
 /// stays **supported** — WordPress genuinely serves from its repository root,
@@ -899,13 +956,13 @@ async fn run_build(
 /// # Errors
 ///
 /// Returns an error if the override file cannot be written or removed.
-async fn apply_document_root(
+async fn apply_site_override(
     ctx: &DeployContext<'_>,
     site_key: &str,
-    document_root: &DocumentRoot,
+    over: &site_override::SiteOverride,
     hostname: &str,
 ) -> anyhow::Result<()> {
-    if !document_root.needs_override_file() {
+    if !over.document_root.narrows_the_web_root() {
         tracing::warn!(
             %hostname,
             site_key,
@@ -918,43 +975,40 @@ async fn apply_document_root(
     }
 
     let Some(overrides_dir) = ctx.site_overrides_dir else {
-        if document_root.needs_override_file() {
-            tracing::warn!(
-                %hostname,
-                docroot = document_root.declared(),
-                "docroot cannot be honoured: --site-overrides-dir is not \
-                 configured, so ePHPm will serve the whole checkout — including \
-                 vendor/, config/ and storage/logs/. Set it to ePHPm's \
-                 [server] site_overrides_dir (a directory OUTSIDE sites_dir)"
-            );
-        }
+        tracing::warn!(
+            %hostname,
+            docroot = over.document_root.declared(),
+            "no per-site override can be written: --site-overrides-dir is not \
+             configured. ePHPm will serve the whole checkout — including \
+             vendor/, config/ and storage/logs/ — and the manifest's `env:` will \
+             reach PHP only through the generated .env, not through an \
+             auto-loaded prepend. Set it to ePHPm's [server] site_overrides_dir \
+             (a directory OUTSIDE sites_dir)"
+        );
         return Ok(());
     };
 
-    if document_root.needs_override_file() {
-        let path = site_override::write_override(overrides_dir, site_key, document_root).await?;
-        tracing::info!(
-            %hostname,
-            site_key,
-            docroot = document_root.declared(),
-            path = %path.display(),
-            "wrote per-site document-root override"
-        );
-    } else {
-        site_override::remove_override(overrides_dir, site_key).await?;
-        tracing::debug!(
-            %hostname,
-            site_key,
-            "docroot is the repository root — no override file (any stale one removed)"
-        );
-    }
+    let path = site_override::write_override(overrides_dir, site_key, over).await?;
+    tracing::info!(
+        %hostname,
+        site_key,
+        docroot = over.document_root.declared(),
+        auto_prepend_file = over.auto_prepend_file.as_ref().map(site_override::PrependFile::declared),
+        path = %path.display(),
+        "wrote per-site override (document root + env prepend). An ePHPm older \
+         than the auto_prepend_file key (ephpm#463) ignores that key with a \
+         warning and still honours the document root"
+    );
     Ok(())
 }
 
 /// Resolve `env:` (including `${secret.NAME}` references) and write it where the
-/// app can read it: a `.env` file for framework-native dotenv loaders, plus a
-/// PHP prepend an app can `require_once`. Also writes a non-secret sidecar
-/// exposing the effective manifest.
+/// app can read it: the PHP prepend ePHPm auto-loads on every request, plus a
+/// `.env` for framework-native dotenv loaders and for the out-of-server
+/// `build:`/`seed:` steps. Also writes a non-secret sidecar exposing the
+/// effective manifest.
+///
+/// See [`PREPEND_FILE`] and [`DOTENV_FILE`] for why both exist and which wins.
 async fn materialize_env(
     repo: &str,
     manifest: &AppManifest,
@@ -974,10 +1028,52 @@ async fn materialize_env(
         resolved.insert(key.clone(), value);
     }
 
-    // The PHP prepend: written so the documented `require_once` workaround has
-    // something to require. Nothing loads it automatically — see PREPEND_FILE.
-    let prepend = render_php_prepend(&resolved);
-    tokio::fs::write(checkout.join(PREPEND_FILE), prepend)
+    // A manifest key the host owns is not an error — the prepend refuses to let
+    // it win in `$_SERVER` — but the author should hear that it will not take
+    // effect there, because it reads like it would.
+    let shadowed: Vec<&str> = resolved
+        .keys()
+        .filter(|k| HOST_OWNED_SERVER_PREFIXES.iter().any(|p| k.starts_with(p)))
+        .map(String::as_str)
+        .collect();
+    if !shadowed.is_empty() {
+        tracing::warn!(
+            keys = %shadowed.join(", "),
+            "`env:` declares keys ePHPm injects itself (the live per-site \
+             database/KV credentials, which rotate). They will NOT replace \
+             $_SERVER — the host's values win. They are still set in $_ENV and \
+             putenv() for code that reads those"
+        );
+    }
+
+    // The PHP prepend: ePHPm executes this before every request for the site
+    // (see PREPEND_FILE and `apply_site_override`).
+    //
+    // Unlink first. `write` follows a symlink, so a repository shipping a
+    // symlink at this name would have the preview's resolved secrets — every
+    // `${secret.NAME}` in the manifest — written through it to wherever it
+    // points. Removing the entry replaces the *link*, not its target, and
+    // leaves us writing a regular file we own. (ePHPm would refuse to prepend a
+    // symlink escaping the container, so this is about the write, not the
+    // include.)
+    let prepend_path = checkout.join(PREPEND_FILE);
+    match tokio::fs::symlink_metadata(&prepend_path).await {
+        Ok(meta) => {
+            tracing::warn!(
+                path = %prepend_path.display(),
+                symlink = meta.is_symlink(),
+                "repository ships a file at switchboard's generated prepend path — replacing it"
+            );
+            tokio::fs::remove_file(&prepend_path)
+                .await
+                .context("failed to replace the repository's file at the preview prepend path")?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).context("failed to inspect the preview prepend path");
+        }
+    }
+    tokio::fs::write(&prepend_path, render_php_prepend(&resolved))
         .await
         .context("failed to write preview env prepend")?;
 
@@ -999,11 +1095,13 @@ async fn materialize_env(
 
     // Non-secret sidecar for debugging: env KEYS only, never values.
     //
-    // `ini` is recorded exactly as the manifest declared it. It used to gain a
-    // synthesized `auto_prepend_file` entry pointing at the prepend — which read
-    // like a wiring step and was none: ePHPm does not read this file, and
-    // `ini:` is advisory in v1. A key nothing acts on is worse than an absent
-    // one, so it is gone (switchboard#4).
+    // `ini` is recorded exactly as the manifest declared it. It once gained a
+    // synthesized `auto_prepend_file` entry pointing at the prepend, which read
+    // like a wiring step and was none — ePHPm does not read this file. The real
+    // wiring lives in `<site_overrides_dir>/<site_key>.toml`, so what is
+    // recorded here is that the declaration was *made*, and where. Whether the
+    // server honours it depends on its version (ephpm#463), which this daemon
+    // has no channel to ask about — so it is not claimed.
     let sidecar = serde_json::json!({
         "generated_by": "switchboard",
         "php": manifest.php,
@@ -1019,7 +1117,9 @@ async fn materialize_env(
         // Where the prepend will live once the checkout is swapped into place,
         // for an app that wants to require it by absolute path.
         "prepend_file": prepend_hint.to_string_lossy(),
-        "prepend_auto_loaded": false,
+        // The relative value written into the site override's
+        // `auto_prepend_file`. Present means "declared", not "honoured".
+        "prepend_declared_as": PREPEND_FILE,
     });
     tokio::fs::write(
         checkout.join(SIDECAR_FILE),
@@ -1037,15 +1137,43 @@ async fn materialize_env(
     }
     tracing::info!(
         env_count = resolved.len(),
-        "materialized preview environment (.env + prepend)"
+        prepend = PREPEND_FILE,
+        dotenv = DOTENV_FILE,
+        "materialized preview environment (auto-loaded prepend + .env for \
+         build:/seed: and dotenv-reading frameworks)"
     );
     Ok(())
 }
 
-/// Render the PHP auto-prepend that exports env via putenv/$_ENV/$_SERVER.
+/// `$_SERVER` name prefixes ePHPm itself owns.
+///
+/// The server injects this vhost's live database and KV credentials into
+/// `$_SERVER` through `register_server_variables`, and they **rotate** — the
+/// per-site password is `HMAC-SHA256(master_secret, site_key)` over a secret
+/// regenerated at every host restart. The prepend must not overwrite them.
+///
+/// This mattered less when the prepend only ran if the app chose to
+/// `require_once` it. Now that ePHPm auto-loads it *after*
+/// `register_server_variables` and *before* the app, a manifest declaring
+/// `env: { DB_HOST: ... }` would silently replace a working credential with a
+/// stale literal on every request. See guide §2.
+const HOST_OWNED_SERVER_PREFIXES: [&str; 2] = ["DB_", "EPHPM_"];
+
+/// Render the PHP prepend that exports env via `$_SERVER` (and `$_ENV`/`putenv`
+/// for older code).
+///
+/// `$_SERVER` is the one that matters: ePHPm has no `sapi_module.getenv` handler
+/// and injects everything through `register_server_variables`, so the guide
+/// tells app authors to read `$_SERVER`, and phpdotenv consults it first. The
+/// other two are written for code that predates that advice.
+///
+/// Keys under [`HOST_OWNED_SERVER_PREFIXES`] are written to `$_ENV`/`putenv` but
+/// **not** allowed to overwrite an existing `$_SERVER` entry, so a manifest can
+/// never clobber the live per-site credential with a stale literal.
 fn render_php_prepend(env: &BTreeMap<String, String>) -> String {
     let mut php = String::from(
         "<?php\n// Generated by switchboard for the ePHPm preview. Do not commit.\n\
+         // Loaded by ePHPm as this site's auto_prepend_file (switchboard#4).\n\
          $__ephpm_preview_env = [\n",
     );
     for (key, value) in env {
@@ -1055,13 +1183,26 @@ fn render_php_prepend(env: &BTreeMap<String, String>) -> String {
             php_single_quote_escape(value)
         ));
     }
-    php.push_str(
-        "];\nforeach ($__ephpm_preview_env as $__k => $__v) {\n\
+    let guarded = HOST_OWNED_SERVER_PREFIXES
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    php.push_str(&format!(
+        "];\n$__ephpm_host_owned = [{guarded}];\n\
+         foreach ($__ephpm_preview_env as $__k => $__v) {{\n\
          \x20   putenv(\"$__k=$__v\");\n\
          \x20   $_ENV[$__k] = $__v;\n\
+         \x20   // Never replace a credential the host injected for this vhost:\n\
+         \x20   // it is live, per-site, and rotates on every host restart.\n\
+         \x20   $__owned = false;\n\
+         \x20   foreach ($__ephpm_host_owned as $__p) {{\n\
+         \x20       if (str_starts_with($__k, $__p)) {{ $__owned = true; break; }}\n\
+         \x20   }}\n\
+         \x20   if ($__owned && isset($_SERVER[$__k])) {{ continue; }}\n\
          \x20   $_SERVER[$__k] = $__v;\n\
-         }\nunset($__k, $__v);\n",
-    );
+         }}\nunset($__k, $__v, $__p, $__owned, $__ephpm_host_owned);\n"
+    ));
     php
 }
 
@@ -1426,46 +1567,75 @@ mod tests {
             !sidecar.contains("resolved-secret"),
             "sidecar must not leak secret values"
         );
-        // The sidecar used to carry a synthesized `auto_prepend_file` entry
-        // that read like wiring and was none — ePHPm never reads this file.
+        // The sidecar records that the declaration was *made* and where, not
+        // that the server honoured it — this daemon has no channel to ask an
+        // ePHPm its version, and the old `"prepend_auto_loaded": false` is no
+        // longer true on a server carrying ephpm#463.
         assert!(
-            !sidecar.contains("auto_prepend_file"),
-            "the sidecar must not imply an ini entry nothing applies"
+            sidecar.contains("\"prepend_declared_as\""),
+            "the sidecar must name the value written into the site override"
         );
         assert!(
-            sidecar.contains("\"prepend_auto_loaded\": false"),
-            "the sidecar must state plainly that nothing loads the prepend"
+            !sidecar.contains("prepend_auto_loaded"),
+            "the sidecar must not claim a server-side outcome it cannot observe"
         );
     }
 
-    /// switchboard#4. `docroot: "."` is the common shape (WordPress, most
-    /// bespoke apps) and used to get **no** `env:` delivery at all: no `.env`
-    /// was written and nothing auto-loads the prepend. The `.env` is written
-    /// for every docroot now — it is dot-prefixed, and ePHPm's `hidden_files`
-    /// default is `deny`, so it is a 403 over HTTP either way.
+    /// **switchboard#4, the whole shape.** `docroot: "."` (WordPress, most
+    /// bespoke apps) is the case that had no `env:` delivery at all. It must now
+    /// produce: the prepend, a `.env`, *and* an override file naming the prepend
+    /// in `auto_prepend_file` — with no `document_root`, because absent is how
+    /// "the container is the web root" is spelled.
     #[tokio::test]
-    async fn dotenv_is_written_for_a_root_docroot_too() {
+    async fn a_root_docroot_preview_gets_an_auto_loaded_prepend() {
         let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        let overrides = dir.path().join("overrides");
+        tokio::fs::create_dir_all(&checkout).await.unwrap();
+
         let manifest = AppManifest::from_yaml_str("version: 1\nenv:\n  K: \"v\"\n").unwrap();
         assert_eq!(manifest.docroot, ".", "this test is about the `.` shape");
         let secrets = Secrets::default();
         let req = make_request();
-        let prepend_hint = dir.path().join(PREPEND_FILE);
+
         materialize_env(
             &req.repo_full_name,
             &manifest,
             &secrets,
-            dir.path(),
-            &prepend_hint,
+            &checkout,
+            &checkout.join(PREPEND_FILE),
             false,
         )
         .await
         .unwrap();
-        assert!(dir.path().join(PREPEND_FILE).exists());
-        let dotenv = tokio::fs::read_to_string(dir.path().join(DOTENV_FILE))
+        assert!(checkout.join(PREPEND_FILE).exists());
+        let dotenv = tokio::fs::read_to_string(checkout.join(DOTENV_FILE))
             .await
             .expect("a `docroot: \".\"` preview must still get its env: values");
         assert!(dotenv.contains("K=\"v\""), "{dotenv}");
+
+        // The half that was missing: the override that wires it up.
+        let document_root = site_override::validate_docroot(&checkout, &manifest.docroot).unwrap();
+        assert_eq!(document_root, site_override::DocumentRoot::Container);
+        let prepend = site_override::validate_prepend(&checkout, PREPEND_FILE)
+            .expect("the generated prepend must satisfy ePHPm's containment rules");
+        let over = site_override::SiteOverride {
+            document_root,
+            auto_prepend_file: Some(prepend),
+        };
+        let path = site_override::write_override(&overrides, "app-pr-7", &over)
+            .await
+            .unwrap();
+
+        let toml = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            toml.contains(&format!("auto_prepend_file = \"{PREPEND_FILE}\"\n")),
+            "the override must name the prepend ePHPm will load: {toml}"
+        );
+        assert!(
+            !toml.contains("document_root"),
+            "`docroot: \".\"` is spelled by omitting the key: {toml}"
+        );
     }
 
     /// Every generated file is dot-prefixed, which is what makes writing them
@@ -1498,7 +1668,9 @@ mod tests {
     #[test]
     fn php_prepend_exports_all_three_superglobals() {
         // The prepend must populate putenv + $_ENV + $_SERVER so both
-        // WordPress getenv() and Laravel env() see the values.
+        // WordPress getenv() and Laravel env() see the values. `$_SERVER` is
+        // the one the guide tells authors to read (§2) — ePHPm has no
+        // `sapi_module.getenv`, and phpdotenv consults `$_SERVER` first.
         let mut env = BTreeMap::new();
         env.insert("APP_ENV".to_string(), "preview".to_string());
         let php = render_php_prepend(&env);
@@ -1507,6 +1679,37 @@ mod tests {
         assert!(php.contains("putenv("));
         assert!(php.contains("$_ENV["));
         assert!(php.contains("$_SERVER["));
+    }
+
+    /// **The auto-load hazard.** The prepend now runs on every request, after
+    /// ePHPm's `register_server_variables` and before the app. A manifest
+    /// declaring `DB_HOST` must not replace the live, rotating per-site
+    /// credential with a stale literal — so `$_SERVER` writes for host-owned
+    /// prefixes are guarded by an `isset` check, while `$_ENV`/`putenv` still
+    /// carry the declared value for code that reads those.
+    #[test]
+    fn the_prepend_never_clobbers_a_host_injected_credential() {
+        let mut env = BTreeMap::new();
+        env.insert("DB_HOST".to_string(), "elsewhere.example".to_string());
+        env.insert("EPHPM_REDIS_PORT".to_string(), "1".to_string());
+        env.insert("APP_ENV".to_string(), "preview".to_string());
+        let php = render_php_prepend(&env);
+
+        for prefix in HOST_OWNED_SERVER_PREFIXES {
+            assert!(
+                php.contains(&format!("'{prefix}'")),
+                "{prefix} must be in the guard list: {php}"
+            );
+        }
+        assert!(
+            php.contains("if ($__owned && isset($_SERVER[$__k])) { continue; }"),
+            "the guard must skip only the $_SERVER write: {php}"
+        );
+        // The values are still delivered everywhere else.
+        assert!(php.contains("'DB_HOST' => 'elsewhere.example'"));
+        // Temporaries are cleaned up — the prepend runs in the same scope as
+        // the app's front controller.
+        assert!(php.contains("unset($__k, $__v, $__p, $__owned, $__ephpm_host_owned);"));
     }
 
     // ── dotenv rendering ────────────────────────────────────────────
@@ -1624,7 +1827,7 @@ mod tests {
         assert!(!wait_healthy("https://example.invalid", "/", &ctx).await);
     }
 
-    // ── the document-root override the deploy now publishes (#3) ────────
+    // ── the per-site override the deploy publishes (#3, then #4) ────────
 
     /// A deploy context pointing at one tempdir, with the overrides directory
     /// either configured or deliberately absent.
@@ -1647,69 +1850,108 @@ mod tests {
         }
     }
 
+    /// A checkout carrying the generated prepend, and the validated override
+    /// for it — the shape `deploy_preview` assembles at step (5).
+    fn staged_override(checkout: &Path, docroot: &str) -> site_override::SiteOverride {
+        std::fs::create_dir_all(checkout.join("public")).unwrap();
+        std::fs::write(checkout.join(PREPEND_FILE), b"<?php // generated").unwrap();
+        site_override::SiteOverride {
+            document_root: site_override::validate_docroot(checkout, docroot).unwrap(),
+            auto_prepend_file: Some(
+                site_override::validate_prepend(checkout, PREPEND_FILE).unwrap(),
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn subdirectory_docroot_publishes_an_override_file() {
         let dir = tempfile::tempdir().unwrap();
         let overrides = dir.path().join("overrides");
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
         let secrets = Secrets::default();
         let ctx = override_ctx(dir.path(), Some(&overrides), &secrets);
-        let root = crate::site_override::DocumentRoot::Subdirectory {
-            declared: "public".into(),
-            resolved: dir.path().to_path_buf(),
-        };
 
-        apply_document_root(&ctx, "app-pr-1", &root, "app-pr-1.preview.ephpm.dev")
-            .await
-            .unwrap();
-
-        let written = tokio::fs::read_to_string(overrides.join("app-pr-1.toml"))
-            .await
-            .unwrap();
-        assert!(written.contains("document_root = \"public\""), "{written}");
-    }
-
-    /// A redeploy that goes back to `docroot: "."` must not leave the previous
-    /// override behind — ePHPm would keep serving a subdirectory this checkout
-    /// may no longer have, and its rejection of a stale one is silent.
-    #[tokio::test]
-    async fn container_docroot_clears_a_stale_override() {
-        let dir = tempfile::tempdir().unwrap();
-        let overrides = dir.path().join("overrides");
-        tokio::fs::create_dir_all(&overrides).await.unwrap();
-        let stale = overrides.join("app-pr-1.toml");
-        tokio::fs::write(&stale, "document_root = \"public\"\n")
-            .await
-            .unwrap();
-
-        let secrets = Secrets::default();
-        let ctx = override_ctx(dir.path(), Some(&overrides), &secrets);
-        apply_document_root(
+        apply_site_override(
             &ctx,
             "app-pr-1",
-            &crate::site_override::DocumentRoot::Container,
+            &staged_override(&checkout, "public"),
             "app-pr-1.preview.ephpm.dev",
         )
         .await
         .unwrap();
 
-        assert!(!stale.exists(), "a stale override must be removed");
+        let written = tokio::fs::read_to_string(overrides.join("app-pr-1.toml"))
+            .await
+            .unwrap();
+        assert!(written.contains("document_root = \"public\""), "{written}");
+        assert!(
+            written.contains(&format!("auto_prepend_file = \"{PREPEND_FILE}\"")),
+            "{written}"
+        );
     }
 
-    /// Without `--site-overrides-dir` there is nowhere to publish the docroot.
-    /// That is a warning, not a failure: the preview still works, it is just
-    /// served from its repository root. The deploy must not error.
+    /// A redeploy that goes back to `docroot: "."` must not leave the previous
+    /// `document_root` behind — ePHPm would keep serving a subdirectory this
+    /// checkout may no longer have, and as of ephpm#472 a declaration it cannot
+    /// resolve takes the site to a 503.
+    ///
+    /// The file is no longer *removed* for `.`, it is rewritten without the
+    /// key: it still has to carry `auto_prepend_file`, which is precisely what
+    /// a `docroot: "."` preview needs (switchboard#4).
+    #[tokio::test]
+    async fn container_docroot_clears_a_stale_document_root_but_keeps_the_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let overrides = dir.path().join("overrides");
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        tokio::fs::create_dir_all(&overrides).await.unwrap();
+        let path = overrides.join("app-pr-1.toml");
+        tokio::fs::write(&path, "document_root = \"public\"\n")
+            .await
+            .unwrap();
+
+        let secrets = Secrets::default();
+        let ctx = override_ctx(dir.path(), Some(&overrides), &secrets);
+        apply_site_override(
+            &ctx,
+            "app-pr-1",
+            &staged_override(&checkout, "."),
+            "app-pr-1.preview.ephpm.dev",
+        )
+        .await
+        .unwrap();
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            !written.contains("document_root"),
+            "the stale narrowing must be gone: {written}"
+        );
+        assert!(
+            written.contains("auto_prepend_file"),
+            "but the file must survive to carry the env prepend: {written}"
+        );
+    }
+
+    /// Without `--site-overrides-dir` there is nowhere to publish either the
+    /// docroot or the prepend. That is a warning, not a failure: the preview
+    /// still works, served from its repository root with `env:` arriving only
+    /// through the generated `.env`. The deploy must not error.
     #[tokio::test]
     async fn missing_overrides_dir_warns_but_does_not_fail_the_deploy() {
         let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
         let secrets = Secrets::default();
         let ctx = override_ctx(dir.path(), None, &secrets);
-        let root = crate::site_override::DocumentRoot::Subdirectory {
-            declared: "public".into(),
-            resolved: dir.path().to_path_buf(),
-        };
-        apply_document_root(&ctx, "app-pr-1", &root, "app-pr-1.preview.ephpm.dev")
-            .await
-            .expect("an unconfigured overrides dir must not fail the deploy");
+        apply_site_override(
+            &ctx,
+            "app-pr-1",
+            &staged_override(&checkout, "public"),
+            "app-pr-1.preview.ephpm.dev",
+        )
+        .await
+        .expect("an unconfigured overrides dir must not fail the deploy");
     }
 
     // ── build/seed run through `ephpm exec --site` (the root-RCE fix) ────
