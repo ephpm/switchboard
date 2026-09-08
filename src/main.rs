@@ -424,6 +424,14 @@ async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result
         }
     };
 
+    // Mint an installation token for the checkout fetch, so a PRIVATE repository
+    // can be previewed. `None` when no App credentials / installation id are
+    // available — the fetch then stays unauthenticated (fine for public repos;
+    // a private one fails with a clear message). Same short-lived,
+    // installation-scoped token the reporting path mints; the App installation
+    // must carry `contents: read` for a private fetch to succeed.
+    let fetch_token = fetch_installation_token(state, req).await;
+
     let suffix = state.config.effective_sites_domain_suffix();
     let ctx = deployer::DeployContext {
         sites_dir: &state.config.sites_dir,
@@ -434,6 +442,7 @@ async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result
         ephpm_bin: &state.config.ephpm_bin,
         ephpm_config: &state.config.ephpm_config,
         secrets,
+        fetch_token: fetch_token.as_deref(),
         health_timeout: Duration::from_secs(state.config.health_timeout_secs),
         health_interval: Duration::from_secs(state.config.health_interval_secs),
     };
@@ -519,6 +528,44 @@ async fn github_client(state: &AppState, req: &PreviewRequest) -> Option<github:
         Ok(token) => Some(github::GitHubClient::new(token)),
         Err(e) => {
             tracing::error!(%e, "failed to get installation token");
+            None
+        }
+    }
+}
+
+/// Mint an installation token to authenticate the **checkout fetch**, or `None`
+/// when authentication is not possible.
+///
+/// Two `None` cases, both non-fatal and both leaving the fetch unauthenticated
+/// (which still works for public repositories): no App credentials are
+/// configured, or the job carries no installation id. A minting *failure* is
+/// also `None` but warned — a private repo will then fail the fetch with the
+/// clear "configure App credentials" message rather than deploying wrong.
+///
+/// This is the same token type the reporting path uses (`create_deployment_status`,
+/// PR comments), minted separately here because the fetch happens before
+/// reporting and the token is short-lived. The App installation must have
+/// `contents: read` for a private fetch to succeed.
+async fn fetch_installation_token(state: &AppState, req: &PreviewRequest) -> Option<String> {
+    let (Some(app_id), Some(app_key)) = (state.config.app_id, state.config.app_key.as_deref())
+    else {
+        tracing::debug!(
+            "no GitHub App credentials — checkout fetch will be unauthenticated \
+             (public repositories only)"
+        );
+        return None;
+    };
+    let installation_id = req.installation_id?;
+
+    match get_installation_token(app_id, app_key, installation_id).await {
+        Ok(token) => Some(token),
+        Err(e) => {
+            tracing::warn!(
+                %e,
+                label = %req.label,
+                "failed to mint an installation token for the checkout fetch — a \
+                 private repository will fail to fetch"
+            );
             None
         }
     }

@@ -247,6 +247,20 @@ pub struct DeployContext<'a> {
     pub ephpm_config: &'a Path,
     /// Switchboard's own secret store for `${secret.NAME}` resolution.
     pub secrets: &'a Secrets,
+    /// Short-lived GitHub App **installation access token** used to authenticate
+    /// the checkout fetch, so a **private** repository can be previewed.
+    ///
+    /// `None` disables fetch authentication: a public repository still fetches
+    /// (it needs no credential), and a private one fails with a clear message
+    /// rather than a confusing git error. The token is installation-scoped and
+    /// short-lived; the App installation must carry `contents: read` for the
+    /// fetch to succeed against a private repository.
+    ///
+    /// It is applied to **that one fetch** as a transient `http.extraheader`
+    /// (`-c` on the git invocation), never written into the repository's
+    /// persisted git config, and never logged — see [`fetch_auth_config`] and
+    /// [`run_git_fetch`].
+    pub fetch_token: Option<&'a str>,
     /// How long to poll `health:` for a 200 before giving up. Zero disables the
     /// health gate entirely.
     pub health_timeout: Duration,
@@ -343,7 +357,7 @@ pub async fn deploy_preview(
     if tmp_dir.exists() {
         tokio::fs::remove_dir_all(&tmp_dir).await.ok();
     }
-    fetch_checkout(req, &tmp_dir).await?;
+    fetch_checkout(req, &tmp_dir, ctx.fetch_token).await?;
 
     // (2) Detect framework + load manifest.
     let framework = detect_framework(&tmp_dir).await;
@@ -544,9 +558,30 @@ pub async fn deploy_preview(
 ///
 /// When no `fetch_ref` is known (the legacy webhook path) this degrades to a
 /// shallow branch clone.
-async fn fetch_checkout(req: &PreviewRequest, dest: &Path) -> anyhow::Result<()> {
+///
+/// `token` is the installation access token that authenticates the fetch against
+/// a **private** repository. `None` fetches unauthenticated (public repos only);
+/// a private repo then fails with the [`private_repo_hint`] message rather than
+/// a bare git error. The token is applied as a transient, per-process
+/// `http.extraheader` credential ([`fetch_auth_config`]) and never persisted or
+/// logged.
+async fn fetch_checkout(
+    req: &PreviewRequest,
+    dest: &Path,
+    token: Option<&str>,
+) -> anyhow::Result<()> {
+    let auth = fetch_auth_config(token);
+
     let Some(pull_ref) = req.fetch_ref.as_deref() else {
-        return clone_branch(&req.fetch_url, req.branch.as_deref(), &req.sha, dest).await;
+        return clone_branch(
+            &req.fetch_url,
+            req.branch.as_deref(),
+            &req.sha,
+            dest,
+            &auth,
+            token.is_some(),
+        )
+        .await;
     };
 
     tokio::fs::create_dir_all(dest)
@@ -555,8 +590,9 @@ async fn fetch_checkout(req: &PreviewRequest, dest: &Path) -> anyhow::Result<()>
     run_git(dest, &["init", "--quiet"]).await?;
     run_git(dest, &["remote", "add", "origin", &req.fetch_url]).await?;
 
-    // Exact SHA first.
-    if run_git(dest, &["fetch", "--depth", "1", "origin", &req.sha])
+    // Exact SHA first. The credential rides only on the fetch (it is what talks
+    // to GitHub); init/remote-add/checkout are local and take none.
+    if run_git_fetch(dest, &auth, &["fetch", "--depth", "1", "origin", &req.sha])
         .await
         .is_ok()
         && run_git(dest, &["checkout", "--quiet", "--detach", &req.sha])
@@ -568,9 +604,15 @@ async fn fetch_checkout(req: &PreviewRequest, dest: &Path) -> anyhow::Result<()>
 
     // Fall back to the ref tip. This is the head of the PR *now*, which may be
     // a newer commit than the job recorded — say so rather than pretend.
-    run_git(dest, &["fetch", "--depth", "1", "origin", pull_ref])
+    run_git_fetch(dest, &auth, &["fetch", "--depth", "1", "origin", pull_ref])
         .await
-        .with_context(|| format!("failed to fetch {pull_ref} from {}", req.fetch_url))?;
+        .with_context(|| {
+            format!(
+                "failed to fetch {pull_ref} from {}{}",
+                req.fetch_url,
+                private_repo_hint(token.is_some())
+            )
+        })?;
     run_git(dest, &["checkout", "--quiet", "--detach", "FETCH_HEAD"])
         .await
         .context("failed to check out FETCH_HEAD")?;
@@ -585,18 +627,26 @@ async fn fetch_checkout(req: &PreviewRequest, dest: &Path) -> anyhow::Result<()>
 
 /// Legacy path: shallow clone a branch, falling back to a full clone plus an
 /// explicit checkout when the branch has been force-pushed or renamed.
+///
+/// `auth` is the transient credential prefix from [`fetch_auth_config`] (empty
+/// for a public repo); `token_present` only drives the [`private_repo_hint`] on
+/// failure. The `auth` args go **before** the `clone` subcommand so `-c` applies,
+/// and are kept out of the error context.
 async fn clone_branch(
     clone_url: &str,
     branch: Option<&str>,
     sha: &str,
     dest: &Path,
+    auth: &[String],
+    token_present: bool,
 ) -> anyhow::Result<()> {
     if let Some(branch) = branch {
         let status = Command::new("git")
+            .args(auth)
             .args(["clone", "--depth", "1", "--branch", branch, clone_url])
             .arg(dest)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .status()
             .await
             .context("failed to run git clone")?;
@@ -607,19 +657,28 @@ async fn clone_branch(
     }
 
     let status = Command::new("git")
+        .args(auth)
         .args(["clone", "--depth", "1", clone_url])
         .arg(dest)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .status()
         .await
         .context("git clone fallback failed")?;
-    anyhow::ensure!(status.success(), "git clone failed for {clone_url}");
+    anyhow::ensure!(
+        status.success(),
+        "git clone failed{}",
+        private_repo_hint(token_present)
+    );
 
     run_git(dest, &["checkout", "--quiet", "--detach", sha]).await
 }
 
 /// Run `git` in `dir`, erroring on a non-zero exit.
+///
+/// For **unauthenticated** git operations only (init, remote-add, checkout).
+/// The authenticated fetch goes through [`run_git_fetch`], which keeps the
+/// credential out of the strings this function joins into its error context.
 async fn run_git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
     let status = Command::new("git")
         .args(args)
@@ -631,6 +690,73 @@ async fn run_git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
         .with_context(|| format!("failed to run git {}", args.join(" ")))?;
     anyhow::ensure!(status.success(), "git {} failed", args.join(" "));
     Ok(())
+}
+
+/// The transient `-c http.extraheader=...` arguments that authenticate a fetch
+/// with a GitHub App installation token — or an **empty** vec for an
+/// unauthenticated (public-repo) fetch.
+///
+/// The credential is `Authorization: Basic base64("x-access-token:<token>")`,
+/// the scheme GitHub documents for App installation tokens over HTTPS. It is
+/// passed with `-c` so it applies to the **single** git process it prefixes and
+/// is *never* written into the repository's persisted `.git/config`. The
+/// returned strings contain the token verbatim, so they must never be logged —
+/// [`run_git_fetch`] is the only consumer and it keeps them out of every error
+/// string and log line.
+fn fetch_auth_config(token: Option<&str>) -> Vec<String> {
+    let Some(token) = token else {
+        return Vec::new();
+    };
+    use base64::Engine as _;
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+    // NB: `http.extraheader` (not `http.<url>.extraheader`) — scoped to this
+    // process by `-c`, so a broad key is fine and matches GitHub Actions'
+    // own checkout credential.
+    vec![
+        "-c".to_owned(),
+        format!("http.extraheader=Authorization: Basic {basic}"),
+    ]
+}
+
+/// Run an authenticated `git fetch` in `dir`.
+///
+/// `auth` is the token-bearing `-c` prefix from [`fetch_auth_config`] (empty for
+/// a public repo). It is placed **before** `fetch_args` so the `-c` config
+/// applies, and — critically — it is *not* part of `fetch_args`, which is the
+/// only slice joined into any error message. A failing fetch therefore reports
+/// `git fetch --depth 1 origin <sha>` and never the credential. stderr is
+/// discarded (as elsewhere in this module), so the token cannot leak through a
+/// captured git error either.
+async fn run_git_fetch(dir: &Path, auth: &[String], fetch_args: &[&str]) -> anyhow::Result<()> {
+    let status = Command::new("git")
+        .args(auth)
+        .args(fetch_args)
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .with_context(|| format!("failed to run git {}", fetch_args.join(" ")))?;
+    anyhow::ensure!(status.success(), "git {} failed", fetch_args.join(" "));
+    Ok(())
+}
+
+/// The clause appended to a fetch/clone failure when it might be an
+/// unauthenticated attempt at a **private** repository.
+///
+/// Empty when a token *was* supplied (the failure is something else); otherwise
+/// it names the missing credential and the `contents: read` permission the App
+/// installation needs, so a private-repo failure reads as a configuration gap
+/// rather than a mysterious git error.
+fn private_repo_hint(token_present: bool) -> &'static str {
+    if token_present {
+        ""
+    } else {
+        " — no GitHub App installation token was available, so a PRIVATE \
+         repository cannot be fetched. Configure --app-id/--app-key \
+         (SWITCHBOARD_APP_ID/SWITCHBOARD_APP_KEY) and ensure the App \
+         installation has `contents: read`"
+    }
 }
 
 /// Recursively hand the swapped site tree at `site_dir` to the tenant owner so
@@ -1821,6 +1947,7 @@ mod tests {
             ephpm_bin: Path::new("ephpm"),
             ephpm_config: Path::new("/etc/ephpm/ephpm.toml"),
             secrets: &secrets,
+            fetch_token: None,
             health_timeout: Duration::ZERO,
             health_interval: Duration::from_secs(1),
         };
@@ -1845,6 +1972,7 @@ mod tests {
             ephpm_bin: Path::new("ephpm"),
             ephpm_config: Path::new("/etc/ephpm/ephpm.toml"),
             secrets,
+            fetch_token: None,
             health_timeout: Duration::ZERO,
             health_interval: Duration::from_secs(1),
         }
@@ -2090,6 +2218,223 @@ mod tests {
         ensure_sandboxed_exec(&bin)
             .await
             .expect("an ephpm advertising `exec` must be accepted");
+    }
+
+    // ── authenticated checkout fetch (private repos, issue #26) ─────────
+
+    /// Decode a `Basic <base64>` value back to its `user:pass` form.
+    fn decode_basic(header_value: &str) -> String {
+        use base64::Engine as _;
+        let b64 = header_value
+            .strip_prefix("Authorization: Basic ")
+            .expect("extraheader must be an Authorization: Basic value");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("the credential must be valid base64");
+        String::from_utf8(bytes).expect("the credential must be UTF-8")
+    }
+
+    /// **The core Part A assertion.** A token produces a scoped
+    /// `-c http.extraheader=Authorization: Basic base64("x-access-token:<token>")`
+    /// — the exact credential GitHub documents for App installation tokens.
+    #[test]
+    fn a_token_becomes_a_scoped_extraheader_basic_credential() {
+        let token = "ghs_EXAMPLEinstallationtoken0000000000";
+        let cfg = fetch_auth_config(Some(token));
+
+        // Exactly `-c` + one `http.extraheader=...` value, so it applies to a
+        // single git process rather than being persisted.
+        assert_eq!(cfg.len(), 2, "expected `-c <value>`, got {cfg:?}");
+        assert_eq!(cfg[0], "-c");
+        let value = cfg[1]
+            .strip_prefix("http.extraheader=")
+            .expect("the -c value must set http.extraheader");
+        assert_eq!(
+            decode_basic(value),
+            format!("x-access-token:{token}"),
+            "the credential must be x-access-token:<token>"
+        );
+    }
+
+    /// The public-repo path carries **no** credential — the fetch is
+    /// unauthenticated exactly as it is today.
+    #[test]
+    fn no_token_means_no_credential() {
+        assert!(
+            fetch_auth_config(None).is_empty(),
+            "a public-repo fetch must carry no -c http.extraheader argument"
+        );
+    }
+
+    /// The credential must never reach a log line or error message. The only
+    /// string a failed fetch builds is `fetch_args.join(" ")`; the token lives
+    /// in the separate `auth` prefix and must not appear there.
+    #[test]
+    fn the_token_is_kept_out_of_the_error_and_log_surface() {
+        let token = "ghs_supersecretvalue";
+        let auth = fetch_auth_config(Some(token));
+        let fetch_args = ["fetch", "--depth", "1", "origin", "deadbeef"];
+
+        // The redacted description a failure prints — must be token-free.
+        let logged = fetch_args.join(" ");
+        assert!(
+            !logged.contains(token),
+            "the token must not appear in the fetch's error/log string: {logged}"
+        );
+        // And the credential genuinely lives in the auth prefix (so the test
+        // above is meaningful, not vacuous). It is base64-encoded there, so the
+        // raw token string does not even appear literally — decode to confirm.
+        let value = auth[1].strip_prefix("http.extraheader=").unwrap();
+        assert!(
+            decode_basic(value).contains(token),
+            "sanity: the token is carried (base64-encoded) by the auth prefix"
+        );
+        assert!(
+            !auth[1].contains(token),
+            "the token is base64-encoded in the header, never literal"
+        );
+    }
+
+    /// The private-repo hint fires only when no token was available, and names
+    /// the credential + `contents: read` so a private-repo failure is
+    /// actionable rather than a bare git error.
+    #[test]
+    fn private_repo_hint_only_when_unauthenticated() {
+        assert_eq!(private_repo_hint(true), "", "a token was present: no hint");
+        let hint = private_repo_hint(false);
+        assert!(hint.contains("PRIVATE"));
+        assert!(hint.contains("contents: read"));
+        assert!(hint.contains("--app-id") && hint.contains("--app-key"));
+    }
+
+    /// Whether `git` is runnable in this environment; the integration tests
+    /// below skip (rather than fail) when it is not, matching how the symlink
+    /// tests skip on a platform that refuses symlinks.
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Build a bare repo carrying one commit and a `refs/pull/1/head` ref, and
+    /// return its `file://` URL and the commit SHA — a stand-in for the base
+    /// repo `fetch_checkout` pulls a PR head from.
+    fn fixture_remote(root: &Path) -> (String, String) {
+        let bare = root.join("remote.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        git_in(&bare, &["init", "--quiet", "--bare"]);
+
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_in(&work, &["init", "--quiet"]);
+        std::fs::write(work.join("index.php"), b"<?php echo 'preview';").unwrap();
+        git_in(&work, &["add", "."]);
+        git_in(&work, &["commit", "--quiet", "-m", "seed"]);
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+
+        // file:// forces git's transport (so --depth works) and never applies
+        // http.extraheader — which is exactly why it is a clean probe that the
+        // -c credential is not persisted.
+        let url = format!("file://{}", bare.to_string_lossy().replace('\\', "/"));
+        git_in(&work, &["push", "--quiet", &url, "HEAD:refs/pull/1/head"]);
+        (url, sha)
+    }
+
+    fn make_pr_request(url: &str, sha: &str) -> PreviewRequest {
+        PreviewRequest {
+            label: "app-pr-1".into(),
+            repo_full_name: "ephpm/app".into(),
+            owner: "ephpm".into(),
+            repo_name: "app".into(),
+            pr_number: 1,
+            fetch_url: url.to_owned(),
+            fetch_ref: Some("refs/pull/1/head".into()),
+            branch: None,
+            sha: sha.to_owned(),
+            installation_id: Some(42),
+            fork: false,
+        }
+    }
+
+    /// **The "not persisted" integration test.** A fetch carrying a token
+    /// checks the code out AND leaves no trace of the credential in the
+    /// repository's persisted `.git/config`. The `-c` scoping is what makes this
+    /// hold — a `git config http.extraheader ...` would have written it in.
+    #[tokio::test]
+    async fn an_authenticated_fetch_checks_out_and_never_persists_the_token() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (url, sha) = fixture_remote(root.path());
+        let req = make_pr_request(&url, &sha);
+        let dest = root.path().join("checkout");
+
+        let token = "ghs_TOKEN_that_must_not_be_persisted_0001";
+        fetch_checkout(&req, &dest, Some(token))
+            .await
+            .expect("the checkout must succeed");
+
+        // The code is there…
+        assert!(
+            dest.join("index.php").is_file(),
+            "the PR head must be checked out"
+        );
+        // …and the token is nowhere in the persisted git config.
+        let config = std::fs::read_to_string(dest.join(".git").join("config")).unwrap();
+        assert!(
+            !config.contains(token),
+            "the installation token must NOT be written into .git/config: {config}"
+        );
+        assert!(
+            !config.contains("extraheader"),
+            "no extraheader must be persisted — the credential is `-c`-scoped: {config}"
+        );
+    }
+
+    /// **The public-repo path still works.** With no token the same fetch
+    /// succeeds against a repo that needs no credential — today's behaviour is
+    /// unchanged.
+    #[tokio::test]
+    async fn a_public_repo_still_fetches_without_a_token() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (url, sha) = fixture_remote(root.path());
+        let req = make_pr_request(&url, &sha);
+        let dest = root.path().join("checkout");
+
+        fetch_checkout(&req, &dest, None)
+            .await
+            .expect("a public fetch needs no credential");
+        assert!(dest.join("index.php").is_file());
+        let config = std::fs::read_to_string(dest.join(".git").join("config")).unwrap();
+        assert!(!config.contains("extraheader"));
     }
 
     // ── the swapped tree is handed to the tenant before the build (#28 404) ──
