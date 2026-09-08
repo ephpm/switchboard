@@ -100,7 +100,15 @@ resolved derivation at startup.
 
 A **deploy** fetches `refs/pull/<n>/head` at the recorded `head.sha` from the
 **base** repository (which works for forks, and for deleted forks, without
-trusting a third-party clone URL), materializes the app's `env:`, publishes the
+trusting a third-party clone URL). The fetch is **authenticated** with a
+short-lived GitHub App installation token (the same credential used for
+reporting), injected as a transient `http.extraheader` scoped to that one git
+process — never written into the checkout's persisted git config and never
+logged — so **private** repositories can be previewed. When no App credentials
+are configured the fetch stays unauthenticated: public repos still work, and a
+private repo fails with a clear "configure `--app-id`/`--app-key` and grant the
+installation `contents: read`" message. The deploy then materializes the app's
+`env:`, publishes the
 manifest's `docroot:` **and** the generated env prepend as ePHPm's per-site
 override, installs the result at `<sites_dir>/<key>/` by staging into `<key>.tmp`
 and renaming, and only then runs the manifest's `build:` and `seed:` steps —
@@ -168,6 +176,22 @@ from the site key by exact path — never a glob wider than the one site:
 
 In cluster mode every node's daemon runs the same teardown against its own
 disk, which is the complete story — each node reaps its own replicas.
+
+### Preview privacy is a known gap (not yet closed)
+
+A deployed preview currently serves to anyone who resolves its hostname — there
+is **no access gate on the preview URL**. Now that a private repository can be
+checked out (above), that means a private repo's preview is reachable by anyone
+who knows the hostname. This is stated rather than implied: it is a real
+exposure, and the fix is designed but not yet shipped.
+
+The gate belongs in ePHPm, not switchboard — it has to cover the static-file
+path as well as PHP and fail closed, which is the request-phase middleware layer
+ePHPm already has, and switchboard's only per-site channel (the two-key override
+file) is deliberately closed. The full design, threat model, and the companion
+ePHPm issue it depends on (ephpm/ephpm#487) are in [`docs/preview-access-gate.md`](docs/preview-access-gate.md).
+Until that lands, treat previews as world-readable and do not preview a
+repository whose mere contents are sensitive.
 
 ### Teardown is complete or it fails
 
