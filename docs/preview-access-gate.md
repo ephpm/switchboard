@@ -1,15 +1,20 @@
-# Preview access gate — design (switchboard#26, Part B)
+# Preview access gate — switchboard's control-plane half (switchboard#26, Part B)
 
 ## Status
 
-**Specified, not implemented in switchboard.** The clean enforcement point is in
-**ePHPm**, not switchboard, so this PR delivers Part A (authenticated fetch) and
-this written design for Part B. The enforcement change is tracked as companion
-ePHPm issue **ephpm/ephpm#487**; the switchboard-side piece (generate a
-per-preview credential, write
-it into the per-site override, surface it in the PR comment) lands **after** that
-ePHPm key exists — writing it sooner would be an inert, bypassable gate, which is
-worse than an honestly-documented gap.
+**Implemented.** ePHPm ships the enforcement (a per-site `preview-gate`
+middleware) and verification/revocation (ephpm/ephpm#487, merged in #491);
+switchboard ships the control plane described here: it decides which previews to
+gate, writes the `[preview_auth]` activation into the per-site override, mints
+temporary shareable-URL capability tokens, and revokes them on teardown.
+
+> **Design note — this supersedes the original plan.** An earlier revision of
+> this document proposed **per-preview HTTP Basic auth** with a switchboard-
+> generated credential written into a new override key. That is not what shipped.
+> ePHPm implemented a stronger mechanism — a **GitHub-OAuth login gate** that
+> authorizes against real repo read access, plus revocable HS256 **share tokens**
+> for people without repo access — and switchboard drives *that*. The threat
+> model below still holds; the mechanism section is rewritten to match the code.
 
 ## The problem
 
@@ -17,15 +22,17 @@ A deployed preview serves to anyone who resolves `*.preview.ephpm.dev`. Once
 switchboard can check out **private** repositories (Part A of #26), that preview
 is a private repo's code and content served to the whole internet. Fetching
 private code is pointless if the result is world-readable, so the two are one
-decision.
+decision — and a private preview that comes up ungated is the exact exposure this
+feature exists to prevent. Every path where gating could silently not happen must
+instead **fail the deploy loudly** (see "Fail closed").
 
 ## Threat model
 
 **What the gate defends:** *preview privacy.* It stops a random internet visitor
 — someone who knows or guesses the preview hostname — from reading a preview's
-pages, assets, or uploaded content. The intended audience (the PR author and
-reviewers, i.e. people with read access to the base repo) can still reach it,
-because the credential is posted in the PR comment, which only they can see.
+pages, assets, or uploaded content. The intended audience reaches it by signing
+in with GitHub (they are authorized automatically if they have read access to the
+base repo), or via a temporary share link handed out by a repo member.
 
 **What it explicitly does NOT defend:**
 
@@ -33,111 +40,137 @@ because the credential is posted in the PR comment, which only they can see.
   previews is a separate, existing property (per-vhost `open_basedir`, per-site
   DB/KV credentials, the `ephpm exec` sandbox). This gate is only about *who may
   make an HTTP request to a preview*.
-- It does **not** protect against someone who already has read access to the
-  base repo — they are the intended audience and can see the credential.
-- It does **not** resist a determined attacker who compromises a reviewer's
-  GitHub account or the PR comment stream. That is an account-security problem,
-  not a preview-privacy one.
+- A **share link is a bearer capability**: anyone who has the link is in until it
+  expires or is revoked, without signing in. That is the point (sharing with
+  people who cannot authenticate) and is a *weaker* property than the OAuth gate;
+  it is stated in every PR comment that carries one.
+- It does **not** resist a compromised reviewer GitHub account or a leaked PR
+  comment stream. That is account security, not preview privacy.
 - It is **not** a substitute for keeping genuinely sensitive data out of a
   preview environment.
 
 ## Why enforcement belongs in ePHPm, not switchboard
 
-A correct gate has two hard requirements, and switchboard can satisfy neither on
-its own today:
+Unchanged from the original analysis, and the reason the mechanism is split:
 
-1. **It must cover the static-file path as well as the PHP path, and fail
-   closed.** A preview serves static assets (JS/CSS/images) and — for a
-   `docroot: "."` WordPress checkout — arbitrary non-PHP files (`.txt`, `.sql`
-   dumps, uploads) directly off disk, *without* running any PHP. A gate that only
-   runs in PHP leaves all of that ungated. ePHPm already has exactly the right
-   primitive: the **request-phase middleware** chain runs on both the PHP path
-   (`Router::handle_php`) **and** the static-file path
-   (`Router::static_request_phase`, ephpm#395), *before the file's bytes are read
-   from disk*, and it **fails closed**. A `RESPOND` verdict (e.g. a `401`) short-
-   circuits the whole request.
+1. **The gate must cover the static-file path as well as PHP, and fail closed.**
+   A preview serves static assets and — for a `docroot: "."` checkout — arbitrary
+   non-PHP files directly off disk without running any PHP. ePHPm's request-phase
+   middleware runs on both `Router::handle_php` **and**
+   `Router::static_request_phase` (ephpm#395), before a file's bytes are read, and
+   fails closed. An `auto_prepend_file` Basic-auth check (the tempting
+   switchboard-only shortcut) would run on the PHP path only and leave every
+   static file ungated — a bypassable control, rejected.
+2. **The gate must be per-preview.** A preview fleet mints a new vhost per PR, and
+   ePHPm has no runtime config reload. The per-site **override file**, re-read
+   every `SITE_CONFIG_TTL` (~2 s), is switchboard's only per-preview channel; a
+   global `[[middleware]]` mount cannot be turned on for a brand-new preview
+   without a restart. So activation rides the override file, and ePHPm made
+   `preview_auth` a typed section in it (ephpm#487).
 
-2. **The credential must be per-preview.** Every preview needs its own secret so
-   that leaking one does not open the others, and so a credential can rotate per
-   deploy.
+## Chosen mechanism (as shipped)
 
-switchboard's only per-site configuration channel into ePHPm is the two-key
-per-site **override file** (`document_root`, `auto_prepend_file`). That schema is
-**deliberately closed** (see `ephpm-server/src/site_overrides.rs`): an arbitrary
-key is a tenant-influenced sandbox-escape surface, so it is not switchboard's to
-extend from the outside. And ePHPm's `[[middleware]]` mounts are **global** (one
-chain for the whole server, matched only by a path glob) — they have no per-vhost
-credential channel. So the enforcement layer must be added inside ePHPm.
+**A GitHub-OAuth login gate, activated per preview through the `[preview_auth]`
+override section, plus revocable HS256 share-link capabilities.** ePHPm mints the
+OAuth session and verifies both grant paths through one `Hs256Policy`;
+switchboard activates the gate and mints share links.
 
-### Why not the tempting switchboard-only shortcut
+### 1. Gating policy (switchboard)
 
-switchboard already writes an `auto_prepend_file` (the env prepend) that ePHPm
-runs before every request. It is tempting to add a Basic-auth check to that PHP
-prepend. **Rejected:** `auto_prepend_file` runs only on the **PHP** path, so it
-leaves every static asset and non-PHP file ungated. That is a *bypassable*
-control, and the issue is explicit that a bypassable gate is worse than an
-honest gap. The prepend is the wrong layer for a security boundary.
+- **Private repo → gate ON, always.** Its code is not world-readable, so neither
+  is its preview. Repo visibility comes from `repository.private` in the job/
+  webhook payload (`JobRepository::private`), which **defaults to private when
+  absent** (fail closed).
+- **Public repo → ungated by default**, gated only when the operator sets
+  `--gate-public-previews` (e.g. to keep unreleased work off the open internet).
 
-## Chosen mechanism
+### 2. Activation (switchboard writes `[preview_auth]`)
 
-**Per-preview HTTP Basic auth, enforced by an ePHPm request-phase gate that runs
-on both the static and PHP paths and fails closed. The credential is generated
-by switchboard and posted in the PR comment.**
+For a gated preview switchboard writes, into the same
+`<site_overrides_dir>/<site-key>.toml` it already writes `document_root` /
+`auto_prepend_file` into:
 
-- **Credential:** a random, per-preview secret. Basic auth username can be the
-  site key; the password is a switchboard-generated high-entropy token, stored
-  in switchboard's own state and rotated per deploy. (It is deliberately *not*
-  ePHPm's per-site `HMAC(master_secret, site_key)` password — that one rotates on
-  every host restart, so it could not be posted in a durable PR comment.)
-- **Surfacing:** the credential goes in the sticky PR comment, which is visible
-  only to users with read access to the base repo. The comment already exists;
-  it gains a "This preview is private — sign in with …" line.
-- **Enforcement (ePHPm, companion issue):** a request-phase gate, fed a per-site
-  expected credential, returns `401 WWW-Authenticate: Basic` for any request
-  whose `Authorization` header does not match. It runs ahead of both the static
-  and PHP serving paths and fails closed.
+```toml
+[preview_auth]
+session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"   # a REFERENCE, never the key
+login_url      = "/_ephpm/auth/github/login"
+```
 
-### How the per-site credential reaches ePHPm
+`session_secret` is a **reference** (`env:NAME` / `file:/abs` / a literal),
+resolved by both the `github-auth` issuer and the gate — one source of truth, the
+secret never in the tenant-adjacent file or the served tree. switchboard writes
+the same reference it resolves for minting.
 
-Two candidate shapes for the companion ePHPm change; the issue picks one:
+### 3. Share links (switchboard mints)
 
-1. **A new per-site override key** — e.g. `require_basic_auth = "<user>:<bcrypt-
-   or-hmac-of-password>"` (or a token) in `<site_overrides_dir>/<key>.toml`. The
-   override loader already validates and fail-closes per site, and switchboard
-   already writes this file. This is the smallest, most consistent change: the
-   credential travels the exact channel `document_root` and `auto_prepend_file`
-   already do. The value is a *verifier* (hash), never the plaintext, so the
-   operator-owned file does not itself store a reusable secret.
+A share link is a `via:"share"` HS256 capability token, wire-compatible with
+`ephpm_middleware_builtins::preview_gate::mint_share_token`, carrying `site` (the
+canonical site key — per-preview), `via:"share"`, a random `jti`, `iat`, and a
+short `exp`. Handed out as `https://<preview-host>/?ephpm_share=<token>`. Minting
+is opt-in (`--share-link`) because a bearer capability posted on every PR is a
+choice, not a default; only the token travels in the URL, never the secret.
 
-2. **A per-site binding for a builtin auth middleware** — expose the resolved
-   site key to the middleware `RequestCtx` and let a builtin `preview_auth` /
-   `api_key`-style module look the expected credential up from a per-site source.
-   More flexible, more surface; heavier than preview-privacy warrants.
+### 4. Revocation (switchboard, on teardown)
 
-Preference: **option 1** (new override key). It reuses the existing per-site
-config path, keeps the two-parser contract intact, and needs no new middleware
-wiring.
+On teardown, removing the override + checkout already stops the gate on this
+node. Because the per-vhost KV is gossip-replicated and a preview can be
+redeployed, switchboard also bumps the per-site epoch — `preview:share:epoch =
+now` in the preview's own KV keyspace (AUTH'd as the site with
+`HMAC-SHA256([kv] secret, site)`) — which refuses every share token issued
+before that instant, cluster-wide. Best-effort: an unreachable KV is a `warn!`,
+never a teardown failure; skipped entirely when `--kv-secret-file` is unset.
+
+## Fail closed
+
+The one decision that, gotten wrong, publishes private code — so every silent-
+not-happen path is a hard deploy failure instead:
+
+- A gated preview whose `session_secret` reference does not resolve to ≥ 32 bytes
+  **fails the deploy** (`resolve_preview_gate`) rather than shipping an open
+  preview or one ePHPm will 503.
+- A gated preview with **no `--site-overrides-dir`** — nowhere to deliver the
+  gate — **fails the deploy** (`apply_site_override`). An ungated (public) preview
+  in the same situation only warns, because it was already public.
+- Repo visibility **defaults to private** when the job payload omits `private`.
+
+## Operator configuration
+
+One-time, per fleet (ePHPm node config — **not** switchboard, stated here for
+completeness):
+
+1. Register **one** GitHub OAuth App for the fleet and mount `github-auth`
+   globally in `ephpm.toml` with its `client_id`/`client_secret`, the per-repo
+   access target, `session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"`, and for a
+   wildcard fleet the apex-flow knobs `redirect_uri` (the one fixed callback host)
+   and `cookie_domain`.
+2. Set `EPHPM_PREVIEW_SESSION_SECRET` (≥ 32 bytes) in the ePHPm **and** switchboard
+   process environments — both must resolve the reference to identical bytes for a
+   switchboard-minted share token to verify in the gate.
+
+switchboard flags:
+
+| Flag / env | Default | Purpose |
+|---|---|---|
+| `--gate-public-previews` / `SWITCHBOARD_GATE_PUBLIC_PREVIEWS` | off | gate public repos too (private are always gated) |
+| `--preview-session-secret-ref` / `SWITCHBOARD_PREVIEW_SESSION_SECRET_REF` | `env:EPHPM_PREVIEW_SESSION_SECRET` | the reference written into the override and resolved to mint share tokens |
+| `--share-link` / `SWITCHBOARD_SHARE_LINK` | off | mint + post a share link per gated deploy |
+| `--share-link-ttl-secs` / `SWITCHBOARD_SHARE_LINK_TTL_SECS` | `86400` | share-link TTL (kept short) |
+| `--kv-secret-file` / `SWITCHBOARD_KV_SECRET_FILE` | unset | ePHPm's `[kv] secret`, for teardown epoch revocation (unset skips it) |
+| `--kv-addr` / `SWITCHBOARD_KV_ADDR` | `127.0.0.1:6379` | ePHPm's KV RESP listener |
+
+## Rollout ordering
+
+Only write `[preview_auth]` once an ePHPm that **enforces** it is deployed to the
+node. An older ePHPm treats the unknown section leniently (ignored, reported) and
+would serve the preview ungated — so the fleet upgrades ePHPm first, then starts
+writing the key. Same discipline `document_root`/`auto_prepend_file` and the
+`ephpm exec` fail-closed check already follow.
 
 ## Alternatives weighed
 
 | Option | Verdict |
 |---|---|
-| **Shared per-preview token in URL/cookie** (magic link) | Workable, but tokens in URLs leak via `Referer`, browser history and access logs; needs cookie-setting logic and a redirect dance. More moving parts than Basic auth for the same protection. Secondary. |
-| **Basic auth, per-preview generated credential** (chosen) | Zero client state, works for browsers *and* `curl`/CI, trivial to enforce in the request phase on both paths, credential fits naturally in the PR comment. |
-| **IP allowlist** | Reviewers are on dynamic/varied IPs (home, mobile, CI); an allowlist that fits a public preview audience is impractical. Could be an *optional add-on* for a fixed-office deployment, not the default. |
-| **GitHub-OAuth-gated** (tie the gate to actual repo read access) | Strongest — authorizes against real GitHub permissions rather than a shared secret — but needs an OAuth app, a callback handler, a session store, and per-repo authorization checks. Overkill for preview-privacy; a good future upgrade if the shared-secret model proves too coarse. |
-
-## Scope split
-
-- **This PR (switchboard):** Part A only — the authenticated fetch — plus this
-  design.
-- **Companion ePHPm issue (ephpm/ephpm#487):** the request-phase per-site access gate (option 1
-  above): a new per-site override key carrying a Basic-auth verifier, enforced on
-  both the static and PHP paths, failing closed, with unit tests that a request
-  with no/!wrong credential gets `401` and a request with the right credential is
-  served (asserting the before-state: ungated today).
-- **Follow-up switchboard PR (after the ePHPm key ships):** generate the
-  per-preview credential, write the verifier into the per-site override, post the
-  plaintext credential in the PR comment, and rotate it per deploy. Gated behind
-  an explicit opt-in until the enforcing ePHPm is known to be deployed to the
-  node (same rollout-ordering discipline as the `ephpm exec` fail-closed check).
+| **Per-preview HTTP Basic auth** (the original plan here) | Superseded. Works for browsers and `curl`, but a shared per-preview secret is coarser than authorizing against real repo access, and it does not give the "log in with GitHub" UX the OAuth gate does. ePHPm shipped OAuth instead. |
+| **GitHub-OAuth login gate** (shipped) | Authorizes against real GitHub repo-read permission; no shared secret to hand out for the primary path; enforced request-phase on both static and PHP paths, fail closed. |
+| **Revocable share tokens** (shipped, secondary) | For people without repo access. A short-lived, per-preview, revocable bearer capability — explicitly weaker, explicitly labelled. |
+| **IP allowlist** | Reviewers are on varied IPs; impractical as a default. Possible optional add-on for a fixed-office deployment. |

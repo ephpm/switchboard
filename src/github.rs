@@ -300,7 +300,7 @@ fn format_deploy_comment(result: &DeployResult) -> String {
         "deployed (health check pending)"
     };
 
-    format!(
+    let mut body = format!(
         "{COMMENT_MARKER}\n\
          **ePHPm Preview** — {status}\n\n\
          | | |\n\
@@ -312,7 +312,41 @@ fn format_deploy_comment(result: &DeployResult) -> String {
          Preview updates automatically on each push to this PR.",
         result.framework.as_str(),
         result.duration.as_secs_f64(),
-    )
+    );
+    body.push_str(&access_section(result));
+    body
+}
+
+/// The access-guidance block appended to a **gated** preview's comment.
+///
+/// A gated preview is not world-readable, so a reviewer needs to be told how to
+/// get in: log in with GitHub (they are authorised automatically if they have
+/// read access to the repo the preview is for). When switchboard also minted a
+/// share link, it is included with the bearer-capability warning stated plainly —
+/// anyone with the link is in until it expires — because that is a weaker property
+/// than the OAuth gate and the person pasting it must know so. The signing secret
+/// never appears here; only the token, inside the URL, does.
+///
+/// An ungated (public) preview gets no block — its content is already public.
+fn access_section(result: &DeployResult) -> String {
+    if !result.gated {
+        return String::new();
+    }
+    let mut section = String::from(
+        "\n\n**Access:** this preview is private. Sign in with GitHub at the URL above — \
+         you'll be authorised automatically if your GitHub account has read access to this \
+         repository.",
+    );
+    if let Some(share) = &result.share_url {
+        section.push_str(&format!(
+            "\n\n**Shareable link (no login required):** {share}\n\n\
+             > ⚠️ This link is a bearer capability: **anyone who has it can view the preview** \
+             > until it expires or is revoked, without signing in. Share it only with people \
+             > who should see this preview, and don't post it anywhere public. It is revoked \
+             > automatically when the PR is closed."
+        ));
+    }
+    section
 }
 
 #[cfg(test)]
@@ -329,6 +363,8 @@ mod tests {
             duration: Duration::from_millis(14_320),
             php_version: None,
             healthy: true,
+            gated: false,
+            share_url: None,
         };
         let comment = format_deploy_comment(&result);
         assert!(comment.contains("https://pr-42.my-blog.preview.ephpm.dev"));
@@ -350,6 +386,8 @@ mod tests {
             duration: Duration::from_millis(9_500),
             php_version: Some("8.4".into()),
             healthy: false,
+            gated: false,
+            share_url: None,
         };
         let comment = format_deploy_comment(&result);
         assert!(comment.contains(":8084"), "PHP 8.4 should use port 8084");
@@ -368,6 +406,8 @@ mod tests {
             duration: Duration::from_millis(3_000),
             php_version: Some("8.3".into()),
             healthy: true,
+            gated: false,
+            share_url: None,
         };
         let comment = format_deploy_comment(&result);
         assert!(
@@ -394,12 +434,79 @@ mod tests {
             duration: Duration::from_millis(2_449),
             php_version: Some("8.5".into()),
             healthy: true,
+            gated: false,
+            share_url: None,
         };
         let comment = format_deploy_comment(&result);
         assert!(comment.contains("2.4s"), "got: {comment}");
         assert!(comment.contains("Drupal"));
         // 8.5 is the default port-less URL — no explicit port in the link.
         assert!(!comment.contains(":8085"));
+    }
+
+    // ── access-gate guidance (ephpm#487/#491) ──────────────────────────
+
+    fn gated_result(share_url: Option<String>) -> DeployResult {
+        DeployResult {
+            hostname: "pr-1.app.preview.ephpm.dev".into(),
+            framework: Framework::Laravel,
+            duration: Duration::from_millis(3_000),
+            php_version: Some("8.4".into()),
+            healthy: true,
+            gated: true,
+            share_url,
+        }
+    }
+
+    #[test]
+    fn ungated_comment_has_no_access_section() {
+        let result = DeployResult {
+            hostname: "pr-1.app.preview.ephpm.dev".into(),
+            framework: Framework::Laravel,
+            duration: Duration::from_millis(1),
+            php_version: None,
+            healthy: true,
+            gated: false,
+            share_url: None,
+        };
+        let comment = format_deploy_comment(&result);
+        assert!(
+            !comment.contains("Access:"),
+            "a public preview needs no access block: {comment}"
+        );
+        assert!(!comment.contains("Shareable link"));
+    }
+
+    #[test]
+    fn gated_comment_tells_the_reviewer_to_log_in() {
+        let comment = format_deploy_comment(&gated_result(None));
+        assert!(comment.contains("Access:"), "{comment}");
+        assert!(comment.contains("Sign in with GitHub"), "{comment}");
+        assert!(comment.contains("read access"), "{comment}");
+        // No share link was minted, so none is advertised.
+        assert!(!comment.contains("Shareable link"), "{comment}");
+    }
+
+    /// A minted share link is shown with the bearer-capability warning, and only
+    /// the token (inside the URL) appears — never the signing secret.
+    #[test]
+    fn gated_comment_with_a_share_link_warns_it_is_a_bearer_capability() {
+        let token = "eyJhbGciOiJIUzI1NiJ9.payload.sig";
+        let url = format!("https://pr-1.app.preview.ephpm.dev:8084/?ephpm_share={token}");
+        let comment = format_deploy_comment(&gated_result(Some(url.clone())));
+        assert!(
+            comment.contains(&url),
+            "the full share URL must be present: {comment}"
+        );
+        assert!(comment.contains("bearer capability"), "{comment}");
+        assert!(comment.contains("anyone who has it"), "{comment}");
+        assert!(
+            comment.contains("revoked"),
+            "must say teardown revokes it: {comment}"
+        );
+        // The comment carries the token (in the URL) but nothing that looks like
+        // the raw HS256 secret — there is no separate secret field to leak.
+        assert!(comment.contains(token), "the token travels in the URL");
     }
 
     #[test]

@@ -171,6 +171,94 @@ impl PrependFile {
     }
 }
 
+/// Whether `s` can be written between the quotes of a hand-rolled TOML basic
+/// string without changing the document's structure.
+///
+/// The override is written by hand (no `toml` serializer), so a `"` or a newline
+/// in a value would close the string and let it inject keys — the same class the
+/// `docroot`/`auto_prepend_file` charset gate closes. `preview_auth`'s values are
+/// operator-supplied (switchboard's own config), not tenant-supplied, so the risk
+/// is lower, but a hand-written writer that trusts its input is exactly how the
+/// bug recurs. A backslash is refused too: it is TOML's escape lead-in, and none
+/// of these values (an `env:`/`file:` reference, an absolute URL path) needs one.
+fn is_toml_string_safe(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c != '"' && c != '\\' && !c.is_control())
+}
+
+/// The `[preview_auth]` section that turns the per-site OAuth/​share gate ON for
+/// one preview (ephpm#487/#491).
+///
+/// It carries deliberately little: a **reference** to the shared HS256 session
+/// secret (`env:NAME` / `file:/abs` / a literal — never the key itself, since this
+/// file is derived from tenant-controlled repository content) and the issuer's
+/// login entry point. Everything else (cookie name, `require_https`/`require_site`,
+/// `share_param`, revocation) uses the gate's defaults, which match what the
+/// global `github-auth` issuer mount uses. See
+/// [`crate::preview_auth`] for the policy that decides *when* to write this and
+/// for the secret resolution/​minting that pairs with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewAuthSection {
+    /// The `session_secret` reference written verbatim into the file — the SAME
+    /// reference the issuer resolves, so the two share one source of truth. Never
+    /// the resolved secret.
+    session_secret_ref: String,
+    /// The issuer's login endpoint (`login_url`), an absolute path under
+    /// `/_ephpm/auth/`.
+    login_url: String,
+}
+
+impl PreviewAuthSection {
+    /// Build a validated section from a secret **reference** and a login URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reference is empty or the login URL is not an
+    /// absolute (`/`-leading) path, or when either would be unsafe to write into
+    /// the hand-rolled TOML (a quote, backslash, or control character).
+    pub fn new(
+        session_secret_ref: impl Into<String>,
+        login_url: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let session_secret_ref = session_secret_ref.into();
+        let login_url = login_url.into();
+        let secret_ref = session_secret_ref.trim();
+        anyhow::ensure!(
+            !secret_ref.is_empty(),
+            "preview_auth session_secret reference is empty"
+        );
+        anyhow::ensure!(
+            is_toml_string_safe(secret_ref),
+            "preview_auth session_secret reference {secret_ref:?} contains a quote, backslash \
+             or control character and cannot be safely written into the override TOML"
+        );
+        let login = login_url.trim();
+        anyhow::ensure!(
+            login.starts_with('/'),
+            "preview_auth login_url {login:?} must be an absolute path beginning with `/`"
+        );
+        anyhow::ensure!(
+            is_toml_string_safe(login),
+            "preview_auth login_url {login:?} contains a quote, backslash or control character"
+        );
+        Ok(Self {
+            session_secret_ref: secret_ref.to_string(),
+            login_url: login.to_string(),
+        })
+    }
+
+    /// The secret reference as it appears in the file (never the resolved key).
+    #[must_use]
+    pub fn session_secret_ref(&self) -> &str {
+        &self.session_secret_ref
+    }
+
+    /// The issuer's login endpoint as it appears in the file.
+    #[must_use]
+    pub fn login_url(&self) -> &str {
+        &self.login_url
+    }
+}
+
 /// Everything switchboard declares for one site, in one file.
 ///
 /// One struct rather than two writers because ePHPm reads **one** file per site:
@@ -184,6 +272,13 @@ pub struct SiteOverride {
     /// The PHP file ePHPm runs before every request for this site, or `None`
     /// when this deploy has nothing to prepend.
     pub auto_prepend_file: Option<PrependFile>,
+    /// The `[preview_auth]` gate section, or `None` for an ungated preview.
+    ///
+    /// `Some` turns the per-site OAuth/​share gate on. Writing it for a private
+    /// preview is the whole point of the access gate; a private preview whose
+    /// override lacks this section comes up world-readable, which the deployer
+    /// refuses to let happen silently (fail closed).
+    pub preview_auth: Option<PreviewAuthSection>,
 }
 
 /// Validate a manifest's `docroot:` against the checkout it describes.
@@ -318,10 +413,13 @@ fn validate_contained(
 
 /// Render the override file's contents for a validated declaration.
 ///
-/// Two keys, both of which ePHPm implements as typed fields since #472 — no
-/// forward-looking keys. `document_root` is emitted only when it *narrows* the
-/// web root: ePHPm reads an absent key and an explicit `"."` identically, and
-/// the absent spelling is the one every ePHPm ever shipped agrees on.
+/// The two top-level keys (`document_root`, `auto_prepend_file`) are ePHPm typed
+/// fields since #472; the optional `[preview_auth]` table is the access-gate
+/// activation added in ephpm#487/#491. `document_root` is emitted only when it
+/// *narrows* the web root: ePHPm reads an absent key and an explicit `"."`
+/// identically, and the absent spelling is the one every ePHPm ever shipped
+/// agrees on. The `[preview_auth]` table is emitted **last** — a TOML table must
+/// follow all top-level keys, or those keys would parse as belonging to it.
 #[must_use]
 pub fn render_override(over: &SiteOverride) -> String {
     let mut out = String::from(
@@ -336,6 +434,16 @@ pub fn render_override(over: &SiteOverride) -> String {
     }
     if let Some(prepend) = &over.auto_prepend_file {
         out.push_str(&format!("auto_prepend_file = \"{}\"\n", prepend.declared()));
+    }
+    if let Some(auth) = &over.preview_auth {
+        // The secret is a REFERENCE (env:/file:), never the key — this file is
+        // derived from tenant-controlled repository content, so nothing sensitive
+        // is written into it. Both strings are validated by `PreviewAuthSection`.
+        out.push_str(&format!(
+            "\n[preview_auth]\nsession_secret = \"{}\"\nlogin_url = \"{}\"\n",
+            auth.session_secret_ref(),
+            auth.login_url(),
+        ));
     }
     out
 }
@@ -793,7 +901,112 @@ mod tests {
         SiteOverride {
             document_root,
             auto_prepend_file,
+            preview_auth: None,
         }
+    }
+
+    // ── the [preview_auth] gate section (ephpm#487/#491) ────────────────
+
+    #[test]
+    fn preview_auth_section_renders_after_the_top_level_keys() {
+        let c = laravel_checkout();
+        let root = validate_docroot(&c.root, "public").unwrap();
+        write_prepend(&c.root, ".ephpm-preview-prepend.php");
+        let prepend = validate_prepend(&c.root, ".ephpm-preview-prepend.php").unwrap();
+        let auth = PreviewAuthSection::new(
+            "env:EPHPM_PREVIEW_SESSION_SECRET",
+            "/_ephpm/auth/github/login",
+        )
+        .unwrap();
+
+        let over = SiteOverride {
+            document_root: root,
+            auto_prepend_file: Some(prepend),
+            preview_auth: Some(auth),
+        };
+        let text = render_override(&over);
+
+        // The reference is written, not a literal secret.
+        assert!(
+            text.contains("session_secret = \"env:EPHPM_PREVIEW_SESSION_SECRET\""),
+            "the file must carry the reference, never the key: {text}"
+        );
+        assert!(
+            text.contains("login_url = \"/_ephpm/auth/github/login\""),
+            "{text}"
+        );
+
+        // The table header must come after the two top-level keys, or TOML would
+        // read `document_root`/`auto_prepend_file` as members of the table.
+        let table_at = text.find("[preview_auth]").expect("the table is present");
+        assert!(
+            text.find("document_root").unwrap() < table_at
+                && text.find("auto_prepend_file").unwrap() < table_at,
+            "top-level keys must precede the table: {text}"
+        );
+    }
+
+    /// A `docroot: "."` private preview writes no `document_root` but still gates:
+    /// the section is what makes the preview private, and it must be present.
+    #[test]
+    fn preview_auth_can_gate_a_container_docroot_preview() {
+        let auth = PreviewAuthSection::new(
+            "env:EPHPM_PREVIEW_SESSION_SECRET",
+            "/_ephpm/auth/github/login",
+        )
+        .unwrap();
+        let over = SiteOverride {
+            document_root: DocumentRoot::Container,
+            auto_prepend_file: None,
+            preview_auth: Some(auth),
+        };
+        let text = render_override(&over);
+        assert!(!text.contains("document_root"));
+        assert!(text.contains("[preview_auth]"), "{text}");
+    }
+
+    #[test]
+    fn ungated_preview_writes_no_preview_auth_section() {
+        let c = laravel_checkout();
+        let root = validate_docroot(&c.root, "public").unwrap();
+        let text = render_override(&over(root, None));
+        assert!(
+            !text.contains("preview_auth"),
+            "a public/ungated preview must not carry the section: {text}"
+        );
+    }
+
+    #[test]
+    fn preview_auth_refuses_a_toml_injecting_reference() {
+        // A quote or newline in the reference would close the TOML string.
+        for bad in [
+            "env:X\"\nsomething_evil = \"y",
+            "env:X\ndocument_root = \"..",
+            "env:X\\bad",
+        ] {
+            assert!(
+                PreviewAuthSection::new(bad, "/_ephpm/auth/github/login").is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_auth_login_url_must_be_absolute() {
+        assert!(
+            PreviewAuthSection::new("env:SECRET", "login").is_err(),
+            "a relative login_url must be refused"
+        );
+        assert!(
+            PreviewAuthSection::new("env:SECRET", "https://evil/login").is_err(),
+            "an absolute URL (not a path) is refused — login_url is a path under /_ephpm/auth"
+        );
+        assert!(PreviewAuthSection::new("env:SECRET", "/_ephpm/auth/github/login").is_ok());
+    }
+
+    #[test]
+    fn preview_auth_refuses_an_empty_reference() {
+        assert!(PreviewAuthSection::new("   ", "/_ephpm/auth/github/login").is_err());
     }
 
     /// The rendered file must be exactly what ePHPm's `site_overrides::load`
