@@ -129,6 +129,16 @@ pub struct TeardownContext<'a> {
     /// node leaves some artifact classes behind. Turns the failure above into a
     /// `WARN` naming the same artifacts.
     pub allow_incomplete: bool,
+
+    // ── share-link revocation (ephpm#487/#491) ─────────────────────────
+    /// ePHPm's `[kv] secret`, used to derive the per-site RESP password so the
+    /// share-link revocation epoch can be written into the preview's KV keyspace.
+    /// `None` skips KV revocation entirely (logged) — removing the override and
+    /// the checkout is already the primary revocation on this node.
+    pub kv_secret: Option<&'a str>,
+    /// ePHPm's KV RESP listener (`[kv.redis_compat] listen`, default
+    /// `127.0.0.1:6379`). Only consulted when `kv_secret` is set.
+    pub kv_addr: &'a str,
 }
 
 /// Remove a preview deployment and every per-site artifact it left behind.
@@ -244,12 +254,62 @@ pub async fn teardown_preview(
         failures.push(format!("{e:#}"));
     }
 
+    // (6) Revoke every outstanding share link for this preview by bumping its
+    // per-site epoch (`preview:share:epoch` = now). Removing the override and the
+    // checkout above already stops the gate on THIS node, but the per-vhost KV is
+    // gossip-replicated and a preview can be redeployed, so the contract has the
+    // control plane bump the epoch too — it kills all links at once, cluster-wide.
+    //
+    // Best-effort by design: a failed KV write must NOT fail the teardown, or an
+    // unreachable KV port would strand the preview's on-disk artifacts (the
+    // opposite of teardown's job). It is skipped, with a line, when switchboard
+    // has not been told the KV secret.
+    revoke_share_links(ctx, site_key).await;
+
     anyhow::ensure!(
         failures.is_empty(),
         "teardown of {site_key} left artifacts behind: {}",
         failures.join("; ")
     );
     Ok(())
+}
+
+/// Revoke every outstanding share link for `site_key` by bumping its per-site
+/// revocation epoch, best-effort.
+///
+/// Skipped (with an info line) when `--kv-secret-file` is not configured: without
+/// ePHPm's `[kv] secret` switchboard cannot derive the per-site RESP password, and
+/// removing the override + checkout is already the primary revocation. A KV write
+/// that fails (listener down, wrong secret) is a `warn!`, never a teardown
+/// failure — see [`crate::kv`].
+async fn revoke_share_links(ctx: &TeardownContext<'_>, site_key: &str) {
+    let Some(kv_secret) = ctx.kv_secret else {
+        tracing::debug!(
+            %site_key,
+            "share-link revocation epoch not bumped: --kv-secret-file is not configured. \
+             The override and checkout removal above already revoke share links on this node"
+        );
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let revoker = crate::kv::KvRevoker::new(ctx.kv_addr, kv_secret);
+    match revoker.bump_share_epoch(site_key, now).await {
+        Ok(()) => tracing::info!(
+            %site_key,
+            epoch = now,
+            "bumped the share-link revocation epoch — all outstanding share links for this \
+             preview are now refused"
+        ),
+        Err(e) => tracing::warn!(
+            %site_key,
+            error = %format!("{e:#}"),
+            "could not bump the share-link revocation epoch (best-effort). The override and \
+             checkout removal still revoke share links on this node; a leaked link on another \
+             cluster node would expire on its own"
+        ),
+    }
 }
 
 /// Record an artifact class this node is not configured to remove.
@@ -592,6 +652,8 @@ mod tests {
                 vhost_temp_base: Some(&self.temp_base),
                 state_dir: &self.state,
                 allow_incomplete: false,
+                kv_secret: None,
+                kv_addr: "127.0.0.1:6379",
             }
         }
 
@@ -797,6 +859,8 @@ mod tests {
             vhost_temp_base: Some(&f.temp_base),
             state_dir: &f.state,
             allow_incomplete: false,
+            kv_secret: None,
+            kv_addr: "127.0.0.1:6379",
         };
         let err = teardown_preview(&preview(site_key), &ctx)
             .await
@@ -844,6 +908,8 @@ mod tests {
             vhost_temp_base: Some(&f.temp_base),
             state_dir: &f.state,
             allow_incomplete: true,
+            kv_secret: None,
+            kv_addr: "127.0.0.1:6379",
         };
         teardown_preview(&preview(site_key), &ctx).await.unwrap();
 
@@ -876,6 +942,8 @@ mod tests {
             vhost_temp_base: Some(&f.temp_base),
             state_dir: &f.state,
             allow_incomplete: false,
+            kv_secret: None,
+            kv_addr: "127.0.0.1:6379",
         };
         let err = teardown_preview(&preview(site_key), &ctx)
             .await
@@ -889,6 +957,91 @@ mod tests {
         assert!(
             !f.sqlite.join(format!("{site_key}.db")).exists(),
             "the configured class is still reaped despite the failure"
+        );
+    }
+
+    // ── share-link revocation on teardown (ephpm#487/#491) ──────────────
+
+    /// **Teardown bumps the revocation epoch.** With a KV secret configured,
+    /// teardown writes `preview:share:epoch = now` into the preview's own KV
+    /// keyspace (AUTH'd as the site), killing every outstanding share link. A
+    /// minimal mock RESP server captures the frames and asserts the shape.
+    #[tokio::test]
+    async fn teardown_bumps_the_share_revocation_epoch() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kv_addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"+OK\r\n+OK\r\n").await.unwrap();
+            let mut buf = Vec::new();
+            sock.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        let f = Fixture::new().await;
+        let site_key = "ephpm-my-blog-pr-7";
+        f.deploy_artifacts(site_key).await;
+
+        let ctx = TeardownContext {
+            sites_dir: &f.sites,
+            sqlite_dir: Some(&f.sqlite),
+            site_overrides_dir: Some(&f.overrides),
+            vhost_temp_base: Some(&f.temp_base),
+            state_dir: &f.state,
+            allow_incomplete: false,
+            kv_secret: Some("master-secret"),
+            kv_addr: &kv_addr,
+        };
+        teardown_preview(&preview(site_key), &ctx).await.unwrap();
+
+        let received = server.await.unwrap();
+        let expected_pw = crate::preview_auth::derive_site_kv_password("master-secret", site_key);
+        assert!(
+            received.contains("AUTH"),
+            "must AUTH for the site: {received:?}"
+        );
+        assert!(
+            received.contains(site_key),
+            "AUTH scopes to the site's keyspace: {received:?}"
+        );
+        assert!(
+            received.contains(&expected_pw),
+            "AUTH uses the derived per-site password"
+        );
+        assert!(
+            received.contains("preview:share:epoch"),
+            "must set the epoch key: {received:?}"
+        );
+    }
+
+    /// A KV port that is down must NOT fail the teardown — revocation is
+    /// best-effort, and a hard failure would strand the on-disk artifacts.
+    #[tokio::test]
+    async fn an_unreachable_kv_does_not_fail_the_teardown() {
+        let f = Fixture::new().await;
+        let site_key = "ephpm-my-blog-pr-7";
+        f.deploy_artifacts(site_key).await;
+
+        let ctx = TeardownContext {
+            sites_dir: &f.sites,
+            sqlite_dir: Some(&f.sqlite),
+            site_overrides_dir: Some(&f.overrides),
+            vhost_temp_base: Some(&f.temp_base),
+            state_dir: &f.state,
+            allow_incomplete: false,
+            kv_secret: Some("master-secret"),
+            // A port nothing is listening on.
+            kv_addr: "127.0.0.1:1",
+        };
+        teardown_preview(&preview(site_key), &ctx)
+            .await
+            .expect("an unreachable KV must not fail the teardown (best-effort revocation)");
+        assert!(
+            !f.sites.join(site_key).exists(),
+            "the vhost dir is still removed"
         );
     }
 

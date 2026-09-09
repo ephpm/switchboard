@@ -177,21 +177,37 @@ from the site key by exact path — never a glob wider than the one site:
 In cluster mode every node's daemon runs the same teardown against its own
 disk, which is the complete story — each node reaps its own replicas.
 
-### Preview privacy is a known gap (not yet closed)
+### Preview privacy: the access gate
 
-A deployed preview currently serves to anyone who resolves its hostname — there
-is **no access gate on the preview URL**. Now that a private repository can be
-checked out (above), that means a private repo's preview is reachable by anyone
-who knows the hostname. This is stated rather than implied: it is a real
-exposure, and the fix is designed but not yet shipped.
+A **private** repo's preview must not be world-readable. It isn't: switchboard
+gates it (ephpm#487/#491). The enforcement lives in ePHPm — a per-site
+`preview-gate` middleware that redirects unauthenticated visitors to a GitHub
+login, runs on the static **and** PHP paths, and fails closed — because that is
+the request-phase layer that covers static files too, which an
+`auto_prepend_file` check never could. switchboard is the control plane:
 
-The gate belongs in ePHPm, not switchboard — it has to cover the static-file
-path as well as PHP and fail closed, which is the request-phase middleware layer
-ePHPm already has, and switchboard's only per-site channel (the two-key override
-file) is deliberately closed. The full design, threat model, and the companion
-ePHPm issue it depends on (ephpm/ephpm#487) are in [`docs/preview-access-gate.md`](docs/preview-access-gate.md).
-Until that lands, treat previews as world-readable and do not preview a
-repository whose mere contents are sensitive.
+- **Gating policy.** A private repo (`repository.private`, defaulting to private
+  when the job payload omits it — fail closed) is **always** gated. A public repo
+  is ungated by default, gated only with `--gate-public-previews`.
+- **Activation.** For a gated preview switchboard writes a `[preview_auth]`
+  section into the same per-site override it already writes `document_root` /
+  `auto_prepend_file` into — carrying a `session_secret` **reference** (never the
+  key) and the issuer's `login_url`.
+- **Share links.** With `--share-link`, switchboard mints a short-lived,
+  per-preview, revocable `via:"share"` HS256 capability token for people without
+  repo access and posts `…/?ephpm_share=<token>` in the PR comment, with the
+  bearer-capability warning stated plainly.
+- **Revocation.** On teardown switchboard bumps the per-site epoch
+  (`preview:share:epoch`) in the preview's KV keyspace, killing every outstanding
+  share link (best-effort; needs `--kv-secret-file`).
+- **Fail closed.** A gated preview whose session secret cannot be resolved (or
+  that has nowhere to write the gate, i.e. no `--site-overrides-dir`) **fails the
+  deploy** — never an ungated open preview.
+
+The full design, threat model, operator config, and rollout ordering are in
+[`docs/preview-access-gate.md`](docs/preview-access-gate.md). The one-time fleet
+setup (the GitHub OAuth App and `EPHPM_PREVIEW_SESSION_SECRET`) is ePHPm node
+config, described there.
 
 ### Teardown is complete or it fails
 
@@ -323,6 +339,26 @@ a fork builds but every `${secret.NAME}` expands to the empty string (with a
 name-only warning). Fork **teardowns** are always processed; refusing them
 would strand previews on disk.
 
+### Preview access gate (ephpm#487/#491)
+
+See [Preview privacy: the access gate](#preview-privacy-the-access-gate) for what
+these do; the full design is in
+[`docs/preview-access-gate.md`](docs/preview-access-gate.md).
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--gate-public-previews` | `SWITCHBOARD_GATE_PUBLIC_PREVIEWS` | `false` | Gate **public** repos' previews too. Private repos are *always* gated regardless. |
+| `--preview-session-secret-ref` | `SWITCHBOARD_PREVIEW_SESSION_SECRET_REF` | `env:EPHPM_PREVIEW_SESSION_SECRET` | The `session_secret` **reference** (`env:NAME` / `file:/abs` / literal) written into a gated preview's `[preview_auth]` and resolved to mint share tokens. Must be the **same** reference the `github-auth` issuer uses and must resolve to ≥ 32 bytes — a gated deploy whose secret does not resolve **fails** (fail closed). The resolved value must be identical in the ePHPm and switchboard environments. |
+| `--share-link` | `SWITCHBOARD_SHARE_LINK` | `false` | Mint a temporary shareable-URL capability and post it in the PR comment for each **gated** deploy. Opt-in: a share link is a bearer capability. |
+| `--share-link-ttl-secs` | `SWITCHBOARD_SHARE_LINK_TTL_SECS` | `86400` | TTL for a minted share link. Kept short — expiry is the primary control. |
+| `--kv-secret-file` | `SWITCHBOARD_KV_SECRET_FILE` | *(none)* | File holding ePHPm's `[kv] secret`, used to derive the per-site RESP password so **teardown can bump the share-link revocation epoch**. Unset skips KV revocation (the override + checkout removal already revoke on this node). |
+| `--kv-addr` | `SWITCHBOARD_KV_ADDR` | `127.0.0.1:6379` | ePHPm's KV RESP listener (`[kv.redis_compat] listen`). Only used for revocation when `--kv-secret-file` is set. |
+
+The one-time fleet setup this pairs with — the GitHub OAuth App, the global
+`github-auth` mount, and `EPHPM_PREVIEW_SESSION_SECRET` (≥ 32 bytes) in the ePHPm
+**and** switchboard environments — is ePHPm node config, not switchboard's; it is
+described in [`docs/preview-access-gate.md`](docs/preview-access-gate.md).
+
 ### GitHub reporting (optional)
 
 | Flag | Env | Default | Meaning |
@@ -401,8 +437,10 @@ pinned to the crate's MSRV on the ephpm org's self-hosted fleet.
 | `src/validate.rs` | Claim-time re-validation of a deploy job: the queue-age bound and the current-PR-state check |
 | `src/drain.rs` | The `/drain` kick and the shared-secret file |
 | `src/deployer.rs` | The provisioning pipeline: fetch → manifest → env → quarantine the manifest → per-site override → atomic swap → chown to tenant → build → seed → health. `build:`/`seed:` run sandboxed via `ephpm exec --site` (fail-closed if unsupported). |
-| `src/site_override.rs` | The per-site override ePHPm reads: validating `docroot:` and the env prepend against ePHPm's own containment rules, rendering the TOML, and writing it atomically |
-| `src/teardown.rs` | Preview teardown: vhost dir, per-site database, override file, vhost temp/session state root, the API's `applied/` marker — and the refusal to call a partial teardown a success |
+| `src/site_override.rs` | The per-site override ePHPm reads: validating `docroot:` and the env prepend against ePHPm's own containment rules, the `[preview_auth]` gate section, rendering the TOML, and writing it atomically |
+| `src/preview_auth.rs` | The access-gate control plane: gating policy, session-secret resolution (fail closed), wire-compatible HS256 share-token minting, and the per-site KV password derivation |
+| `src/kv.rs` | A tiny RESP2 client for bumping the share-link revocation epoch in a preview's KV keyspace on teardown (best-effort) |
+| `src/teardown.rs` | Preview teardown: vhost dir, per-site database, override file, vhost temp/session state root, the API's `applied/` marker, the share-link revocation epoch — and the refusal to call a partial teardown a success |
 | `src/manifest.rs` | The `ephpm.yaml` app manifest schema, and moving it out of the served root once read |
 | `src/secrets.rs` | `${secret.NAME}` resolution from switchboard's own store |
 | `src/github.rs` | PR comments and Deployment statuses (sticky via the hidden marker) |

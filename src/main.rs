@@ -22,7 +22,9 @@ mod deployer;
 mod drain;
 mod github;
 mod job;
+mod kv;
 mod manifest;
+mod preview_auth;
 mod queue;
 mod secrets;
 mod site_key;
@@ -55,6 +57,10 @@ use validate::Verdict;
 struct AppState {
     config: Config,
     secrets: Secrets,
+    /// ePHPm's `[kv] secret`, resolved once at startup from `--kv-secret-file`,
+    /// for deriving per-site RESP passwords when bumping the share-link
+    /// revocation epoch on teardown. `None` disables KV revocation.
+    kv_secret: Option<String>,
 }
 
 #[tokio::main]
@@ -150,6 +156,24 @@ async fn main() -> anyhow::Result<()> {
     // Load switchboard's own secret store (file + SWITCHBOARD_SECRET_* env).
     let secrets = Secrets::load(config.secrets_file.as_deref())?;
 
+    // Resolve ePHPm's [kv] secret once, for share-link revocation on teardown.
+    // Absent is fine (KV revocation is then skipped); a configured-but-unreadable
+    // file fails startup rather than silently disabling revocation.
+    let kv_secret = config.kv_secret()?;
+    match (&kv_secret, config.gate_public_previews) {
+        (Some(_), _) => info!("share-link revocation enabled (KV secret configured)"),
+        (None, _) => info!(
+            "share-link revocation via KV is not configured (--kv-secret-file unset); \
+             teardown still revokes by removing the override and checkout"
+        ),
+    }
+    info!(
+        gate_public = config.gate_public_previews,
+        share_link = config.share_link,
+        secret_ref = %config.preview_session_secret_ref,
+        "preview access gate: private repos are always gated"
+    );
+
     // Build the drain kicker before anything else runs: a missing token file
     // should fail at startup, not silently warn every two seconds forever.
     let kicker = if config.drain_enabled() {
@@ -179,7 +203,11 @@ async fn main() -> anyhow::Result<()> {
     let webhook_server_enabled = config.webhook_server_enabled;
     let listen = config.listen.clone();
 
-    let state = Arc::new(AppState { config, secrets });
+    let state = Arc::new(AppState {
+        config,
+        secrets,
+        kv_secret,
+    });
 
     if let Some(kicker) = kicker {
         tokio::spawn(drain_loop(kicker, drain_interval));
@@ -445,6 +473,10 @@ async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result
         fetch_token: fetch_token.as_deref(),
         health_timeout: Duration::from_secs(state.config.health_timeout_secs),
         health_interval: Duration::from_secs(state.config.health_interval_secs),
+        gate_public_previews: state.config.gate_public_previews,
+        preview_session_secret_ref: &state.config.preview_session_secret_ref,
+        mint_share_link: state.config.share_link,
+        share_token_ttl: state.config.share_token_ttl(),
     };
     let result = deployer::deploy_preview(req, &ctx).await?;
 
@@ -476,6 +508,8 @@ async fn handle_teardown(state: &AppState, req: &PreviewRequest) -> anyhow::Resu
         vhost_temp_base: state.config.vhost_temp_base.as_deref(),
         state_dir: &state.config.state_dir,
         allow_incomplete: state.config.allow_incomplete_teardown,
+        kv_secret: state.kv_secret.as_deref(),
+        kv_addr: &state.config.kv_addr,
     };
     // The same derivation the deploy used — teardown must remove the artifacts
     // that were actually created, which on a node without a

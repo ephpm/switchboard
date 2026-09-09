@@ -82,6 +82,23 @@ pub struct JobRepository {
     /// `https://` clone URL of the **base** repo — the fetch source, because
     /// `refs/pull/<n>/head` resolves there even for forks.
     pub clone_url: String,
+    /// Whether the base repository is **private** (`repository.private` in the
+    /// GitHub payload; switchboard-api copies it into the job file).
+    ///
+    /// **Absent means private** (fail closed): a private repo's preview must be
+    /// access-gated, and a job document lacking the field has unproven visibility.
+    /// switchboard-api has emitted `private` since it began writing schema-1 jobs
+    /// (it is in the README's own example), so a document without it was either
+    /// not written by the API or predates it — either way, defaulting to private
+    /// gates a preview that might otherwise leak, and the worst case for a genuinely
+    /// public repo is a login prompt.
+    #[serde(default = "private_when_absent")]
+    pub private: bool,
+}
+
+/// Serde default for [`JobRepository::private`]: absent ⇒ private (fail closed).
+fn private_when_absent() -> bool {
+    true
 }
 
 /// The pull request.
@@ -184,6 +201,7 @@ impl Job {
             sha: self.pull_request.head.sha.clone(),
             installation_id: self.installation_id,
             fork: self.pull_request.fork,
+            private: self.repository.private,
         }
     }
 }
@@ -286,6 +304,47 @@ mod tests {
             "absent fork must deserialize as true"
         );
         assert!(job.to_preview_request().fork);
+    }
+
+    #[test]
+    fn public_repo_reaches_the_request_as_not_private() {
+        // The sample says "private": false.
+        let job = Job::parse(sample_json("l", "deploy").as_bytes()).unwrap();
+        assert!(!job.repository.private);
+        assert!(
+            !job.to_preview_request().private,
+            "a public repo is not gated"
+        );
+    }
+
+    #[test]
+    fn private_repo_reaches_the_request() {
+        let doc = sample_json("l", "deploy").replace("\"private\": false", "\"private\": true");
+        let job = Job::parse(doc.as_bytes()).unwrap();
+        assert!(job.repository.private);
+        assert!(
+            job.to_preview_request().private,
+            "a private repo must reach the deployer so its preview is gated"
+        );
+    }
+
+    /// **Absent visibility fails closed.** A schema-1 job with no `private` field
+    /// is treated as private — its preview is gated rather than published open.
+    #[test]
+    fn absent_private_field_is_treated_as_private() {
+        // Drop the whole `, "private": false` tail (comma included) so the JSON
+        // stays valid without the field.
+        let doc = sample_json("l", "deploy").replace(",\n                \"private\": false", "");
+        assert!(
+            !doc.contains("\"private\""),
+            "test setup must drop the field"
+        );
+        let job = Job::parse(doc.as_bytes()).expect("private is optional, not required");
+        assert!(
+            job.repository.private,
+            "absent visibility must default to private (fail closed)"
+        );
+        assert!(job.to_preview_request().private);
     }
 
     #[test]

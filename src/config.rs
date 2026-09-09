@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -206,6 +207,62 @@ pub struct Config {
     #[arg(long, default_value_t = false, env = "SWITCHBOARD_FORK_SECRETS")]
     pub fork_secrets: bool,
 
+    // ── preview access gate (ephpm#487/#491) ──────────────────────────
+    /// Gate **public** repos' previews too. Private repos are *always* gated (a
+    /// private repo's preview must not be world-readable); this widens the policy
+    /// to public code as well — for keeping unreleased work off the open internet.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "SWITCHBOARD_GATE_PUBLIC_PREVIEWS"
+    )]
+    pub gate_public_previews: bool,
+
+    /// The `session_secret` **reference** written into a gated preview's
+    /// `[preview_auth]` section and resolved by switchboard to mint share tokens.
+    ///
+    /// Accepts `env:NAME` (default), `file:/abs/path`, or a literal (discouraged —
+    /// the reference should point at a secret, not be one, since it is written
+    /// into the tenant-adjacent override file). It **must** be the same reference
+    /// the `github-auth` issuer resolves, so the two derive one shared key, and it
+    /// must resolve to ≥ 32 bytes or a gated deploy fails (fail closed). The
+    /// resolved value must be identical in the ePHPm and switchboard process
+    /// environments — the operator sets `EPHPM_PREVIEW_SESSION_SECRET` for both.
+    #[arg(
+        long,
+        default_value = "env:EPHPM_PREVIEW_SESSION_SECRET",
+        env = "SWITCHBOARD_PREVIEW_SESSION_SECRET_REF"
+    )]
+    pub preview_session_secret_ref: String,
+
+    /// Mint a temporary shareable-URL capability and post it in the PR comment for
+    /// each **gated** deploy. Off by default: a share link is a bearer capability
+    /// (anyone with it is in until expiry), so advertising one on every gated PR is
+    /// an explicit opt-in.
+    #[arg(long, default_value_t = false, env = "SWITCHBOARD_SHARE_LINK")]
+    pub share_link: bool,
+
+    /// TTL (seconds) for a minted share link. Kept short — expiry is the primary
+    /// control, so a leaked link self-heals. Default 1 day.
+    #[arg(
+        long,
+        default_value_t = 86_400,
+        env = "SWITCHBOARD_SHARE_LINK_TTL_SECS"
+    )]
+    pub share_link_ttl_secs: u64,
+
+    /// Path to a file holding ePHPm's `[kv] secret`, used to derive the per-site
+    /// RESP password so **teardown can bump the share-link revocation epoch** in a
+    /// preview's KV keyspace. Unset skips KV revocation (the override + checkout
+    /// removal already revoke on this node; a clustered leak self-heals at expiry).
+    #[arg(long, env = "SWITCHBOARD_KV_SECRET_FILE")]
+    pub kv_secret_file: Option<PathBuf>,
+
+    /// ePHPm's KV RESP listener address (`[kv.redis_compat] listen`). Only used
+    /// for share-link revocation when `--kv-secret-file` is set.
+    #[arg(long, default_value = "127.0.0.1:6379", env = "SWITCHBOARD_KV_ADDR")]
+    pub kv_addr: String,
+
     // ── GitHub reporting (optional) ────────────────────────────────────
     /// GitHub App private key path (PEM file). Omit to run without GitHub
     /// reporting — deploys still happen, they are just not reported on the PR.
@@ -260,6 +317,37 @@ impl Config {
     #[must_use]
     pub fn github_reporting_enabled(&self) -> bool {
         self.app_id.is_some() && self.app_key.is_some()
+    }
+
+    /// The TTL applied to a minted share link.
+    #[must_use]
+    pub fn share_token_ttl(&self) -> Duration {
+        Duration::from_secs(self.share_link_ttl_secs.max(1))
+    }
+
+    /// Resolve ePHPm's `[kv] secret` from `--kv-secret-file`, for deriving the
+    /// per-site RESP password used to bump the share-link revocation epoch.
+    ///
+    /// `Ok(None)` when no file is configured — KV revocation is then skipped
+    /// (the override + checkout removal already revoke on this node). The value is
+    /// trimmed to match how ePHPm reads its own secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is configured but cannot be read, or is empty.
+    pub fn kv_secret(&self) -> anyhow::Result<Option<String>> {
+        let Some(path) = &self.kv_secret_file else {
+            return Ok(None);
+        };
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read --kv-secret-file {}", path.display()))?;
+        let secret = raw.trim().to_string();
+        anyhow::ensure!(
+            !secret.is_empty(),
+            "--kv-secret-file {} is empty — it must hold ePHPm's [kv] secret",
+            path.display()
+        );
+        Ok(Some(secret))
     }
 
     /// ePHPm's `sites_domain_suffix` for this node, resolved.
@@ -719,6 +807,80 @@ mod tests {
         assert!(c.allow_fork_deploy);
         assert!(!c.fork_secrets);
         c.validate().unwrap();
+    }
+
+    // ── preview access gate (ephpm#487/#491) ───────────────────────────
+
+    #[test]
+    fn access_gate_defaults_are_safe() {
+        let c = parse_single_node(&[]);
+        assert!(
+            !c.gate_public_previews,
+            "public previews are ungated by default; private are always gated"
+        );
+        assert_eq!(
+            c.preview_session_secret_ref, "env:EPHPM_PREVIEW_SESSION_SECRET",
+            "the default reference matches the issuer's, one source of truth"
+        );
+        assert!(
+            !c.share_link,
+            "share links are opt-in (a bearer capability)"
+        );
+        assert_eq!(c.share_link_ttl_secs, 86_400);
+        assert_eq!(c.share_token_ttl(), Duration::from_secs(86_400));
+        assert_eq!(c.kv_addr, "127.0.0.1:6379");
+        assert!(
+            c.kv_secret_file.is_none(),
+            "no KV revocation unless configured"
+        );
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn access_gate_flags_parse() {
+        let c = parse_single_node(&[
+            "--gate-public-previews",
+            "--preview-session-secret-ref",
+            "file:/etc/switchboard/preview.key",
+            "--share-link",
+            "--share-link-ttl-secs",
+            "3600",
+            "--kv-secret-file",
+            "/etc/ephpm/kv.secret",
+            "--kv-addr",
+            "127.0.0.1:7000",
+        ]);
+        assert!(c.gate_public_previews);
+        assert_eq!(
+            c.preview_session_secret_ref,
+            "file:/etc/switchboard/preview.key"
+        );
+        assert!(c.share_link);
+        assert_eq!(c.share_token_ttl(), Duration::from_secs(3600));
+        assert_eq!(
+            c.kv_secret_file,
+            Some(PathBuf::from("/etc/ephpm/kv.secret"))
+        );
+        assert_eq!(c.kv_addr, "127.0.0.1:7000");
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn kv_secret_is_none_when_unconfigured_and_read_when_set() {
+        let none = parse_single_node(&[]);
+        assert!(none.kv_secret().unwrap().is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kv.secret");
+        std::fs::write(&path, "  the-kv-secret\n").unwrap();
+        let c = parse_single_node(&["--kv-secret-file", path.to_str().unwrap()]);
+        assert_eq!(c.kv_secret().unwrap().as_deref(), Some("the-kv-secret"));
+
+        std::fs::write(&path, "   \n").unwrap();
+        assert!(
+            c.kv_secret().is_err(),
+            "an empty KV secret file is an error"
+        );
     }
 
     #[test]

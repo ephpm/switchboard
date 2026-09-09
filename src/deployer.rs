@@ -42,6 +42,7 @@ use anyhow::Context;
 use tokio::process::Command;
 
 use crate::manifest::AppManifest;
+use crate::preview_auth;
 use crate::secrets::Secrets;
 use crate::site_override;
 
@@ -153,6 +154,13 @@ pub struct PreviewRequest {
     /// True when the PR head comes from a fork (or the head repo is gone).
     /// Gates deploys and secret resolution — see [`fork_deploy_gate`].
     pub fork: bool,
+    /// Whether the **base** repository is private (`repository.private` in the
+    /// webhook/job payload). A private repo's preview must be access-gated so it
+    /// is not world-readable — see [`crate::preview_auth::should_gate`]. **Absent
+    /// means private** at the job boundary (fail closed): switchboard-api emits
+    /// the field, so a document without it has unproven visibility and is treated
+    /// as private rather than published open.
+    pub private: bool,
 }
 
 impl PreviewRequest {
@@ -266,6 +274,24 @@ pub struct DeployContext<'a> {
     pub health_timeout: Duration,
     /// Interval between health poll attempts.
     pub health_interval: Duration,
+
+    // ── preview access gate (ephpm#487/#491) ───────────────────────────
+    /// Gate **public** repos' previews too. Private repos are always gated; this
+    /// only widens the policy to public code (`--gate-public-previews`).
+    pub gate_public_previews: bool,
+    /// The `session_secret` **reference** (`env:NAME` / `file:/abs` / literal)
+    /// shared with the `github-auth` issuer. Written verbatim into a gated
+    /// preview's `[preview_auth]` section, and resolved by switchboard to obtain
+    /// the bytes it mints share tokens with. A gated deploy whose secret cannot be
+    /// resolved to ≥ 32 bytes **fails** (fail closed) rather than shipping an open
+    /// preview.
+    pub preview_session_secret_ref: &'a str,
+    /// Mint a temporary shareable-URL capability and include it in the PR comment
+    /// for each **gated** deploy. Off by default: a share link is a bearer
+    /// capability, so posting one on every gated PR is opt-in.
+    pub mint_share_link: bool,
+    /// TTL for a minted share link. Kept short — expiry is the primary control.
+    pub share_token_ttl: Duration,
 }
 
 /// Result of a successful deployment.
@@ -281,6 +307,13 @@ pub struct DeployResult {
     /// Whether the health check passed within the timeout (false = timed out or
     /// health gating disabled).
     pub healthy: bool,
+    /// Whether this preview is access-gated (a `[preview_auth]` section was
+    /// written). Drives the PR comment's access guidance.
+    pub gated: bool,
+    /// A minted temporary shareable URL, when one was minted (gated deploy with
+    /// `--share-link`). Carries only the bearer token in its query string; the
+    /// signing secret never appears here.
+    pub share_url: Option<String>,
 }
 
 /// Deploy a preview.
@@ -349,8 +382,43 @@ pub async fn deploy_preview(
         hostname = %hostname,
         site_key = %site_key,
         site_dir = %site_dir.display(),
+        private = req.private,
         "deploying preview"
     );
+
+    // Preview access gate (ephpm#487/#491). Decide gating from the base repo's
+    // visibility, and — for a gated preview — resolve the shared session secret
+    // NOW, before anything is fetched or served. A private preview that comes up
+    // ungated is the exact exposure this feature exists to prevent, so a
+    // misconfigured gate (unresolvable/short secret) must FAIL the deploy here,
+    // not fall back to an open preview. The resolved bytes are reused to mint the
+    // optional share link after the health gate.
+    let gate = resolve_preview_gate(
+        req.private,
+        ctx.gate_public_previews,
+        ctx.preview_session_secret_ref,
+    )?;
+    let gated = gate.is_some();
+    let (preview_auth_section, session_secret) = match gate {
+        Some((section, secret)) => {
+            tracing::info!(
+                %hostname,
+                site_key = %site_key,
+                private = req.private,
+                "preview is access-gated — writing [preview_auth]; unauthenticated visitors \
+                 are redirected to GitHub login"
+            );
+            (Some(section), Some(secret))
+        }
+        None => {
+            tracing::info!(
+                %hostname,
+                site_key = %site_key,
+                "preview is public and ungated (set --gate-public-previews to gate public repos)"
+            );
+            (None, None)
+        }
+    };
 
     // (1) Fetch into a staging directory first, then move into place.
     let tmp_dir = site_dir.with_extension("tmp");
@@ -450,6 +518,7 @@ pub async fn deploy_preview(
     let over = site_override::SiteOverride {
         document_root,
         auto_prepend_file: Some(prepend),
+        preview_auth: preview_auth_section,
     };
     apply_site_override(ctx, &site_key, &over, &hostname).await?;
 
@@ -528,11 +597,36 @@ pub async fn deploy_preview(
     // (9) Health-gate: only report ready once the site serves a 200.
     let healthy = wait_healthy(&preview_url, &manifest.health, ctx).await;
 
+    // (10) Optionally mint a temporary share link for this gated preview. The
+    // token is a `via:"share"` bearer capability bound to this preview's site
+    // key; only the token travels (in the URL query), never the signing secret.
+    let share_url = match (gated && ctx.mint_share_link, session_secret.as_deref()) {
+        (true, Some(secret)) => {
+            let now = unix_now();
+            let ttl = ctx.share_token_ttl.as_secs().max(1);
+            let jti = preview_auth::generate_jti();
+            let token = preview_auth::mint_share_token(secret, &site_key, &jti, now, now + ttl);
+            tracing::info!(
+                %hostname,
+                site_key = %site_key,
+                ttl_secs = ttl,
+                "minted a temporary share link (bearer capability) for this gated preview"
+            );
+            Some(preview_auth::share_url(
+                &preview_url,
+                preview_auth::DEFAULT_SHARE_PARAM,
+                &token,
+            ))
+        }
+        _ => None,
+    };
+
     let duration = start.elapsed();
     tracing::info!(
         %hostname,
         framework = framework.as_str(),
         healthy,
+        gated,
         duration_ms = duration.as_millis(),
         "preview deployed"
     );
@@ -543,7 +637,55 @@ pub async fn deploy_preview(
         duration,
         php_version: Some(manifest.php),
         healthy,
+        gated,
+        share_url,
     })
+}
+
+/// Current unix time in whole seconds — the clock the share token's `iat`/`exp`
+/// use, and the same one ePHPm's gate compares against.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Decide the access-gate outcome for a deploy, and — for a gated preview —
+/// resolve the shared session secret.
+///
+/// Returns `Ok(None)` for an ungated preview, or `Ok(Some((section, secret)))`
+/// for a gated one: the `[preview_auth]` section to write and the resolved secret
+/// bytes to mint share tokens with.
+///
+/// **Fail closed** is the whole contract: a private preview (or any preview when
+/// `--gate-public-previews` is set) whose session secret cannot be resolved to a
+/// usable key is an `Err`, never an ungated deploy. This is the one decision that,
+/// gotten wrong, publishes private code — so it is a pure function with its own
+/// tests rather than a branch buried in the pipeline.
+///
+/// # Errors
+///
+/// Returns an error when the preview must be gated but the session-secret
+/// reference does not resolve to ≥ 32 bytes, or the resulting section is invalid.
+fn resolve_preview_gate(
+    repo_is_private: bool,
+    gate_public_previews: bool,
+    session_secret_ref: &str,
+) -> anyhow::Result<Option<(site_override::PreviewAuthSection, Vec<u8>)>> {
+    if !preview_auth::should_gate(repo_is_private, gate_public_previews) {
+        return Ok(None);
+    }
+    let secret = preview_auth::resolve_session_secret(session_secret_ref).context(
+        "refusing to deploy a gated preview without a usable session secret — a private \
+         preview must never come up ungated (fail closed). Set --preview-session-secret-ref \
+         (SWITCHBOARD_PREVIEW_SESSION_SECRET_REF) to a reference that resolves to ≥ 32 bytes, \
+         the same one the github-auth issuer uses",
+    )?;
+    let section = site_override::PreviewAuthSection::new(
+        session_secret_ref,
+        preview_auth::DEFAULT_LOGIN_URL,
+    )?;
+    Ok(Some((section, secret)))
 }
 
 /// Materialize the PR head at `req.sha` into `dest`.
@@ -1101,6 +1243,19 @@ async fn apply_site_override(
     }
 
     let Some(overrides_dir) = ctx.site_overrides_dir else {
+        // Fail CLOSED for a gated preview: the `[preview_auth]` section is the
+        // ONLY thing that makes the preview private, and the override file is the
+        // only channel for it. With nowhere to write it, serving the preview
+        // would publish private code world-readable — the exact exposure the gate
+        // exists to prevent. A public/ungated preview still degrades to a warning
+        // (it was already public).
+        anyhow::ensure!(
+            over.preview_auth.is_none(),
+            "refusing to deploy a gated (private) preview without --site-overrides-dir: the \
+             [preview_auth] gate can only be delivered through ePHPm's [server] \
+             site_overrides_dir, and serving this preview ungated would publish private code. \
+             Configure --site-overrides-dir (SWITCHBOARD_SITE_OVERRIDES_DIR)"
+        );
         tracing::warn!(
             %hostname,
             docroot = over.document_root.declared(),
@@ -1120,10 +1275,13 @@ async fn apply_site_override(
         site_key,
         docroot = over.document_root.declared(),
         auto_prepend_file = over.auto_prepend_file.as_ref().map(site_override::PrependFile::declared),
+        access_gated = over.preview_auth.is_some(),
         path = %path.display(),
-        "wrote per-site override (document root + env prepend). An ePHPm older \
-         than the auto_prepend_file key (ephpm#463) ignores that key with a \
-         warning and still honours the document root"
+        "wrote per-site override (document root + env prepend + optional access gate). \
+         An ePHPm older than the auto_prepend_file key (ephpm#463) ignores that key \
+         with a warning and still honours the document root; one predating the \
+         preview-gate (ephpm#487) ignores [preview_auth] — so the fleet must upgrade \
+         ePHPm before switchboard starts writing it (rollout ordering)"
     );
     Ok(())
 }
@@ -1593,6 +1751,7 @@ mod tests {
             sha: "0123456789abcdef0123456789abcdef01234567".into(),
             installation_id: None,
             fork: false,
+            private: false,
         }
     }
 
@@ -1748,6 +1907,7 @@ mod tests {
         let over = site_override::SiteOverride {
             document_root,
             auto_prepend_file: Some(prepend),
+            preview_auth: None,
         };
         let path = site_override::write_override(&overrides, "app-pr-7", &over)
             .await
@@ -1950,6 +2110,10 @@ mod tests {
             fetch_token: None,
             health_timeout: Duration::ZERO,
             health_interval: Duration::from_secs(1),
+            gate_public_previews: false,
+            preview_session_secret_ref: "env:EPHPM_PREVIEW_SESSION_SECRET",
+            mint_share_link: false,
+            share_token_ttl: Duration::from_secs(86_400),
         };
         assert!(!wait_healthy("https://example.invalid", "/", &ctx).await);
     }
@@ -1975,6 +2139,10 @@ mod tests {
             fetch_token: None,
             health_timeout: Duration::ZERO,
             health_interval: Duration::from_secs(1),
+            gate_public_previews: false,
+            preview_session_secret_ref: "env:EPHPM_PREVIEW_SESSION_SECRET",
+            mint_share_link: false,
+            share_token_ttl: Duration::from_secs(86_400),
         }
     }
 
@@ -1988,7 +2156,21 @@ mod tests {
             auto_prepend_file: Some(
                 site_override::validate_prepend(checkout, PREPEND_FILE).unwrap(),
             ),
+            preview_auth: None,
         }
+    }
+
+    /// A gated variant of [`staged_override`] carrying a valid `[preview_auth]`.
+    fn staged_gated_override(checkout: &Path, docroot: &str) -> site_override::SiteOverride {
+        let mut over = staged_override(checkout, docroot);
+        over.preview_auth = Some(
+            site_override::PreviewAuthSection::new(
+                "env:EPHPM_PREVIEW_SESSION_SECRET",
+                "/_ephpm/auth/github/login",
+            )
+            .unwrap(),
+        );
+        over
     }
 
     #[tokio::test]
@@ -2080,6 +2262,123 @@ mod tests {
         )
         .await
         .expect("an unconfigured overrides dir must not fail the deploy");
+    }
+
+    // ── the access gate: fail-closed activation (ephpm#487/#491) ─────────
+
+    /// A gated preview publishes a `[preview_auth]` section into the override.
+    #[tokio::test]
+    async fn gated_preview_writes_the_preview_auth_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let overrides = dir.path().join("overrides");
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let secrets = Secrets::default();
+        let ctx = override_ctx(dir.path(), Some(&overrides), &secrets);
+
+        apply_site_override(
+            &ctx,
+            "app-pr-1",
+            &staged_gated_override(&checkout, "public"),
+            "app-pr-1.preview.ephpm.dev",
+        )
+        .await
+        .unwrap();
+
+        let written = tokio::fs::read_to_string(overrides.join("app-pr-1.toml"))
+            .await
+            .unwrap();
+        assert!(written.contains("[preview_auth]"), "{written}");
+        assert!(
+            written.contains("session_secret = \"env:EPHPM_PREVIEW_SESSION_SECRET\""),
+            "the reference, never the key: {written}"
+        );
+        assert!(
+            written.contains("login_url = \"/_ephpm/auth/github/login\""),
+            "{written}"
+        );
+    }
+
+    /// **Fail closed.** A GATED preview with no `--site-overrides-dir` has nowhere
+    /// to deliver the gate, so serving it would publish private code. The deploy
+    /// must fail, not degrade to an open preview — unlike an ungated one, which
+    /// only warns (asserted by `missing_overrides_dir_warns_but_does_not_fail_the_deploy`).
+    #[tokio::test]
+    async fn gated_preview_without_overrides_dir_fails_the_deploy() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let secrets = Secrets::default();
+        let ctx = override_ctx(dir.path(), None, &secrets);
+
+        let err = apply_site_override(
+            &ctx,
+            "app-pr-1",
+            &staged_gated_override(&checkout, "public"),
+            "app-pr-1.preview.ephpm.dev",
+        )
+        .await
+        .expect_err("a gated preview with nowhere to write the gate must fail closed");
+        assert!(err.to_string().contains("--site-overrides-dir"), "{err}");
+        assert!(
+            err.to_string().contains("ungated"),
+            "the error must name the exposure it prevents: {err}"
+        );
+    }
+
+    // ── the gate decision (fail-closed) ─────────────────────────────────
+
+    #[test]
+    fn public_preview_is_not_gated() {
+        // A public repo with the default policy needs no secret at all.
+        assert!(
+            resolve_preview_gate(false, false, "env:DOES_NOT_MATTER")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// **The private-repo-with-no-secret fail-closed test.** A private preview
+    /// whose session secret does not resolve must be a hard error — never a
+    /// deploy that silently comes up ungated.
+    #[test]
+    fn private_preview_without_a_secret_fails_closed_not_open() {
+        let err = resolve_preview_gate(true, false, "env:EPHPM_TEST_GATE_DEFINITELY_UNSET")
+            .expect_err("a private preview with no usable secret must fail the deploy");
+        assert!(
+            err.to_string().contains("ungated"),
+            "the failure must be about not shipping an open preview: {err}"
+        );
+    }
+
+    #[test]
+    fn private_preview_with_a_good_secret_is_gated() {
+        let name = "EPHPM_TEST_GATE_SECRET_OK";
+        // SAFETY: unique name; test-local.
+        unsafe { std::env::set_var(name, "0123456789abcdef0123456789abcdef") };
+        let gate = resolve_preview_gate(true, false, &format!("env:{name}")).unwrap();
+        let (section, secret) = gate.expect("a private preview with a usable secret must gate");
+        assert_eq!(section.session_secret_ref(), format!("env:{name}"));
+        assert_eq!(section.login_url(), preview_auth::DEFAULT_LOGIN_URL);
+        assert_eq!(
+            secret.len(),
+            32,
+            "the resolved bytes are handed on for minting"
+        );
+        unsafe { std::env::remove_var(name) };
+    }
+
+    #[test]
+    fn public_preview_is_gated_when_the_operator_opts_in() {
+        let name = "EPHPM_TEST_GATE_SECRET_PUBLIC";
+        unsafe { std::env::set_var(name, "0123456789abcdef0123456789abcdef") };
+        assert!(
+            resolve_preview_gate(false, true, &format!("env:{name}"))
+                .unwrap()
+                .is_some(),
+            "--gate-public-previews gates a public repo too"
+        );
+        unsafe { std::env::remove_var(name) };
     }
 
     // ── build/seed run through `ephpm exec --site` (the root-RCE fix) ────
@@ -2377,6 +2676,7 @@ mod tests {
             sha: sha.to_owned(),
             installation_id: Some(42),
             fork: false,
+            private: false,
         }
     }
 

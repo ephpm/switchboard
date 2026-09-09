@@ -85,6 +85,17 @@ pub struct Repository {
     pub clone_url: String,
     pub name: String,
     pub owner: RepoOwner,
+    /// Whether the base repository is private. GitHub always sends this on a
+    /// `pull_request` webhook; defaulted to `true` (fail closed) for the same
+    /// reason as the job path — an absent value must not publish a private
+    /// preview open.
+    #[serde(default = "private_when_absent")]
+    pub private: bool,
+}
+
+/// Serde default for [`Repository::private`]: absent ⇒ private (fail closed).
+fn private_when_absent() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +134,7 @@ impl PullRequestEvent {
             sha: self.pull_request.head.sha.clone(),
             installation_id: self.installation.as_ref().map(|i| i.id),
             fork: self.is_fork(),
+            private: self.repository.private,
         }
     }
 
@@ -272,6 +284,7 @@ mod tests {
                 owner: RepoOwner {
                     login: "ephpm".into(),
                 },
+                private: false,
             },
             installation: None,
         }
@@ -293,6 +306,20 @@ mod tests {
         assert_eq!(req.fetch_ref.as_deref(), Some("refs/pull/42/head"));
         assert_eq!(req.sha, "abc123");
         assert_eq!(req.pr_number, 42);
+    }
+
+    #[test]
+    fn private_repo_flows_to_the_request() {
+        let mut event = event_with_head_repo(Some("ephpm/my-blog"));
+        assert!(
+            !event.to_preview_request().private,
+            "the sample repo is public"
+        );
+        event.repository.private = true;
+        assert!(
+            event.to_preview_request().private,
+            "a private base repo must reach the deployer so its preview is gated"
+        );
     }
 
     #[test]
@@ -385,6 +412,7 @@ mod tests {
                 clone_url: "x".into(),
                 name: "b".into(),
                 owner: RepoOwner { login: "a".into() },
+                private: false,
             },
             installation: None,
         };
@@ -417,6 +445,7 @@ mod tests {
                 clone_url: "x".into(),
                 name: "b".into(),
                 owner: RepoOwner { login: "a".into() },
+                private: false,
             },
             installation: None,
         };
