@@ -1,0 +1,64 @@
+name: Release binary
+
+# Builds a release Linux binary of switchboard and uploads it as a run
+# artifact so it can be downloaded and deployed to the preview nodes. There is
+# no GitHub Release and no signing — a downloadable artifact is the whole job.
+#
+# The binary MUST be built on the same `[self-hosted, linux, x64]` runner class
+# (the ephpm org's ephemerd fleet) that produced the node binaries, so it is
+# glibc-compatible with the nodes. Do NOT switch to musl or a container.
+#
+# Like ci.yml: "pure Rust" does not mean "no C toolchain" — transitive deps
+# (ring via reqwest's rustls stack, libc, proc-macro2 build scripts) need `cc`
+# on PATH, so we install build-essential first, mirroring ci.yml verbatim.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build release binary (linux-x64)
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build prerequisites
+        # Resolve the privilege-escalation method at run time — some fleet
+        # runners come up as root without `sudo`, others as non-root with it.
+        # (Pattern lifted verbatim from ci.yml.)
+        run: |
+          set -eu
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "apt-get unavailable; assuming the image already provides build prerequisites"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "::error::not running as root and sudo is unavailable"
+            exit 1
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends build-essential pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        # --locked so the build fails loudly if Cargo.lock is stale rather than
+        # silently resolving a different dependency graph than CI tested.
+        run: cargo build --release --locked
+      - name: Record version
+        id: version
+        run: |
+          set -eu
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: switchboard-linux-x64-${{ steps.version.outputs.sha }}
+          path: target/release/switchboard
+          if-no-files-found: error
