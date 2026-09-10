@@ -185,15 +185,40 @@ fn is_toml_string_safe(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c != '"' && c != '\\' && !c.is_control())
 }
 
+/// Whether `s` is a GitHub repository full name in the exact `owner/name` shape
+/// the preview gate keys on.
+///
+/// The gate compares this value against the repositories a logged-in GitHub user
+/// can read, so the shape has to be precise: **exactly one** `/`, both segments
+/// non-empty and neither a bare `.`/`..`, and every character drawn from the same
+/// conservative `[A-Za-z0-9._-]` set the path gates use — which also makes the
+/// value TOML-safe, since we hand-write it between quotes. Anything else (a space,
+/// a second slash, a quote, an empty half) is rejected rather than written, so a
+/// malformed base-repo identity fails the deploy here instead of producing a
+/// `[preview_auth]` section that gates against a repository name no user has.
+fn is_valid_repo_full_name(s: &str) -> bool {
+    let mut parts = s.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    // `split('/')` guarantees no segment contains `/`, so the shared
+    // `is_allowed_path_char` set (which permits `/`) can never admit one here.
+    let segment_ok = |seg: &str| {
+        !seg.is_empty() && seg != "." && seg != ".." && seg.chars().all(is_allowed_path_char)
+    };
+    segment_ok(owner) && segment_ok(name)
+}
+
 /// The `[preview_auth]` section that turns the per-site OAuth/​share gate ON for
 /// one preview (ephpm#487/#491).
 ///
 /// It carries deliberately little: a **reference** to the shared HS256 session
 /// secret (`env:NAME` / `file:/abs` / a literal — never the key itself, since this
-/// file is derived from tenant-controlled repository content) and the issuer's
-/// login entry point. Everything else (cookie name, `require_https`/`require_site`,
-/// `share_param`, revocation) uses the gate's defaults, which match what the
-/// global `github-auth` issuer mount uses. See
+/// file is derived from tenant-controlled repository content), the issuer's login
+/// entry point, and the preview's **base** repository (`owner/name`) that read
+/// access to it gates the preview. Everything else (cookie name,
+/// `require_https`/`require_site`, `share_param`, revocation) uses the gate's
+/// defaults, which match what the global `github-auth` issuer mount uses. See
 /// [`crate::preview_auth`] for the policy that decides *when* to write this and
 /// for the secret resolution/​minting that pairs with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,22 +230,32 @@ pub struct PreviewAuthSection {
     /// The issuer's login endpoint (`login_url`), an absolute path under
     /// `/_ephpm/auth/`.
     login_url: String,
+    /// The preview's **base** repository full name (`owner/name`). ePHPm gates the
+    /// preview to GitHub users with read access to this repository, so it is the
+    /// base repo — the one whose access policy the preview should inherit — never
+    /// a fork's. Validated to the exact `owner/name` shape (see
+    /// [`is_valid_repo_full_name`]).
+    repo: String,
 }
 
 impl PreviewAuthSection {
-    /// Build a validated section from a secret **reference** and a login URL.
+    /// Build a validated section from a secret **reference**, a login URL, and
+    /// the preview's base repository full name (`owner/name`).
     ///
     /// # Errors
     ///
-    /// Returns an error when the reference is empty or the login URL is not an
-    /// absolute (`/`-leading) path, or when either would be unsafe to write into
-    /// the hand-rolled TOML (a quote, backslash, or control character).
+    /// Returns an error when the reference is empty, the login URL is not an
+    /// absolute (`/`-leading) path, the repository is not in the exact
+    /// `owner/name` shape, or when any of them would be unsafe to write into the
+    /// hand-rolled TOML (a quote, backslash, or control character).
     pub fn new(
         session_secret_ref: impl Into<String>,
         login_url: impl Into<String>,
+        repo: impl Into<String>,
     ) -> anyhow::Result<Self> {
         let session_secret_ref = session_secret_ref.into();
         let login_url = login_url.into();
+        let repo = repo.into();
         let secret_ref = session_secret_ref.trim();
         anyhow::ensure!(
             !secret_ref.is_empty(),
@@ -240,9 +275,17 @@ impl PreviewAuthSection {
             is_toml_string_safe(login),
             "preview_auth login_url {login:?} contains a quote, backslash or control character"
         );
+        let repo = repo.trim();
+        anyhow::ensure!(
+            is_valid_repo_full_name(repo),
+            "preview_auth repo {repo:?} must be a GitHub repository full name in the exact \
+             `owner/name` shape (each segment [A-Za-z0-9._-], no spaces, quotes, backslashes \
+             or extra slashes)"
+        );
         Ok(Self {
             session_secret_ref: secret_ref.to_string(),
             login_url: login.to_string(),
+            repo: repo.to_string(),
         })
     }
 
@@ -256,6 +299,12 @@ impl PreviewAuthSection {
     #[must_use]
     pub fn login_url(&self) -> &str {
         &self.login_url
+    }
+
+    /// The base repository (`owner/name`) as it appears in the file.
+    #[must_use]
+    pub fn repo(&self) -> &str {
+        &self.repo
     }
 }
 
@@ -438,11 +487,14 @@ pub fn render_override(over: &SiteOverride) -> String {
     if let Some(auth) = &over.preview_auth {
         // The secret is a REFERENCE (env:/file:), never the key — this file is
         // derived from tenant-controlled repository content, so nothing sensitive
-        // is written into it. Both strings are validated by `PreviewAuthSection`.
+        // is written into it. `repo` is the base repository (`owner/name`) read
+        // access to which the gate uses to admit GitHub users. All three strings
+        // are validated by `PreviewAuthSection`.
         out.push_str(&format!(
-            "\n[preview_auth]\nsession_secret = \"{}\"\nlogin_url = \"{}\"\n",
+            "\n[preview_auth]\nsession_secret = \"{}\"\nlogin_url = \"{}\"\nrepo = \"{}\"\n",
             auth.session_secret_ref(),
             auth.login_url(),
+            auth.repo(),
         ));
     }
     out
@@ -916,6 +968,7 @@ mod tests {
         let auth = PreviewAuthSection::new(
             "env:EPHPM_PREVIEW_SESSION_SECRET",
             "/_ephpm/auth/github/login",
+            "ephpm/wordpress-sample",
         )
         .unwrap();
 
@@ -935,6 +988,12 @@ mod tests {
             text.contains("login_url = \"/_ephpm/auth/github/login\""),
             "{text}"
         );
+        // The base repo the gate keys on — the exact `owner/name` contract shared
+        // with ePHPm's preview-gate reader.
+        assert!(
+            text.contains("repo = \"ephpm/wordpress-sample\""),
+            "the section must carry the base repo full name: {text}"
+        );
 
         // The table header must come after the two top-level keys, or TOML would
         // read `document_root`/`auto_prepend_file` as members of the table.
@@ -953,6 +1012,7 @@ mod tests {
         let auth = PreviewAuthSection::new(
             "env:EPHPM_PREVIEW_SESSION_SECRET",
             "/_ephpm/auth/github/login",
+            "ephpm/wordpress-sample",
         )
         .unwrap();
         let over = SiteOverride {
@@ -963,6 +1023,7 @@ mod tests {
         let text = render_override(&over);
         assert!(!text.contains("document_root"));
         assert!(text.contains("[preview_auth]"), "{text}");
+        assert!(text.contains("repo = \"ephpm/wordpress-sample\""), "{text}");
     }
 
     #[test]
@@ -985,7 +1046,7 @@ mod tests {
             "env:X\\bad",
         ] {
             assert!(
-                PreviewAuthSection::new(bad, "/_ephpm/auth/github/login").is_err(),
+                PreviewAuthSection::new(bad, "/_ephpm/auth/github/login", "ephpm/app").is_err(),
                 "{bad:?} must be refused"
             );
         }
@@ -994,19 +1055,87 @@ mod tests {
     #[test]
     fn preview_auth_login_url_must_be_absolute() {
         assert!(
-            PreviewAuthSection::new("env:SECRET", "login").is_err(),
+            PreviewAuthSection::new("env:SECRET", "login", "ephpm/app").is_err(),
             "a relative login_url must be refused"
         );
         assert!(
-            PreviewAuthSection::new("env:SECRET", "https://evil/login").is_err(),
+            PreviewAuthSection::new("env:SECRET", "https://evil/login", "ephpm/app").is_err(),
             "an absolute URL (not a path) is refused — login_url is a path under /_ephpm/auth"
         );
-        assert!(PreviewAuthSection::new("env:SECRET", "/_ephpm/auth/github/login").is_ok());
+        assert!(
+            PreviewAuthSection::new("env:SECRET", "/_ephpm/auth/github/login", "ephpm/app").is_ok()
+        );
     }
 
     #[test]
     fn preview_auth_refuses_an_empty_reference() {
-        assert!(PreviewAuthSection::new("   ", "/_ephpm/auth/github/login").is_err());
+        assert!(PreviewAuthSection::new("   ", "/_ephpm/auth/github/login", "ephpm/app").is_err());
+    }
+
+    /// The base repo must be an exact `owner/name`: two non-empty segments and a
+    /// single slash. This is the shape ePHPm's gate reads, so a malformed value
+    /// (a bare name, an extra path segment, a `.git` suffix's slash, a URL) must
+    /// fail the deploy here rather than gate against a repository no user has.
+    #[test]
+    fn preview_auth_repo_must_be_owner_slash_name() {
+        for good in [
+            "ephpm/wordpress-sample",
+            "ephpm/app",
+            "octocat/Hello-World",
+            "a/b",
+            "owner/repo.name_with-punct",
+        ] {
+            assert!(
+                PreviewAuthSection::new("env:S", "/login", good).is_ok(),
+                "{good:?} is a valid owner/name and must be accepted"
+            );
+            assert_eq!(
+                PreviewAuthSection::new("env:S", "/login", good)
+                    .unwrap()
+                    .repo(),
+                good,
+                "the value round-trips verbatim"
+            );
+        }
+        for bad in [
+            "",
+            "   ",
+            "noslash",
+            "owner/",
+            "/name",
+            "owner/name/extra",
+            "owner//name",
+            "own er/name",
+            "owner /name",
+            "./name",
+            "owner/..",
+            "https://github.com/owner/name",
+        ] {
+            assert!(
+                PreviewAuthSection::new("env:S", "/login", bad).is_err(),
+                "{bad:?} is not an owner/name and must be refused"
+            );
+        }
+    }
+
+    /// A quote, backslash, newline or control character in the repo would close
+    /// the hand-rolled TOML string — the same injection class the reference and
+    /// login_url gates close. The charset gate refuses them all outright.
+    #[test]
+    fn preview_auth_repo_toml_injection_attempts_are_refused() {
+        for bad in [
+            "owner/name\"\nsomething_evil = \"y",
+            "owner/name\ndocument_root = \"..",
+            "owner\"/name",
+            "owner/na\\me",
+            "owner/name\u{0}",
+            "owner/name # comment",
+        ] {
+            assert!(
+                PreviewAuthSection::new("env:S", "/login", bad).is_err(),
+                "{bad:?} must be refused by the repo gate"
+            );
+        }
     }
 
     /// The rendered file must be exactly what ePHPm's `site_overrides::load`

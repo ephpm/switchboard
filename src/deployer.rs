@@ -397,6 +397,7 @@ pub async fn deploy_preview(
         req.private,
         ctx.gate_public_previews,
         ctx.preview_session_secret_ref,
+        &req.repo_full_name,
     )?;
     let gated = gate.is_some();
     let (preview_auth_section, session_secret) = match gate {
@@ -663,14 +664,22 @@ fn unix_now() -> u64 {
 /// gotten wrong, publishes private code — so it is a pure function with its own
 /// tests rather than a branch buried in the pipeline.
 ///
+/// `repo_full_name` is the preview's **base** repository (`owner/name`) — the one
+/// whose GitHub read access gates the preview. It is written into the
+/// `[preview_auth]` section verbatim, so a malformed value fails the deploy here
+/// (the section builder rejects anything but an exact `owner/name`) rather than
+/// shipping a gate that admits no one.
+///
 /// # Errors
 ///
 /// Returns an error when the preview must be gated but the session-secret
-/// reference does not resolve to ≥ 32 bytes, or the resulting section is invalid.
+/// reference does not resolve to ≥ 32 bytes, the base repo is not a valid
+/// `owner/name`, or the resulting section is otherwise invalid.
 fn resolve_preview_gate(
     repo_is_private: bool,
     gate_public_previews: bool,
     session_secret_ref: &str,
+    repo_full_name: &str,
 ) -> anyhow::Result<Option<(site_override::PreviewAuthSection, Vec<u8>)>> {
     if !preview_auth::should_gate(repo_is_private, gate_public_previews) {
         return Ok(None);
@@ -684,6 +693,10 @@ fn resolve_preview_gate(
     let section = site_override::PreviewAuthSection::new(
         session_secret_ref,
         preview_auth::DEFAULT_LOGIN_URL,
+        repo_full_name,
+    )
+    .context(
+        "refusing to deploy a gated preview whose base repository is not a valid owner/name",
     )?;
     Ok(Some((section, secret)))
 }
@@ -2167,6 +2180,7 @@ mod tests {
             site_override::PreviewAuthSection::new(
                 "env:EPHPM_PREVIEW_SESSION_SECRET",
                 "/_ephpm/auth/github/login",
+                "ephpm/wordpress-sample",
             )
             .unwrap(),
         );
@@ -2294,6 +2308,10 @@ mod tests {
             "the reference, never the key: {written}"
         );
         assert!(
+            written.contains("repo = \"ephpm/wordpress-sample\""),
+            "the base repo the gate keys on must be written: {written}"
+        );
+        assert!(
             written.contains("login_url = \"/_ephpm/auth/github/login\""),
             "{written}"
         );
@@ -2332,7 +2350,7 @@ mod tests {
     fn public_preview_is_not_gated() {
         // A public repo with the default policy needs no secret at all.
         assert!(
-            resolve_preview_gate(false, false, "env:DOES_NOT_MATTER")
+            resolve_preview_gate(false, false, "env:DOES_NOT_MATTER", "ephpm/app")
                 .unwrap()
                 .is_none()
         );
@@ -2343,8 +2361,13 @@ mod tests {
     /// deploy that silently comes up ungated.
     #[test]
     fn private_preview_without_a_secret_fails_closed_not_open() {
-        let err = resolve_preview_gate(true, false, "env:EPHPM_TEST_GATE_DEFINITELY_UNSET")
-            .expect_err("a private preview with no usable secret must fail the deploy");
+        let err = resolve_preview_gate(
+            true,
+            false,
+            "env:EPHPM_TEST_GATE_DEFINITELY_UNSET",
+            "ephpm/app",
+        )
+        .expect_err("a private preview with no usable secret must fail the deploy");
         assert!(
             err.to_string().contains("ungated"),
             "the failure must be about not shipping an open preview: {err}"
@@ -2356,14 +2379,44 @@ mod tests {
         let name = "EPHPM_TEST_GATE_SECRET_OK";
         // SAFETY: unique name; test-local.
         unsafe { std::env::set_var(name, "0123456789abcdef0123456789abcdef") };
-        let gate = resolve_preview_gate(true, false, &format!("env:{name}")).unwrap();
+        let gate = resolve_preview_gate(
+            true,
+            false,
+            &format!("env:{name}"),
+            "ephpm/wordpress-sample",
+        )
+        .unwrap();
         let (section, secret) = gate.expect("a private preview with a usable secret must gate");
         assert_eq!(section.session_secret_ref(), format!("env:{name}"));
         assert_eq!(section.login_url(), preview_auth::DEFAULT_LOGIN_URL);
         assert_eq!(
+            section.repo(),
+            "ephpm/wordpress-sample",
+            "the base repo the gate keys on is threaded into the section"
+        );
+        assert_eq!(
             secret.len(),
             32,
             "the resolved bytes are handed on for minting"
+        );
+        unsafe { std::env::remove_var(name) };
+    }
+
+    /// A gated preview whose base repo is not a clean `owner/name` fails the
+    /// deploy — even with a perfectly good secret — rather than writing a
+    /// `[preview_auth]` section that gates against a repository no GitHub user
+    /// can have read access to (which would lock everyone out, or, worse, be
+    /// discarded by ePHPm's reader and come up ungated).
+    #[test]
+    fn gated_preview_with_a_malformed_base_repo_fails_the_deploy() {
+        let name = "EPHPM_TEST_GATE_SECRET_BADREPO";
+        // SAFETY: unique name; test-local.
+        unsafe { std::env::set_var(name, "0123456789abcdef0123456789abcdef") };
+        let err = resolve_preview_gate(true, false, &format!("env:{name}"), "not-a-full-name")
+            .expect_err("a gated preview with an invalid base repo must fail, not gate");
+        assert!(
+            err.to_string().contains("owner/name"),
+            "the failure must name the shape it required: {err}"
         );
         unsafe { std::env::remove_var(name) };
     }
@@ -2373,7 +2426,7 @@ mod tests {
         let name = "EPHPM_TEST_GATE_SECRET_PUBLIC";
         unsafe { std::env::set_var(name, "0123456789abcdef0123456789abcdef") };
         assert!(
-            resolve_preview_gate(false, true, &format!("env:{name}"))
+            resolve_preview_gate(false, true, &format!("env:{name}"), "ephpm/app")
                 .unwrap()
                 .is_some(),
             "--gate-public-previews gates a public repo too"
