@@ -42,6 +42,7 @@ use anyhow::Context;
 use tokio::process::Command;
 
 use crate::analyze::{self, AnalyzeBlock, AnalyzeGateResult};
+use crate::kv;
 use crate::manifest::AppManifest;
 use crate::preview_auth;
 use crate::secrets::Secrets;
@@ -303,6 +304,17 @@ pub struct DeployContext<'a> {
     /// Wall-clock timeout for one `ephpm analyze` run. A run that exceeds it is
     /// killed and the preview is blocked (fail closed).
     pub analyze_timeout: Duration,
+    /// ePHPm's KV RESP listener address, for the **cluster-shared analyze verdict
+    /// cache** (the gate scans a commit once per cluster, not once per node).
+    pub kv_addr: &'a str,
+    /// ePHPm's `[kv] secret`, or `None` when `--kv-secret-file` is unset. `None`
+    /// disables the shared verdict cache — the gate then scans on every node
+    /// (fail-safe to today's behavior). Also used by teardown's share-link
+    /// revocation.
+    pub kv_secret: Option<&'a str>,
+    /// TTL applied to a published verdict in the shared cache. The head SHA is the
+    /// real invalidator; the TTL just garbage-collects old entries.
+    pub analyze_verdict_ttl: Duration,
 }
 
 /// Result of a successful deployment.
@@ -488,12 +500,34 @@ pub async fn deploy_preview(
     // the one artifact the ordinary deploy-failure path also leaves for the next
     // deploy to clean. The gate is a no-op (`Skipped`) when `--analyze-config`
     // is unset.
-    match analyze::run_gate(
+    //
+    // The verdict is identical on every node (pure function of repo + head SHA +
+    // gate config), so it is deduplicated through ePHPm's cluster-shared,
+    // gossip-replicated KV: the first node to scan a commit publishes its verdict
+    // and peers reuse it. The dedup fails SAFE — a KV read error scans locally —
+    // while the gate itself fails CLOSED. No cluster-shared KV (no
+    // `--kv-secret-file`) means each node scans, exactly as before.
+    let verdict_cache = ctx.kv_secret.map(|secret| {
+        kv::VerdictCache::new(
+            ctx.kv_addr,
+            secret,
+            site_key.clone(),
+            ctx.analyze_verdict_ttl,
+        )
+    });
+    let verdict_identity = analyze::VerdictIdentity {
+        repo: &req.repo_full_name,
+        pr: req.pr_number,
+        head_sha: &req.sha,
+    };
+    match analyze::run_gate_cached(
         ctx.ephpm_bin,
         ctx.analyze_config,
         ctx.analyze_timeout,
         &tmp_dir,
         &hostname,
+        verdict_cache.as_ref(),
+        &verdict_identity,
     )
     .await
     {
@@ -2205,6 +2239,9 @@ mod tests {
             share_token_ttl: Duration::from_secs(86_400),
             analyze_config: None,
             analyze_timeout: Duration::from_secs(180),
+            kv_addr: "127.0.0.1:6379",
+            kv_secret: None,
+            analyze_verdict_ttl: Duration::from_secs(86_400),
         };
         assert!(!wait_healthy("https://example.invalid", "/", &ctx).await);
     }
@@ -2236,6 +2273,9 @@ mod tests {
             share_token_ttl: Duration::from_secs(86_400),
             analyze_config: None,
             analyze_timeout: Duration::from_secs(180),
+            kv_addr: "127.0.0.1:6379",
+            kv_secret: None,
+            analyze_verdict_ttl: Duration::from_secs(86_400),
         }
     }
 

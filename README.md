@@ -214,6 +214,25 @@ swap simply never happens.
   line, message) — and the GitHub deployment status is set to **failure**. The
   job is left in `queue/claimed/` for inspection (marked failed), not cleared as
   a success; a later push re-runs the gate and refreshes the comment.
+- **Scanned once per commit, cluster-wide.** switchboard runs on every node and
+  each materializes the same checkout, so a naive gate would re-scan the identical
+  commit N times. The verdict is a pure function of (repo, PR head SHA, gate
+  config), so it is deduplicated through ePHPm's **gossip-replicated** KV: the
+  first node to scan a commit publishes its verdict under
+  `analyze:verdict:<repo>:<pr>:<head_sha>:<cfg_hash>` (in the preview's own
+  per-site keyspace, TTL `--analyze-verdict-ttl-secs`), and its peers reuse it —
+  reconstructing the identical block comment from the stored findings — instead of
+  re-scanning. `cfg_hash` is a fingerprint of the operator policy file, so editing
+  the policy re-scans everywhere. There is **no lock or leader wait**: if two nodes
+  miss at once and both scan, the result is identical, so the only cost is a
+  redundant scan — the same looseness the PR-comment dedup accepts.
+- **Fail closed on the gate, fail *safe* on the dedup.** A KV **read** error scans
+  locally (never skip the gate because coordination failed); a KV **write** error
+  proceeds with the local verdict (never block a deploy because publishing the
+  shared verdict failed). Coordination failure degrades to "each node scans
+  itself", never to "serve unscanned". The shared cache is active only when
+  `--analyze-config` **and** `--kv-secret-file` are both set (the KV secret derives
+  the per-site RESP password); without the secret, each node scans independently.
 
 A **reviewed example policy** is in
 [`docs/analyze-gate.example.yml`](docs/analyze-gate.example.yml). It enables the
@@ -404,10 +423,13 @@ a reviewed example policy.
 |---|---|---|---|
 | `--analyze-config` | `SWITCHBOARD_ANALYZE_CONFIG` | *(none)* | Operator `ephpm analyze` policy file. **Unset disables the gate** (deploys behave as before; startup `WARN`s). When set, every deploy runs `ephpm analyze <checkout> --config <this> --format sarif` before the swap and blocks on a bad verdict. Passed with an explicit `--config` so a PR's own `.ephpm-analyze.yml` cannot neuter it — keep it **outside** any tenant docroot, with absolute paths inside. |
 | `--analyze-timeout-secs` | `SWITCHBOARD_ANALYZE_TIMEOUT_SECS` | `180` | Wall-clock timeout for one `ephpm analyze` run. A run that exceeds it is killed and the deploy is **blocked** (fail closed). Only consulted when `--analyze-config` is set. |
+| `--analyze-verdict-ttl-secs` | `SWITCHBOARD_ANALYZE_VERDICT_TTL_SECS` | `86400` | TTL for a verdict published to the cluster-shared cache. The head SHA is the real invalidator; the TTL just GCs old entries. The shared cache needs `--kv-secret-file` too; without it each node scans independently. |
 
 Exit-code contract (from `ephpm analyze`): `0` publishes; `2` (quarantine) and
 `3` (deny) block; `1` (analyzer error), any other code, and a timeout all block
-(fail closed). The gate reuses `--ephpm-bin`, which must support `analyze`.
+(fail closed). The gate reuses `--ephpm-bin`, which must support `analyze`. When
+`--kv-secret-file` is set the verdict is deduplicated cluster-wide (scanned once
+per commit; peers reuse the shared verdict, fail-safe to per-node scanning).
 
 ### Preview access gate (ephpm#487/#491)
 
@@ -421,7 +443,7 @@ these do; the full design is in
 | `--preview-session-secret-ref` | `SWITCHBOARD_PREVIEW_SESSION_SECRET_REF` | `env:EPHPM_PREVIEW_SESSION_SECRET` | The `session_secret` **reference** (`env:NAME` / `file:/abs` / literal) written into a gated preview's `[preview_auth]` and resolved to mint share tokens. Must be the **same** reference the `github-auth` issuer uses and must resolve to ≥ 32 bytes — a gated deploy whose secret does not resolve **fails** (fail closed). The resolved value must be identical in the ePHPm and switchboard environments. |
 | `--share-link` | `SWITCHBOARD_SHARE_LINK` | `false` | Mint a temporary shareable-URL capability and post it in the PR comment for each **gated** deploy. Opt-in: a share link is a bearer capability. |
 | `--share-link-ttl-secs` | `SWITCHBOARD_SHARE_LINK_TTL_SECS` | `86400` | TTL for a minted share link. Kept short — expiry is the primary control. |
-| `--kv-secret-file` | `SWITCHBOARD_KV_SECRET_FILE` | *(none)* | File holding ePHPm's `[kv] secret`, used to derive the per-site RESP password so **teardown can bump the share-link revocation epoch**. Unset skips KV revocation (the override + checkout removal already revoke on this node). |
+| `--kv-secret-file` | `SWITCHBOARD_KV_SECRET_FILE` | *(none)* | File holding ePHPm's `[kv] secret`, used to derive the per-site RESP password for two cluster-shared KV uses: **teardown bumps the share-link revocation epoch**, and the **analyze gate deduplicates its verdict** across nodes. Unset disables both (revocation falls back to override + checkout removal on this node; the analyze gate scans on every node). |
 | `--kv-addr` | `SWITCHBOARD_KV_ADDR` | `127.0.0.1:6379` | ePHPm's KV RESP listener (`[kv.redis_compat] listen`). Only used for revocation when `--kv-secret-file` is set. |
 
 The one-time fleet setup this pairs with — the GitHub OAuth App, the global
@@ -507,10 +529,10 @@ pinned to the crate's MSRV on the ephpm org's self-hosted fleet.
 | `src/validate.rs` | Claim-time re-validation of a deploy job: the queue-age bound and the current-PR-state check |
 | `src/drain.rs` | The `/drain` kick and the shared-secret file |
 | `src/deployer.rs` | The provisioning pipeline: fetch → manifest → **analyze gate** → env → quarantine the manifest → per-site override → atomic swap → chown to tenant → build → seed → health. `build:`/`seed:` run sandboxed via `ephpm exec --site` (fail-closed if unsupported). |
-| `src/analyze.rs` | The pre-serve static-analysis gate: run `ephpm analyze` over the pristine checkout, the pure exit-code→proceed/block decision, SARIF finding parsing, and the fail-closed contract |
+| `src/analyze.rs` | The pre-serve static-analysis gate: run `ephpm analyze` over the pristine checkout, the pure exit-code→proceed/block decision, SARIF finding parsing, the fail-closed contract, and the cluster-wide verdict dedup (pure `plan_from_lookup`, cacheable `CachedVerdict`) |
 | `src/site_override.rs` | The per-site override ePHPm reads: validating `docroot:` and the env prepend against ePHPm's own containment rules, the `[preview_auth]` gate section, rendering the TOML, and writing it atomically |
 | `src/preview_auth.rs` | The access-gate control plane: gating policy, session-secret resolution (fail closed), wire-compatible HS256 share-token minting, and the per-site KV password derivation |
-| `src/kv.rs` | A tiny RESP2 client for bumping the share-link revocation epoch in a preview's KV keyspace on teardown (best-effort) |
+| `src/kv.rs` | A tiny RESP2 client for ePHPm's gossip-replicated KV: bumping the share-link revocation epoch on teardown (`KvRevoker`) and the cluster-shared analyze verdict cache (`VerdictCache`, GET/SET-EX) — both best-effort |
 | `src/teardown.rs` | Preview teardown: vhost dir, per-site database, override file, vhost temp/session state root, the API's `applied/` marker, the share-link revocation epoch — and the refusal to call a partial teardown a success |
 | `src/manifest.rs` | The `ephpm.yaml` app manifest schema, and moving it out of the served root once read |
 | `src/secrets.rs` | `${secret.NAME}` resolution from switchboard's own store |

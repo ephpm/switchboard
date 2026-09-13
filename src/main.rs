@@ -188,6 +188,20 @@ async fn main() -> anyhow::Result<()> {
             timeout_secs = config.analyze_timeout_secs,
             "pre-serve analyze gate enabled — a preview is blocked on a bad `ephpm analyze` verdict"
         );
+        // Verdict dedup rides ePHPm's cluster-shared KV, which needs the KV
+        // secret; without it each node scans the same commit independently.
+        if config.kv_secret_file.is_some() {
+            info!(
+                verdict_ttl_secs = config.analyze_verdict_ttl_secs,
+                "analyze verdict dedup enabled — a commit is scanned once per cluster \
+                 (peers reuse the shared verdict; fail-safe to per-node scanning)"
+            );
+        } else {
+            info!(
+                "analyze verdict dedup disabled (--kv-secret-file unset) — each node scans \
+                 the same commit independently"
+            );
+        }
     } else {
         tracing::warn!(
             "pre-serve analyze gate is NOT configured (--analyze-config unset) — previews \
@@ -501,6 +515,9 @@ async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result
         share_token_ttl: state.config.share_token_ttl(),
         analyze_config: state.config.analyze_config.as_deref(),
         analyze_timeout: state.config.analyze_timeout(),
+        kv_addr: &state.config.kv_addr,
+        kv_secret: state.kv_secret.as_deref(),
+        analyze_verdict_ttl: state.config.analyze_verdict_ttl(),
     };
     let result = deployer::deploy_preview(req, &ctx).await?;
 

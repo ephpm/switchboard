@@ -41,8 +41,12 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use tokio::process::Command;
+
+use crate::kv::VerdictCache;
 
 /// How many findings switchboard keeps from a blocked run's SARIF. The PR
 /// comment renders a smaller top-N slice of these; the cap only bounds memory on
@@ -192,8 +196,9 @@ pub fn decide(outcome: &AnalyzeOutcome) -> GateDecision {
 }
 
 /// One finding lifted from the analyzer's SARIF output, reduced to what the PR
-/// comment shows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// comment shows. `Serialize`/`Deserialize` so a verdict can be cached in the
+/// cluster-shared KV and reconstructed byte-identically on a peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
     /// The SARIF `ruleId` (e.g. `dangerous-sinks/eval`).
     pub rule_id: String,
@@ -206,8 +211,10 @@ pub struct Finding {
 }
 
 /// A blocked run's detail, threaded into the PR comment and the deployment
-/// status.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// status. `Serialize`/`Deserialize` so the whole block (verdict + findings) can
+/// be cached cluster-wide and a peer can render the identical block comment
+/// without re-scanning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalyzeBlock {
     /// Short machine label (`deny`/`quarantine`/`error`/`timeout`).
     pub verdict: String,
@@ -232,6 +239,275 @@ pub enum AnalyzeGateResult {
     /// The publish is refused. Carries the verdict and findings for the PR
     /// comment and the deployment status.
     Blocked(AnalyzeBlock),
+}
+
+/// A verdict serialized for the **cluster-shared** cache.
+///
+/// The analyze verdict is a pure function of (repo, PR head SHA, gate config), so
+/// it is identical on every node. switchboard runs on every node and each
+/// materializes the same checkout on its own disk, so without coordination the
+/// gate would re-scan the identical commit N times. This is the shared value: the
+/// first node to scan publishes it, and its peers reuse it. `Skipped` is never
+/// cached — a disabled gate shares nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CachedVerdict {
+    /// The tree passed — a peer proceeds to publish.
+    Passed,
+    /// The tree was blocked — a peer blocks and renders the same block comment
+    /// from this stored `AnalyzeBlock` (verdict + findings), no re-scan.
+    Blocked(AnalyzeBlock),
+}
+
+impl CachedVerdict {
+    /// The cacheable form of a gate result, or `None` for [`AnalyzeGateResult::Skipped`]
+    /// (a disabled gate has nothing to share).
+    #[must_use]
+    pub fn from_result(result: &AnalyzeGateResult) -> Option<Self> {
+        match result {
+            AnalyzeGateResult::Passed => Some(Self::Passed),
+            AnalyzeGateResult::Blocked(block) => Some(Self::Blocked(block.clone())),
+            AnalyzeGateResult::Skipped => None,
+        }
+    }
+
+    /// Reconstruct the gate result a peer acts on — the same block/proceed
+    /// decision and, for a block, the same findings the comment renders.
+    #[must_use]
+    pub fn into_result(self) -> AnalyzeGateResult {
+        match self {
+            Self::Passed => AnalyzeGateResult::Passed,
+            Self::Blocked(block) => AnalyzeGateResult::Blocked(block),
+        }
+    }
+
+    /// Serialize for storage in the shared KV.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails (it does not, for these types).
+    pub fn to_json(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    /// Parse a stored value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored bytes are not a `CachedVerdict` — the
+    /// caller treats that as a miss and re-scans (fail-safe).
+    pub fn from_json(s: &str) -> anyhow::Result<Self> {
+        Ok(serde_json::from_str(s)?)
+    }
+}
+
+/// The identity a verdict is keyed by — everything the verdict depends on except
+/// the gate config (which enters the key as its fingerprint).
+#[derive(Debug, Clone, Copy)]
+pub struct VerdictIdentity<'a> {
+    /// `owner/name` of the base repository.
+    pub repo: &'a str,
+    /// Pull request number.
+    pub pr: u64,
+    /// PR head commit SHA — the input that changes on every push, so a new push
+    /// naturally gets a fresh key and re-scans.
+    pub head_sha: &'a str,
+}
+
+/// What a shared-cache lookup produced. The [`plan_from_lookup`] policy turns
+/// this into a proceed-to-reuse or fall-back-to-scan decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheLookup {
+    /// The key was present with this stored value.
+    Hit(String),
+    /// The key was absent.
+    Miss,
+    /// The store could not be read (unreachable, auth rejected, …). Fail-safe:
+    /// treated exactly like a miss, so a coordination failure never skips the
+    /// gate — the node scans itself.
+    Unavailable,
+}
+
+/// The action to take after a shared-cache lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CachePlan {
+    /// Reuse this peer verdict — do not run the analyzer.
+    Reuse(AnalyzeGateResult),
+    /// Run the analyzer locally (then publish the result).
+    Scan,
+}
+
+/// Decide what to do with a shared-cache lookup. **Pure** — the whole dedup
+/// policy, tested without a real KV:
+///
+/// * a parseable **hit** → reuse the peer verdict (no local scan);
+/// * an **unparseable** hit → scan locally (fail-safe: never trust a value we
+///   cannot read as a verdict);
+/// * a **miss** or an **unavailable** store → scan locally.
+///
+/// Note it never blocks on a coordination failure: `Unavailable` maps to `Scan`,
+/// the same as `Miss`, so the gate degrades to per-node scanning — never to
+/// "serve unscanned".
+#[must_use]
+pub fn plan_from_lookup(lookup: CacheLookup) -> CachePlan {
+    match lookup {
+        CacheLookup::Hit(value) => match CachedVerdict::from_json(&value) {
+            Ok(cached) => CachePlan::Reuse(cached.into_result()),
+            Err(_) => CachePlan::Scan,
+        },
+        CacheLookup::Miss | CacheLookup::Unavailable => CachePlan::Scan,
+    }
+}
+
+/// The shared-cache key a verdict is stored under:
+/// `analyze:verdict:<repo>:<pr>:<head_sha>:<cfg_hash>`.
+///
+/// `cfg_hash` is [`config_fingerprint`] of the operator gate config, so editing
+/// the policy invalidates every cached verdict (the next scan re-runs under the
+/// new rules).
+#[must_use]
+pub fn verdict_key(identity: &VerdictIdentity<'_>, cfg_hash: &str) -> String {
+    format!(
+        "analyze:verdict:{}:{}:{}:{cfg_hash}",
+        identity.repo, identity.pr, identity.head_sha
+    )
+}
+
+/// A short, stable fingerprint of the operator gate config's **contents**, so a
+/// policy edit changes the cache key and forces a re-scan cluster-wide.
+#[must_use]
+pub fn config_fingerprint(contents: &[u8]) -> String {
+    let digest = Sha256::digest(contents);
+    // 16 hex chars (8 bytes) is ample to separate policy revisions; the key is
+    // already scoped by repo/PR/SHA.
+    hex::encode(&digest[..8])
+}
+
+/// [`config_fingerprint`] of a file's contents, or `None` if it cannot be read.
+///
+/// A node that cannot read the policy must not govern its peers, so `None`
+/// disables the shared cache for this deploy (the node scans locally and does not
+/// publish) rather than fingerprinting an error.
+fn config_fingerprint_of_file(path: &Path) -> Option<String> {
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| config_fingerprint(&bytes))
+}
+
+/// Run the analyze gate with **cluster-wide verdict deduplication**.
+///
+/// The verdict is identical on every node, so the first node to scan a given
+/// (repo, PR head SHA, gate config) publishes it to the shared KV and its peers
+/// reuse it instead of re-scanning the same commit. This wraps [`run_gate`]; the
+/// scan itself, the fail-closed exit-code policy, and the SARIF parsing are
+/// unchanged.
+///
+/// Layering of failure modes (this ordering is the contract):
+/// * the **gate** fails closed — a bad verdict / analyzer error / timeout blocks;
+/// * the **dedup** fails safe — a KV read error scans locally, a KV write error
+///   proceeds with the local verdict. Coordination failure degrades to today's
+///   "each node scans itself", never to "serve unscanned".
+///
+/// `cache` is `None` when there is no cluster-shared KV switchboard can reach
+/// (`--kv-secret-file` unset); the gate then simply scans on every node. When
+/// `analyze_config` is `None` the gate is disabled and this returns
+/// [`AnalyzeGateResult::Skipped`] without touching the KV or the binary.
+///
+/// There is deliberately **no lock/lease/leader wait**: if two nodes miss at once
+/// and both scan, the result is identical, so the only cost is a redundant scan —
+/// the same looseness the PR-comment dedup already accepts.
+pub async fn run_gate_cached(
+    ephpm_bin: &Path,
+    analyze_config: Option<&Path>,
+    timeout: Duration,
+    target: &Path,
+    hostname: &str,
+    cache: Option<&VerdictCache>,
+    identity: &VerdictIdentity<'_>,
+) -> AnalyzeGateResult {
+    let Some(config) = analyze_config else {
+        // Gate disabled — no KV interaction at all.
+        tracing::debug!(
+            %hostname,
+            "pre-serve analyze gate is disabled (--analyze-config unset) — publishing \
+             without static-analysis screening"
+        );
+        return AnalyzeGateResult::Skipped;
+    };
+
+    // The key depends on the policy's contents. A node that cannot read the
+    // policy scans locally without the shared cache rather than fingerprinting an
+    // error and governing its peers with it.
+    let (key, cache) = match config_fingerprint_of_file(config) {
+        Some(cfg_hash) => (Some(verdict_key(identity, &cfg_hash)), cache),
+        None => {
+            tracing::warn!(
+                %hostname,
+                config = %config.display(),
+                "could not read the analyze config to fingerprint it — scanning locally \
+                 without the cluster-shared verdict cache"
+            );
+            (None, None)
+        }
+    };
+
+    // Consult the shared cache (fail-safe: any read problem is a local scan).
+    if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
+        let lookup = match cache.get(key).await {
+            Ok(Some(value)) => CacheLookup::Hit(value),
+            Ok(None) => CacheLookup::Miss,
+            Err(e) => {
+                tracing::warn!(
+                    %hostname,
+                    %e,
+                    "cluster-shared verdict cache read failed — scanning locally (fail-safe)"
+                );
+                CacheLookup::Unavailable
+            }
+        };
+        if let CachePlan::Reuse(result) = plan_from_lookup(lookup) {
+            let verdict = match &result {
+                AnalyzeGateResult::Blocked(block) => block.verdict.as_str(),
+                _ => "pass",
+            };
+            tracing::info!(
+                %hostname,
+                %verdict,
+                "reused a peer's analyze verdict from the cluster-shared cache — not \
+                 re-scanning this commit"
+            );
+            return result;
+        }
+    }
+
+    // Miss / unparseable / unavailable / no cache → scan locally.
+    let result = run_gate(ephpm_bin, Some(config), timeout, target, hostname).await;
+
+    // Publish for peers (best-effort; a write failure never blocks the deploy).
+    if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
+        if let Some(cached) = CachedVerdict::from_result(&result) {
+            match cached.to_json() {
+                Ok(json) => match cache.put(key, &json).await {
+                    Ok(()) => tracing::debug!(
+                        %hostname,
+                        "published analyze verdict to the cluster-shared cache for peers"
+                    ),
+                    Err(e) => tracing::warn!(
+                        %hostname,
+                        %e,
+                        "failed to publish the analyze verdict to the shared cache — peers \
+                         will scan this commit themselves (proceeding with the local verdict)"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    %hostname,
+                    %e,
+                    "failed to serialize the analyze verdict for the shared cache"
+                ),
+            }
+        }
+    }
+
+    result
 }
 
 /// Run the pre-serve analyze gate over a materialized preview tree.
@@ -648,6 +924,129 @@ mod tests {
         assert_eq!(parse_sarif_findings(""), (Vec::new(), 0));
         // Well-formed JSON with no runs is simply zero findings, not an error.
         assert_eq!(parse_sarif_findings("{}"), (Vec::new(), 0));
+    }
+
+    // ── cluster-shared verdict dedup (pure logic) ──────────────────────
+
+    fn sample_block() -> AnalyzeBlock {
+        AnalyzeBlock {
+            verdict: "deny".into(),
+            reason: "reached the deny threshold".into(),
+            findings: vec![Finding {
+                rule_id: "dangerous-sinks/eval".into(),
+                file: "index.php".into(),
+                line: Some(7),
+                message: "eval on request data".into(),
+            }],
+            total_findings: 1,
+        }
+    }
+
+    /// A block verdict round-trips through JSON with its findings intact — so a
+    /// peer reconstructs the identical block comment without re-scanning.
+    #[test]
+    fn cached_verdict_block_round_trips() {
+        let cached = CachedVerdict::Blocked(sample_block());
+        let json = cached.to_json().unwrap();
+        let back = CachedVerdict::from_json(&json).unwrap();
+        assert_eq!(back, cached);
+        // And it reconstructs the acting result verbatim.
+        match back.into_result() {
+            AnalyzeGateResult::Blocked(b) => {
+                assert_eq!(b.verdict, "deny");
+                assert_eq!(b.findings.len(), 1);
+                assert_eq!(b.findings[0].rule_id, "dangerous-sinks/eval");
+                assert_eq!(b.total_findings, 1);
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cached_verdict_pass_round_trips() {
+        let json = CachedVerdict::Passed.to_json().unwrap();
+        assert_eq!(
+            CachedVerdict::from_json(&json).unwrap().into_result(),
+            AnalyzeGateResult::Passed
+        );
+    }
+
+    /// A disabled gate (`Skipped`) is never cached — there is nothing to share.
+    #[test]
+    fn skipped_is_not_cacheable() {
+        assert_eq!(
+            CachedVerdict::from_result(&AnalyzeGateResult::Skipped),
+            None
+        );
+        assert_eq!(
+            CachedVerdict::from_result(&AnalyzeGateResult::Passed),
+            Some(CachedVerdict::Passed)
+        );
+    }
+
+    /// **Cache hit** → reuse the peer verdict, no local scan.
+    #[test]
+    fn a_parseable_hit_is_reused() {
+        let json = CachedVerdict::Blocked(sample_block()).to_json().unwrap();
+        match plan_from_lookup(CacheLookup::Hit(json)) {
+            CachePlan::Reuse(AnalyzeGateResult::Blocked(b)) => assert_eq!(b.verdict, "deny"),
+            other => panic!("a valid hit must be reused, got {other:?}"),
+        }
+        // A passing verdict is likewise reused.
+        let json = CachedVerdict::Passed.to_json().unwrap();
+        assert_eq!(
+            plan_from_lookup(CacheLookup::Hit(json)),
+            CachePlan::Reuse(AnalyzeGateResult::Passed)
+        );
+    }
+
+    /// **Cache miss** → scan locally (and the caller then publishes).
+    #[test]
+    fn a_miss_scans() {
+        assert_eq!(plan_from_lookup(CacheLookup::Miss), CachePlan::Scan);
+    }
+
+    /// **KV read error** (Unavailable) → scan locally. This is the fail-SAFE
+    /// direction: a coordination failure degrades to per-node scanning, never to
+    /// "serve unscanned".
+    #[test]
+    fn an_unavailable_store_scans_locally() {
+        assert_eq!(plan_from_lookup(CacheLookup::Unavailable), CachePlan::Scan);
+    }
+
+    /// A stored value that is not a verdict is treated as a miss and re-scanned —
+    /// never trusted.
+    #[test]
+    fn an_unparseable_hit_scans() {
+        assert_eq!(
+            plan_from_lookup(CacheLookup::Hit("not json".into())),
+            CachePlan::Scan
+        );
+    }
+
+    #[test]
+    fn verdict_key_has_the_documented_shape() {
+        let id = VerdictIdentity {
+            repo: "ephpm/wordpress-sample",
+            pr: 7,
+            head_sha: "0123456789abcdef",
+        };
+        assert_eq!(
+            verdict_key(&id, "cafebabecafebabe"),
+            "analyze:verdict:ephpm/wordpress-sample:7:0123456789abcdef:cafebabecafebabe"
+        );
+    }
+
+    /// The config fingerprint is deterministic and content-sensitive — editing
+    /// the policy changes the key, so every node re-scans under the new rules.
+    #[test]
+    fn config_fingerprint_is_deterministic_and_sensitive() {
+        let a = config_fingerprint(b"profile: none\nfail_on: quarantine\n");
+        let b = config_fingerprint(b"profile: none\nfail_on: quarantine\n");
+        let c = config_fingerprint(b"profile: none\nfail_on: deny\n");
+        assert_eq!(a, b, "same contents → same fingerprint");
+        assert_ne!(a, c, "a policy edit must change the fingerprint");
+        assert_eq!(a.len(), 16, "16 hex chars");
     }
 
     /// The stored slice is capped, but the reported total is the true count — so

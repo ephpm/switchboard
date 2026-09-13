@@ -252,9 +252,17 @@ pub struct Config {
     pub share_link_ttl_secs: u64,
 
     /// Path to a file holding ePHPm's `[kv] secret`, used to derive the per-site
-    /// RESP password so **teardown can bump the share-link revocation epoch** in a
-    /// preview's KV keyspace. Unset skips KV revocation (the override + checkout
-    /// removal already revoke on this node; a clustered leak self-heals at expiry).
+    /// RESP password for two cluster-shared KV uses:
+    ///
+    /// * **teardown bumps the share-link revocation epoch** in a preview's KV
+    ///   keyspace; and
+    /// * the **analyze gate deduplicates its verdict** across nodes (the first
+    ///   node to scan a commit publishes the verdict; peers reuse it).
+    ///
+    /// Unset disables both: teardown revocation falls back to removing the
+    /// override + checkout (a clustered leak self-heals at expiry), and the
+    /// analyze gate scans on every node independently (fail-safe to the pre-dedup
+    /// behavior).
     #[arg(long, env = "SWITCHBOARD_KV_SECRET_FILE")]
     pub kv_secret_file: Option<PathBuf>,
 
@@ -294,6 +302,24 @@ pub struct Config {
     /// `--analyze-config` is set.
     #[arg(long, default_value_t = 180, env = "SWITCHBOARD_ANALYZE_TIMEOUT_SECS")]
     pub analyze_timeout_secs: u64,
+
+    /// TTL (seconds) for a verdict published to the **cluster-shared** analyze
+    /// cache. The gate's verdict is a pure function of (repo, PR head SHA, gate
+    /// config), so it is deduplicated across nodes through ePHPm's
+    /// gossip-replicated KV — the first node to scan a commit publishes its
+    /// verdict and peers reuse it instead of re-scanning.
+    ///
+    /// The shared cache is active only when `--analyze-config` **and**
+    /// `--kv-secret-file` are both set; without the KV secret each node scans
+    /// independently (fail-safe to the pre-dedup behavior). The head SHA is the
+    /// real invalidator — this TTL just garbage-collects old entries. Default 1
+    /// day.
+    #[arg(
+        long,
+        default_value_t = 86_400,
+        env = "SWITCHBOARD_ANALYZE_VERDICT_TTL_SECS"
+    )]
+    pub analyze_verdict_ttl_secs: u64,
 
     // ── GitHub reporting (optional) ────────────────────────────────────
     /// GitHub App private key path (PEM file). Omit to run without GitHub
@@ -369,6 +395,13 @@ impl Config {
     #[must_use]
     pub fn analyze_timeout(&self) -> Duration {
         Duration::from_secs(self.analyze_timeout_secs.max(1))
+    }
+
+    /// TTL for a verdict published to the cluster-shared analyze cache (floored
+    /// at one second).
+    #[must_use]
+    pub fn analyze_verdict_ttl(&self) -> Duration {
+        Duration::from_secs(self.analyze_verdict_ttl_secs.max(1))
     }
 
     /// Resolve ePHPm's `[kv] secret` from `--kv-secret-file`, for deriving the
@@ -944,6 +977,11 @@ mod tests {
             "the documented default timeout is 180s"
         );
         assert_eq!(c.analyze_timeout(), Duration::from_secs(180));
+        assert_eq!(
+            c.analyze_verdict_ttl_secs, 86_400,
+            "the documented default verdict TTL is 1 day"
+        );
+        assert_eq!(c.analyze_verdict_ttl(), Duration::from_secs(86_400));
         c.validate().unwrap();
     }
 
@@ -954,6 +992,8 @@ mod tests {
             "/etc/switchboard/analyze-gate.yml",
             "--analyze-timeout-secs",
             "300",
+            "--analyze-verdict-ttl-secs",
+            "7200",
         ]);
         assert!(c.analyze_gate_enabled());
         assert_eq!(
@@ -961,15 +1001,22 @@ mod tests {
             Some(PathBuf::from("/etc/switchboard/analyze-gate.yml"))
         );
         assert_eq!(c.analyze_timeout(), Duration::from_secs(300));
+        assert_eq!(c.analyze_verdict_ttl(), Duration::from_secs(7200));
         c.validate().unwrap();
     }
 
-    /// A zero timeout must not make every run time out instantly — it is floored
-    /// at one second.
+    /// A zero timeout/TTL must not become instant — both are floored at one
+    /// second.
     #[test]
-    fn zero_analyze_timeout_is_floored() {
-        let c = parse_single_node(&["--analyze-timeout-secs", "0"]);
+    fn zero_analyze_durations_are_floored() {
+        let c = parse_single_node(&[
+            "--analyze-timeout-secs",
+            "0",
+            "--analyze-verdict-ttl-secs",
+            "0",
+        ]);
         assert_eq!(c.analyze_timeout(), Duration::from_secs(1));
+        assert_eq!(c.analyze_verdict_ttl(), Duration::from_secs(1));
     }
 
     #[test]
