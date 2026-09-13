@@ -504,17 +504,15 @@ pub async fn deploy_preview(
     // The verdict is identical on every node (pure function of repo + head SHA +
     // gate config), so it is deduplicated through ePHPm's cluster-shared,
     // gossip-replicated KV: the first node to scan a commit publishes its verdict
-    // and peers reuse it. The dedup fails SAFE — a KV read error scans locally —
-    // while the gate itself fails CLOSED. No cluster-shared KV (no
-    // `--kv-secret-file`) means each node scans, exactly as before.
-    let verdict_cache = ctx.kv_secret.map(|secret| {
-        kv::VerdictCache::new(
-            ctx.kv_addr,
-            secret,
-            site_key.clone(),
-            ctx.analyze_verdict_ttl,
-        )
-    });
+    // and peers reuse it. The verdict lives in a switchboard-private KV namespace
+    // no preview tenant can authenticate to (see `kv::VERDICT_STORE_SITE`), so a
+    // malicious preview cannot forge a `Passed` for a future commit. The dedup
+    // fails SAFE — a KV read error scans locally — while the gate itself fails
+    // CLOSED. No cluster-shared KV (no `--kv-secret-file`) means each node scans,
+    // exactly as before.
+    let verdict_cache = ctx
+        .kv_secret
+        .map(|secret| kv::VerdictCache::new(ctx.kv_addr, secret, ctx.analyze_verdict_ttl));
     let verdict_identity = analyze::VerdictIdentity {
         repo: &req.repo_full_name,
         pr: req.pr_number,

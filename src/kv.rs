@@ -146,6 +146,29 @@ impl KvRevoker {
     }
 }
 
+/// The **switchboard-private** KV namespace the analyze verdict cache lives in.
+///
+/// This is an AUTH *site* string, deliberately chosen so no preview tenant can
+/// ever reach it. Two facts make it disjoint from every preview keyspace:
+///
+/// * A tenant's `ephpm_kv_*` calls are auto-scoped **server-side** by ePHPm to
+///   the request's own resolved site key — a tenant never gets to choose an AUTH
+///   site, it can only ever read/write its one keyspace.
+/// * A resolvable site key is always a *valid* one: DNS-style labels drawn from
+///   `[a-z0-9._-]` (ePHPm's `is_valid_site_key`, mirrored in
+///   [`crate::site_key::is_valid_site_key`]). This namespace begins with the
+///   gossip unit-separator `\x1f`, which is outside that charset, so it can never
+///   equal any preview site key — and therefore no tenant is ever scoped to it.
+///
+/// switchboard holds `kv_secret`, so it can derive the password for *any* AUTH
+/// site and reach this one. That asymmetry — switchboard can address it, no
+/// tenant can — is what prevents a malicious preview from poisoning the cache
+/// (writing a forged `Passed` for a future SHA it authors). All nodes' daemons
+/// AUTH as this same reserved site, so they share one gossip-replicated verdict
+/// keyspace; the per-commit key ([`crate::analyze::verdict_key`]) keeps distinct
+/// previews from colliding within it.
+pub const VERDICT_STORE_SITE: &str = "\x1fswitchboard-verdicts";
+
 /// A client for the cluster-shared **analyze verdict cache** in ePHPm's KV.
 ///
 /// The pre-serve analyze gate's verdict is a pure function of (repo, PR head SHA,
@@ -156,19 +179,17 @@ impl KvRevoker {
 ///
 /// # Scope and store
 ///
-/// Values live in the **preview's own** per-site KV keyspace (the same AUTH
-/// scoping [`KvRevoker`] uses: `AUTH <site> <derived>`, then bare keys), which is
-/// gossip-replicated, so a peer deploying the same preview reads the same value.
-///
-/// **Why the tenant keyspace is safe here.** The deployed (untrusted) app can
-/// read/write its own keyspace, so it can in principle write a verdict key. It
-/// cannot escalate: a `proceed` verdict only ever governs a peer if some node
-/// *legitimately* proceeded (the first `proceed` for a SHA is always a real
-/// scan — the app cannot run until a node has served it, which requires that
-/// node to have proceeded on its own scan). And the key is bound to the exact
-/// `head_sha` and the operator config's fingerprint, neither of which the app can
-/// forge for a *future* push. So the app can at most reinforce a decision the
-/// dedup would have reached anyway.
+/// Values live in the switchboard-private [`VERDICT_STORE_SITE`] namespace — NOT
+/// a preview's own keyspace — reached with the same AUTH scoping [`KvRevoker`]
+/// uses (`AUTH <site> <derived>`, then bare keys) but with the reserved site.
+/// The store is gossip-replicated, so a peer reads what the first scanner wrote;
+/// and because no tenant can authenticate to this namespace (see
+/// [`VERDICT_STORE_SITE`]), the deployed preview code cannot read or forge a
+/// verdict. That is what closes the cache-poisoning hole: an earlier design put
+/// verdicts in the preview's own keyspace, where the running app could
+/// `ephpm_kv_set` a forged `Passed` for a future malicious commit it authors
+/// (it knows the repo/PR/SHA, and the config fingerprint is derivable from the
+/// public policy) and bypass the gate.
 ///
 /// Best-effort in both directions: a read failure means the caller scans locally
 /// (fail-safe), and a write failure means peers scan themselves — neither ever
@@ -177,53 +198,48 @@ impl KvRevoker {
 pub struct VerdictCache {
     addr: String,
     kv_secret: String,
-    site: String,
     ttl: Duration,
 }
 
 impl VerdictCache {
-    /// Build a cache client scoped to one preview's site keyspace.
+    /// Build a cache client for the switchboard-private verdict namespace.
     ///
     /// `addr` is ePHPm's RESP listener, `kv_secret` its `[kv] secret` (for the
-    /// per-site password), `site` the preview's canonical site key, and `ttl` the
-    /// expiry applied to a published verdict (the SHA is the real invalidator; the
-    /// TTL just garbage-collects old entries).
+    /// per-site password derivation, here against [`VERDICT_STORE_SITE`]), and
+    /// `ttl` the expiry applied to a published verdict (the SHA is the real
+    /// invalidator; the TTL just garbage-collects old entries). There is
+    /// deliberately no preview-`site` parameter — every verdict for the whole
+    /// fleet lives in the one reserved namespace, keyed per commit.
     #[must_use]
-    pub fn new(
-        addr: impl Into<String>,
-        kv_secret: impl Into<String>,
-        site: impl Into<String>,
-        ttl: Duration,
-    ) -> Self {
+    pub fn new(addr: impl Into<String>, kv_secret: impl Into<String>, ttl: Duration) -> Self {
         Self {
             addr: addr.into(),
             kv_secret: kv_secret.into(),
-            site: site.into(),
             ttl,
         }
     }
 
-    /// `GET <key>` from the site's keyspace. `Ok(None)` is a genuine miss (nil
-    /// reply); an `Err` is a transport/auth problem the caller treats as
-    /// "unavailable" and scans locally.
+    /// `GET <key>` from the reserved verdict namespace. `Ok(None)` is a genuine
+    /// miss (nil reply); an `Err` is a transport/auth problem the caller treats
+    /// as "unavailable" and scans locally.
     ///
     /// # Errors
     ///
     /// Returns an error if the connection, AUTH, or GET fails.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let password = derive_site_kv_password(&self.kv_secret, &self.site);
+        let password = derive_site_kv_password(&self.kv_secret, VERDICT_STORE_SITE);
         tokio::time::timeout(OP_TIMEOUT, self.get_inner(&password, key))
             .await
             .with_context(|| format!("KV GET from {} timed out after {OP_TIMEOUT:?}", self.addr))?
     }
 
-    /// `SET <key> <value> EX <ttl>` in the site's keyspace.
+    /// `SET <key> <value> EX <ttl>` in the reserved verdict namespace.
     ///
     /// # Errors
     ///
     /// Returns an error if the connection, AUTH, or SET fails.
     pub async fn put(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        let password = derive_site_kv_password(&self.kv_secret, &self.site);
+        let password = derive_site_kv_password(&self.kv_secret, VERDICT_STORE_SITE);
         let ttl = self.ttl.as_secs().max(1).to_string();
         tokio::time::timeout(OP_TIMEOUT, self.put_inner(&password, key, value, &ttl))
             .await
@@ -238,7 +254,7 @@ impl VerdictCache {
         let mut reader = BufReader::new(read_half);
 
         write_half
-            .write_all(&encode_command(&["AUTH", &self.site, password]))
+            .write_all(&encode_command(&["AUTH", VERDICT_STORE_SITE, password]))
             .await
             .context("failed to send KV AUTH")?;
         read_reply(&mut reader)
@@ -271,7 +287,7 @@ impl VerdictCache {
         let mut reader = BufReader::new(read_half);
 
         write_half
-            .write_all(&encode_command(&["AUTH", &self.site, password]))
+            .write_all(&encode_command(&["AUTH", VERDICT_STORE_SITE, password]))
             .await
             .context("failed to send KV AUTH")?;
         read_reply(&mut reader)
@@ -480,7 +496,8 @@ mod tests {
     }
 
     /// A cache **hit**: the fake server replies to AUTH then returns the stored
-    /// JSON as a bulk string; `get` returns it, and the AUTH is scoped to the site.
+    /// JSON as a bulk string; `get` returns it, and the AUTH is scoped to the
+    /// switchboard-private verdict namespace — never a preview's site key.
     #[tokio::test]
     async fn verdict_cache_get_returns_the_stored_value() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -496,7 +513,7 @@ mod tests {
             String::from_utf8_lossy(&buf).into_owned()
         });
 
-        let cache = VerdictCache::new(addr, "master-secret", "app-pr-1", Duration::from_secs(3600));
+        let cache = VerdictCache::new(addr, "master-secret", Duration::from_secs(3600));
         let got = cache
             .get("analyze:verdict:o/r:1:deadbeef:abcd")
             .await
@@ -506,8 +523,15 @@ mod tests {
         let received = server.await.unwrap();
         assert!(received.contains("AUTH"), "{received:?}");
         assert!(
-            received.contains("app-pr-1"),
-            "AUTH names the site: {received:?}"
+            received.contains(VERDICT_STORE_SITE),
+            "AUTH must name the reserved verdict namespace: {received:?}"
+        );
+        // The reserved namespace is authenticated with the password derived for
+        // *it*, not for any preview.
+        let expected_pw = derive_site_kv_password("master-secret", VERDICT_STORE_SITE);
+        assert!(
+            received.contains(&expected_pw),
+            "AUTH must use the reserved-namespace password"
         );
         assert!(received.contains("GET"), "{received:?}");
         assert!(
@@ -527,7 +551,7 @@ mod tests {
             let mut buf = Vec::new();
             sock.read_to_end(&mut buf).await.unwrap();
         });
-        let cache = VerdictCache::new(addr, "master-secret", "app-pr-1", Duration::from_secs(3600));
+        let cache = VerdictCache::new(addr, "master-secret", Duration::from_secs(3600));
         assert_eq!(cache.get("k").await.unwrap(), None);
     }
 
@@ -543,7 +567,7 @@ mod tests {
             sock.read_to_end(&mut buf).await.unwrap();
             String::from_utf8_lossy(&buf).into_owned()
         });
-        let cache = VerdictCache::new(addr, "master-secret", "app-pr-1", Duration::from_secs(600));
+        let cache = VerdictCache::new(addr, "master-secret", Duration::from_secs(600));
         cache.put("k", "v").await.unwrap();
 
         let received = server.await.unwrap();
@@ -559,13 +583,68 @@ mod tests {
     /// "unavailable" and scans locally — fail-safe).
     #[tokio::test]
     async fn verdict_cache_get_on_a_dead_addr_errors() {
-        // Port 0 is not connectable; connect fails fast.
-        let cache = VerdictCache::new(
-            "127.0.0.1:1",
-            "master-secret",
-            "app-pr-1",
-            Duration::from_secs(60),
-        );
+        // Port 1 is not connectable; connect fails fast.
+        let cache = VerdictCache::new("127.0.0.1:1", "master-secret", Duration::from_secs(60));
         assert!(cache.get("k").await.is_err());
+    }
+
+    /// **The cache-poisoning guard.** The verdict namespace must be unreachable
+    /// by any preview tenant. A tenant's `ephpm_kv_*` is auto-scoped by ePHPm to
+    /// its own resolved site key, which is always a *valid* site key
+    /// ([`crate::site_key::is_valid_site_key`]); the reserved namespace is
+    /// deliberately not a valid site key (leading `\x1f`), so no tenant can ever
+    /// be scoped to it and thus cannot forge a verdict.
+    #[test]
+    fn verdict_namespace_is_unreachable_by_any_tenant() {
+        assert!(
+            !crate::site_key::is_valid_site_key(VERDICT_STORE_SITE),
+            "the verdict namespace must never equal a resolvable preview site key"
+        );
+        // Concretely, it carries the gossip unit-separator, outside the
+        // [a-z0-9._-] site-key charset.
+        assert!(
+            VERDICT_STORE_SITE.contains('\u{1f}'),
+            "the reserved namespace must use an out-of-charset byte"
+        );
+        // And it is disjoint from realistic preview site keys.
+        for site in [
+            "ephpm-wordpress-sample-pr-7",
+            "app-pr-1",
+            "ephpm-my-blog-pr-42.preview.ephpm.dev",
+        ] {
+            assert!(crate::site_key::is_valid_site_key(site));
+            assert_ne!(
+                site, VERDICT_STORE_SITE,
+                "no preview site key may equal the verdict namespace"
+            );
+        }
+    }
+
+    /// Every preview's verdict lives in the **one** switchboard-owned namespace,
+    /// so the cluster-wide dedup works across the whole fleet — the cache is not
+    /// scoped per preview (there is no preview-`site` parameter), only the
+    /// per-commit key distinguishes entries.
+    #[tokio::test]
+    async fn all_previews_share_one_verdict_namespace() {
+        // Two caches built independently (as two different previews' deploys
+        // would) both AUTH as the same reserved namespace.
+        for _ in 0..2 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                sock.write_all(b"+OK\r\n$-1\r\n").await.unwrap();
+                let mut buf = Vec::new();
+                sock.read_to_end(&mut buf).await.unwrap();
+                String::from_utf8_lossy(&buf).into_owned()
+            });
+            let cache = VerdictCache::new(addr, "master-secret", Duration::from_secs(60));
+            let _ = cache.get("analyze:verdict:o/r:1:sha:cfg").await;
+            let received = server.await.unwrap();
+            assert!(
+                received.contains(VERDICT_STORE_SITE),
+                "every cache AUTHs the shared namespace: {received:?}"
+            );
+        }
     }
 }

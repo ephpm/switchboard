@@ -219,13 +219,23 @@ swap simply never happens.
   commit N times. The verdict is a pure function of (repo, PR head SHA, gate
   config), so it is deduplicated through ePHPm's **gossip-replicated** KV: the
   first node to scan a commit publishes its verdict under
-  `analyze:verdict:<repo>:<pr>:<head_sha>:<cfg_hash>` (in the preview's own
-  per-site keyspace, TTL `--analyze-verdict-ttl-secs`), and its peers reuse it —
-  reconstructing the identical block comment from the stored findings — instead of
-  re-scanning. `cfg_hash` is a fingerprint of the operator policy file, so editing
-  the policy re-scans everywhere. There is **no lock or leader wait**: if two nodes
-  miss at once and both scan, the result is identical, so the only cost is a
-  redundant scan — the same looseness the PR-comment dedup accepts.
+  `analyze:verdict:<repo>:<pr>:<head_sha>:<cfg_hash>` (TTL
+  `--analyze-verdict-ttl-secs`), and its peers reuse it — reconstructing the
+  identical block comment from the stored findings — instead of re-scanning.
+  `cfg_hash` is a fingerprint of the operator policy file, so editing the policy
+  re-scans everywhere. There is **no lock or leader wait**: if two nodes miss at
+  once and both scan, the result is identical, so the only cost is a redundant
+  scan — the same looseness the PR-comment dedup accepts.
+- **Verdicts live in a switchboard-private namespace, not the preview's.** The
+  cache is stored under a reserved AUTH site (`\x1f`-prefixed, provably not a
+  valid preview site key) that **no preview tenant can authenticate to** — a
+  tenant's `ephpm_kv_*` is auto-scoped by ePHPm to its own resolved site key, so
+  it can only ever reach that one keyspace. switchboard holds the KV secret and
+  can address the reserved namespace; the running (untrusted) app cannot read or
+  write it. This is what prevents cache poisoning: were verdicts kept in the
+  preview's own keyspace, a malicious app could `ephpm_kv_set` a forged `Passed`
+  for a future commit it authors (it knows the repo/PR/SHA, and the config
+  fingerprint is derivable from the public policy) and bypass the gate on peers.
 - **Fail closed on the gate, fail *safe* on the dedup.** A KV **read** error scans
   locally (never skip the gate because coordination failed); a KV **write** error
   proceeds with the local verdict (never block a deploy because publishing the
