@@ -177,6 +177,90 @@ from the site key by exact path — never a glob wider than the one site:
 In cluster mode every node's daemon runs the same teardown against its own
 disk, which is the complete story — each node reaps its own replicas.
 
+### Pre-serve static-analysis gate
+
+A preview builds and serves **untrusted pull-request code**. With
+`--analyze-config` set, switchboard screens that code before it goes live: after
+the checkout is materialized and **before** the atomic swap makes the vhost
+routable (and before `build:`/`seed:` execute any of it), it runs
+
+```text
+ephpm analyze <checkout> --config <operator-policy.yml> --format sarif
+```
+
+over the pristine tree and **refuses to publish on a bad verdict**. On a
+redeploy the previous, known-good container stays live untouched, because the
+swap simply never happens.
+
+- **Off by default.** With no `--analyze-config` the gate is disabled and deploys
+  behave exactly as before (startup logs one `WARN`). This is the safe rollout
+  default: the analyzers ship in a recent `ephpm`, and a node on an older binary
+  must not have every preview blocked. The gate is live only once
+  `--analyze-config` is set **and** the node's `--ephpm-bin` supports `analyze`.
+- **The policy is the operator's, never the PR's.** `--config` is passed
+  explicitly, which overrides `ephpm analyze`'s auto-discovery of a
+  `.ephpm-analyze.yml` **inside the checkout** — otherwise a malicious PR could
+  ship `enable: []` to neuter its own gate. Keep the policy file outside any
+  tenant docroot, and use absolute paths inside it.
+- **Screens the pristine code.** The gate runs before switchboard injects the
+  resolved `env:` (`.env` + prepend), so the analyzer never scans switchboard's
+  *own* secrets — only the pull request's code.
+- **Fail closed.** Exit `0` publishes; exit `2` (quarantine) and `3` (deny)
+  block; exit `1` (analyzer error), any other code, a timeout, and a binary that
+  will not spawn **all block**. A gate that cannot run must not wave code
+  through. The wall-clock timeout is `--analyze-timeout-secs` (default 180s).
+- **Blocked previews are reported.** The block is posted into the PR's sticky
+  comment — the verdict, the finding count, and the top ~10 findings (rule, file,
+  line, message) — and the GitHub deployment status is set to **failure**. The
+  job is left in `queue/claimed/` for inspection (marked failed), not cleared as
+  a success; a later push re-runs the gate and refreshes the comment.
+- **Scanned once per commit, cluster-wide.** switchboard runs on every node and
+  each materializes the same checkout, so a naive gate would re-scan the identical
+  commit N times. The verdict is a pure function of (repo, PR head SHA, gate
+  config), so it is deduplicated through ePHPm's **gossip-replicated** KV: the
+  first node to scan a commit publishes its verdict under
+  `analyze:verdict:<repo>:<pr>:<head_sha>:<cfg_hash>` (TTL
+  `--analyze-verdict-ttl-secs`), and its peers reuse it — reconstructing the
+  identical block comment from the stored findings — instead of re-scanning.
+  `cfg_hash` is a fingerprint of the operator policy file, so editing the policy
+  re-scans everywhere. There is **no lock or leader wait**: if two nodes miss at
+  once and both scan, the result is identical, so the only cost is a redundant
+  scan — the same looseness the PR-comment dedup accepts.
+- **Verdicts live in a switchboard-private namespace, not the preview's.** The
+  cache is stored under a reserved AUTH site (`\x1f`-prefixed, provably not a
+  valid preview site key) that **no preview tenant can authenticate to** — a
+  tenant's `ephpm_kv_*` is auto-scoped by ePHPm to its own resolved site key, so
+  it can only ever reach that one keyspace. switchboard holds the KV secret and
+  can address the reserved namespace; the running (untrusted) app cannot read or
+  write it. This is what prevents cache poisoning: were verdicts kept in the
+  preview's own keyspace, a malicious app could `ephpm_kv_set` a forged `Passed`
+  for a future commit it authors (it knows the repo/PR/SHA, and the config
+  fingerprint is derivable from the public policy) and bypass the gate on peers.
+- **Fail closed on the gate, fail *safe* on the dedup.** A KV **read** error scans
+  locally (never skip the gate because coordination failed); a KV **write** error
+  proceeds with the local verdict (never block a deploy because publishing the
+  shared verdict failed). Coordination failure degrades to "each node scans
+  itself", never to "serve unscanned". The shared cache is active only when
+  `--analyze-config` **and** `--kv-secret-file` are both set (the KV secret derives
+  the per-site RESP password); without the secret, each node scans independently.
+
+A **reviewed example policy** is in
+[`docs/analyze-gate.example.yml`](docs/analyze-gate.example.yml). It enables the
+six **native** analyzers — `writable-exec`, `obfuscation-scan`, `secrets-scan`,
+`composer-scripts`, `dangerous-sinks`, `wp-vuln` — which are a fast file-walk
+(~2.6s on a 2000-file WordPress-scale tree, cold), so previews stay snappy.
+
+**Opt-in: `opcode-scan`.** It is deliberately left out of the default policy. It
+compiles every PHP file through ePHPm's embedded Zend engine (~+5–15s on a full
+WordPress tree), turning *suspected* sink findings into *confirmed* ones at a real
+latency cost. A node that wants that stronger detection adds `opcode-scan` to both
+`enable` and `required` in its policy file, accepting the extra per-preview time.
+`wp-vuln` stays out of `required` in the example because its feed is optional — a
+missing feed must skip, not gate. These analyzers require an `ephpm` build that
+includes them (`writable-exec`/`obfuscation-scan`/`secrets-scan`/`composer-scripts`
+landed recently); the gate stays off until `--analyze-config` is set and the
+nodes run an `ephpm` that has them.
+
 ### Preview privacy: the access gate
 
 A **private** repo's preview must not be world-readable. It isn't: switchboard
@@ -339,6 +423,24 @@ a fork builds but every `${secret.NAME}` expands to the empty string (with a
 name-only warning). Fork **teardowns** are always processed; refusing them
 would strand previews on disk.
 
+### Pre-serve analyze gate
+
+See [Pre-serve static-analysis gate](#pre-serve-static-analysis-gate) for what
+this does and [`docs/analyze-gate.example.yml`](docs/analyze-gate.example.yml) for
+a reviewed example policy.
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--analyze-config` | `SWITCHBOARD_ANALYZE_CONFIG` | *(none)* | Operator `ephpm analyze` policy file. **Unset disables the gate** (deploys behave as before; startup `WARN`s). When set, every deploy runs `ephpm analyze <checkout> --config <this> --format sarif` before the swap and blocks on a bad verdict. Passed with an explicit `--config` so a PR's own `.ephpm-analyze.yml` cannot neuter it — keep it **outside** any tenant docroot, with absolute paths inside. |
+| `--analyze-timeout-secs` | `SWITCHBOARD_ANALYZE_TIMEOUT_SECS` | `180` | Wall-clock timeout for one `ephpm analyze` run. A run that exceeds it is killed and the deploy is **blocked** (fail closed). Only consulted when `--analyze-config` is set. |
+| `--analyze-verdict-ttl-secs` | `SWITCHBOARD_ANALYZE_VERDICT_TTL_SECS` | `86400` | TTL for a verdict published to the cluster-shared cache. The head SHA is the real invalidator; the TTL just GCs old entries. The shared cache needs `--kv-secret-file` too; without it each node scans independently. |
+
+Exit-code contract (from `ephpm analyze`): `0` publishes; `2` (quarantine) and
+`3` (deny) block; `1` (analyzer error), any other code, and a timeout all block
+(fail closed). The gate reuses `--ephpm-bin`, which must support `analyze`. When
+`--kv-secret-file` is set the verdict is deduplicated cluster-wide (scanned once
+per commit; peers reuse the shared verdict, fail-safe to per-node scanning).
+
 ### Preview access gate (ephpm#487/#491)
 
 See [Preview privacy: the access gate](#preview-privacy-the-access-gate) for what
@@ -351,7 +453,7 @@ these do; the full design is in
 | `--preview-session-secret-ref` | `SWITCHBOARD_PREVIEW_SESSION_SECRET_REF` | `env:EPHPM_PREVIEW_SESSION_SECRET` | The `session_secret` **reference** (`env:NAME` / `file:/abs` / literal) written into a gated preview's `[preview_auth]` and resolved to mint share tokens. Must be the **same** reference the `github-auth` issuer uses and must resolve to ≥ 32 bytes — a gated deploy whose secret does not resolve **fails** (fail closed). The resolved value must be identical in the ePHPm and switchboard environments. |
 | `--share-link` | `SWITCHBOARD_SHARE_LINK` | `false` | Mint a temporary shareable-URL capability and post it in the PR comment for each **gated** deploy. Opt-in: a share link is a bearer capability. |
 | `--share-link-ttl-secs` | `SWITCHBOARD_SHARE_LINK_TTL_SECS` | `86400` | TTL for a minted share link. Kept short — expiry is the primary control. |
-| `--kv-secret-file` | `SWITCHBOARD_KV_SECRET_FILE` | *(none)* | File holding ePHPm's `[kv] secret`, used to derive the per-site RESP password so **teardown can bump the share-link revocation epoch**. Unset skips KV revocation (the override + checkout removal already revoke on this node). |
+| `--kv-secret-file` | `SWITCHBOARD_KV_SECRET_FILE` | *(none)* | File holding ePHPm's `[kv] secret`, used to derive the per-site RESP password for two cluster-shared KV uses: **teardown bumps the share-link revocation epoch**, and the **analyze gate deduplicates its verdict** across nodes. Unset disables both (revocation falls back to override + checkout removal on this node; the analyze gate scans on every node). |
 | `--kv-addr` | `SWITCHBOARD_KV_ADDR` | `127.0.0.1:6379` | ePHPm's KV RESP listener (`[kv.redis_compat] listen`). Only used for revocation when `--kv-secret-file` is set. |
 
 The one-time fleet setup this pairs with — the GitHub OAuth App, the global
@@ -436,10 +538,11 @@ pinned to the crate's MSRV on the ephpm org's self-hosted fleet.
 | `src/queue.rs` | Scan, claim (`link`+`unlink`), coalesce per label, complete; the enqueue timestamp a claimed job carries |
 | `src/validate.rs` | Claim-time re-validation of a deploy job: the queue-age bound and the current-PR-state check |
 | `src/drain.rs` | The `/drain` kick and the shared-secret file |
-| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → env → quarantine the manifest → per-site override → atomic swap → chown to tenant → build → seed → health. `build:`/`seed:` run sandboxed via `ephpm exec --site` (fail-closed if unsupported). |
+| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → **analyze gate** → env → quarantine the manifest → per-site override → atomic swap → chown to tenant → build → seed → health. `build:`/`seed:` run sandboxed via `ephpm exec --site` (fail-closed if unsupported). |
+| `src/analyze.rs` | The pre-serve static-analysis gate: run `ephpm analyze` over the pristine checkout, the pure exit-code→proceed/block decision, SARIF finding parsing, the fail-closed contract, and the cluster-wide verdict dedup (pure `plan_from_lookup`, cacheable `CachedVerdict`) |
 | `src/site_override.rs` | The per-site override ePHPm reads: validating `docroot:` and the env prepend against ePHPm's own containment rules, the `[preview_auth]` gate section, rendering the TOML, and writing it atomically |
 | `src/preview_auth.rs` | The access-gate control plane: gating policy, session-secret resolution (fail closed), wire-compatible HS256 share-token minting, and the per-site KV password derivation |
-| `src/kv.rs` | A tiny RESP2 client for bumping the share-link revocation epoch in a preview's KV keyspace on teardown (best-effort) |
+| `src/kv.rs` | A tiny RESP2 client for ePHPm's gossip-replicated KV: bumping the share-link revocation epoch on teardown (`KvRevoker`) and the cluster-shared analyze verdict cache (`VerdictCache`, GET/SET-EX) — both best-effort |
 | `src/teardown.rs` | Preview teardown: vhost dir, per-site database, override file, vhost temp/session state root, the API's `applied/` marker, the share-link revocation epoch — and the refusal to call a partial teardown a success |
 | `src/manifest.rs` | The `ephpm.yaml` app manifest schema, and moving it out of the served root once read |
 | `src/secrets.rs` | `${secret.NAME}` resolution from switchboard's own store |

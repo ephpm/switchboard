@@ -252,9 +252,17 @@ pub struct Config {
     pub share_link_ttl_secs: u64,
 
     /// Path to a file holding ePHPm's `[kv] secret`, used to derive the per-site
-    /// RESP password so **teardown can bump the share-link revocation epoch** in a
-    /// preview's KV keyspace. Unset skips KV revocation (the override + checkout
-    /// removal already revoke on this node; a clustered leak self-heals at expiry).
+    /// RESP password for two cluster-shared KV uses:
+    ///
+    /// * **teardown bumps the share-link revocation epoch** in a preview's KV
+    ///   keyspace; and
+    /// * the **analyze gate deduplicates its verdict** across nodes (the first
+    ///   node to scan a commit publishes the verdict; peers reuse it).
+    ///
+    /// Unset disables both: teardown revocation falls back to removing the
+    /// override + checkout (a clustered leak self-heals at expiry), and the
+    /// analyze gate scans on every node independently (fail-safe to the pre-dedup
+    /// behavior).
     #[arg(long, env = "SWITCHBOARD_KV_SECRET_FILE")]
     pub kv_secret_file: Option<PathBuf>,
 
@@ -262,6 +270,56 @@ pub struct Config {
     /// for share-link revocation when `--kv-secret-file` is set.
     #[arg(long, default_value = "127.0.0.1:6379", env = "SWITCHBOARD_KV_ADDR")]
     pub kv_addr: String,
+
+    // ── pre-serve static-analysis gate ─────────────────────────────────
+    /// Path to the operator-controlled `ephpm analyze` policy file (YAML), used
+    /// to screen a preview's checkout before it is published.
+    ///
+    /// **When unset the gate is disabled** and a deploy behaves exactly as it did
+    /// before this option existed — the safe rollout default (startup logs one
+    /// `WARN`). When set, every deploy runs
+    /// `ephpm analyze <checkout> --config <this> --format sarif` after the PR
+    /// checkout is materialized and **before** the vhost is swapped live, and a
+    /// bad verdict blocks the preview.
+    ///
+    /// The explicit `--config` is **security-critical**: it overrides `ephpm
+    /// analyze`'s auto-discovery of a `.ephpm-analyze.yml` inside the checkout, so
+    /// a malicious pull request cannot ship `enable: []` to neuter its own gate.
+    /// Point it at a file **outside** any tenant docroot that the tenant cannot
+    /// write, and (per that file's own contract) use absolute paths inside it — a
+    /// relative path there would resolve against the tenant tree.
+    ///
+    /// The analyzers this depends on
+    /// (`writable-exec`/`obfuscation-scan`/`secrets-scan`/`composer-scripts`/…)
+    /// ship in a recent `ephpm`; the gate stays off until this is set **and** the
+    /// node's `--ephpm-bin` supports `analyze`.
+    #[arg(long, env = "SWITCHBOARD_ANALYZE_CONFIG")]
+    pub analyze_config: Option<PathBuf>,
+
+    /// Wall-clock timeout (seconds) for a single `ephpm analyze` run. A run that
+    /// exceeds it is killed and the deploy is **blocked** (fail closed) — a gate
+    /// that cannot finish must not wave code through. Only consulted when
+    /// `--analyze-config` is set.
+    #[arg(long, default_value_t = 180, env = "SWITCHBOARD_ANALYZE_TIMEOUT_SECS")]
+    pub analyze_timeout_secs: u64,
+
+    /// TTL (seconds) for a verdict published to the **cluster-shared** analyze
+    /// cache. The gate's verdict is a pure function of (repo, PR head SHA, gate
+    /// config), so it is deduplicated across nodes through ePHPm's
+    /// gossip-replicated KV — the first node to scan a commit publishes its
+    /// verdict and peers reuse it instead of re-scanning.
+    ///
+    /// The shared cache is active only when `--analyze-config` **and**
+    /// `--kv-secret-file` are both set; without the KV secret each node scans
+    /// independently (fail-safe to the pre-dedup behavior). The head SHA is the
+    /// real invalidator — this TTL just garbage-collects old entries. Default 1
+    /// day.
+    #[arg(
+        long,
+        default_value_t = 86_400,
+        env = "SWITCHBOARD_ANALYZE_VERDICT_TTL_SECS"
+    )]
+    pub analyze_verdict_ttl_secs: u64,
 
     // ── GitHub reporting (optional) ────────────────────────────────────
     /// GitHub App private key path (PEM file). Omit to run without GitHub
@@ -323,6 +381,27 @@ impl Config {
     #[must_use]
     pub fn share_token_ttl(&self) -> Duration {
         Duration::from_secs(self.share_link_ttl_secs.max(1))
+    }
+
+    /// Whether the pre-serve analyze gate is enabled. It is off until an operator
+    /// points `--analyze-config` at a policy file — the safe rollout default.
+    #[must_use]
+    pub fn analyze_gate_enabled(&self) -> bool {
+        self.analyze_config.is_some()
+    }
+
+    /// Wall-clock timeout for a single `ephpm analyze` run (floored at one
+    /// second so a `0` cannot make every run time out instantly).
+    #[must_use]
+    pub fn analyze_timeout(&self) -> Duration {
+        Duration::from_secs(self.analyze_timeout_secs.max(1))
+    }
+
+    /// TTL for a verdict published to the cluster-shared analyze cache (floored
+    /// at one second).
+    #[must_use]
+    pub fn analyze_verdict_ttl(&self) -> Duration {
+        Duration::from_secs(self.analyze_verdict_ttl_secs.max(1))
     }
 
     /// Resolve ePHPm's `[kv] secret` from `--kv-secret-file`, for deriving the
@@ -881,6 +960,63 @@ mod tests {
             c.kv_secret().is_err(),
             "an empty KV secret file is an error"
         );
+    }
+
+    // ── pre-serve analyze gate ──────────────────────────────────────────
+
+    #[test]
+    fn analyze_gate_is_off_by_default() {
+        let c = parse_single_node(&[]);
+        assert!(
+            !c.analyze_gate_enabled(),
+            "the gate must be disabled unless an operator configures it"
+        );
+        assert!(c.analyze_config.is_none());
+        assert_eq!(
+            c.analyze_timeout_secs, 180,
+            "the documented default timeout is 180s"
+        );
+        assert_eq!(c.analyze_timeout(), Duration::from_secs(180));
+        assert_eq!(
+            c.analyze_verdict_ttl_secs, 86_400,
+            "the documented default verdict TTL is 1 day"
+        );
+        assert_eq!(c.analyze_verdict_ttl(), Duration::from_secs(86_400));
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn analyze_gate_flags_parse() {
+        let c = parse_single_node(&[
+            "--analyze-config",
+            "/etc/switchboard/analyze-gate.yml",
+            "--analyze-timeout-secs",
+            "300",
+            "--analyze-verdict-ttl-secs",
+            "7200",
+        ]);
+        assert!(c.analyze_gate_enabled());
+        assert_eq!(
+            c.analyze_config,
+            Some(PathBuf::from("/etc/switchboard/analyze-gate.yml"))
+        );
+        assert_eq!(c.analyze_timeout(), Duration::from_secs(300));
+        assert_eq!(c.analyze_verdict_ttl(), Duration::from_secs(7200));
+        c.validate().unwrap();
+    }
+
+    /// A zero timeout/TTL must not become instant — both are floored at one
+    /// second.
+    #[test]
+    fn zero_analyze_durations_are_floored() {
+        let c = parse_single_node(&[
+            "--analyze-timeout-secs",
+            "0",
+            "--analyze-verdict-ttl-secs",
+            "0",
+        ]);
+        assert_eq!(c.analyze_timeout(), Duration::from_secs(1));
+        assert_eq!(c.analyze_verdict_ttl(), Duration::from_secs(1));
     }
 
     #[test]
