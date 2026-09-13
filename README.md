@@ -177,6 +177,61 @@ from the site key by exact path — never a glob wider than the one site:
 In cluster mode every node's daemon runs the same teardown against its own
 disk, which is the complete story — each node reaps its own replicas.
 
+### Pre-serve static-analysis gate
+
+A preview builds and serves **untrusted pull-request code**. With
+`--analyze-config` set, switchboard screens that code before it goes live: after
+the checkout is materialized and **before** the atomic swap makes the vhost
+routable (and before `build:`/`seed:` execute any of it), it runs
+
+```text
+ephpm analyze <checkout> --config <operator-policy.yml> --format sarif
+```
+
+over the pristine tree and **refuses to publish on a bad verdict**. On a
+redeploy the previous, known-good container stays live untouched, because the
+swap simply never happens.
+
+- **Off by default.** With no `--analyze-config` the gate is disabled and deploys
+  behave exactly as before (startup logs one `WARN`). This is the safe rollout
+  default: the analyzers ship in a recent `ephpm`, and a node on an older binary
+  must not have every preview blocked. The gate is live only once
+  `--analyze-config` is set **and** the node's `--ephpm-bin` supports `analyze`.
+- **The policy is the operator's, never the PR's.** `--config` is passed
+  explicitly, which overrides `ephpm analyze`'s auto-discovery of a
+  `.ephpm-analyze.yml` **inside the checkout** — otherwise a malicious PR could
+  ship `enable: []` to neuter its own gate. Keep the policy file outside any
+  tenant docroot, and use absolute paths inside it.
+- **Screens the pristine code.** The gate runs before switchboard injects the
+  resolved `env:` (`.env` + prepend), so the analyzer never scans switchboard's
+  *own* secrets — only the pull request's code.
+- **Fail closed.** Exit `0` publishes; exit `2` (quarantine) and `3` (deny)
+  block; exit `1` (analyzer error), any other code, a timeout, and a binary that
+  will not spawn **all block**. A gate that cannot run must not wave code
+  through. The wall-clock timeout is `--analyze-timeout-secs` (default 180s).
+- **Blocked previews are reported.** The block is posted into the PR's sticky
+  comment — the verdict, the finding count, and the top ~10 findings (rule, file,
+  line, message) — and the GitHub deployment status is set to **failure**. The
+  job is left in `queue/claimed/` for inspection (marked failed), not cleared as
+  a success; a later push re-runs the gate and refreshes the comment.
+
+A **reviewed example policy** is in
+[`docs/analyze-gate.example.yml`](docs/analyze-gate.example.yml). It enables the
+six **native** analyzers — `writable-exec`, `obfuscation-scan`, `secrets-scan`,
+`composer-scripts`, `dangerous-sinks`, `wp-vuln` — which are a fast file-walk
+(~2.6s on a 2000-file WordPress-scale tree, cold), so previews stay snappy.
+
+**Opt-in: `opcode-scan`.** It is deliberately left out of the default policy. It
+compiles every PHP file through ePHPm's embedded Zend engine (~+5–15s on a full
+WordPress tree), turning *suspected* sink findings into *confirmed* ones at a real
+latency cost. A node that wants that stronger detection adds `opcode-scan` to both
+`enable` and `required` in its policy file, accepting the extra per-preview time.
+`wp-vuln` stays out of `required` in the example because its feed is optional — a
+missing feed must skip, not gate. These analyzers require an `ephpm` build that
+includes them (`writable-exec`/`obfuscation-scan`/`secrets-scan`/`composer-scripts`
+landed recently); the gate stays off until `--analyze-config` is set and the
+nodes run an `ephpm` that has them.
+
 ### Preview privacy: the access gate
 
 A **private** repo's preview must not be world-readable. It isn't: switchboard
@@ -339,6 +394,21 @@ a fork builds but every `${secret.NAME}` expands to the empty string (with a
 name-only warning). Fork **teardowns** are always processed; refusing them
 would strand previews on disk.
 
+### Pre-serve analyze gate
+
+See [Pre-serve static-analysis gate](#pre-serve-static-analysis-gate) for what
+this does and [`docs/analyze-gate.example.yml`](docs/analyze-gate.example.yml) for
+a reviewed example policy.
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--analyze-config` | `SWITCHBOARD_ANALYZE_CONFIG` | *(none)* | Operator `ephpm analyze` policy file. **Unset disables the gate** (deploys behave as before; startup `WARN`s). When set, every deploy runs `ephpm analyze <checkout> --config <this> --format sarif` before the swap and blocks on a bad verdict. Passed with an explicit `--config` so a PR's own `.ephpm-analyze.yml` cannot neuter it — keep it **outside** any tenant docroot, with absolute paths inside. |
+| `--analyze-timeout-secs` | `SWITCHBOARD_ANALYZE_TIMEOUT_SECS` | `180` | Wall-clock timeout for one `ephpm analyze` run. A run that exceeds it is killed and the deploy is **blocked** (fail closed). Only consulted when `--analyze-config` is set. |
+
+Exit-code contract (from `ephpm analyze`): `0` publishes; `2` (quarantine) and
+`3` (deny) block; `1` (analyzer error), any other code, and a timeout all block
+(fail closed). The gate reuses `--ephpm-bin`, which must support `analyze`.
+
 ### Preview access gate (ephpm#487/#491)
 
 See [Preview privacy: the access gate](#preview-privacy-the-access-gate) for what
@@ -436,7 +506,8 @@ pinned to the crate's MSRV on the ephpm org's self-hosted fleet.
 | `src/queue.rs` | Scan, claim (`link`+`unlink`), coalesce per label, complete; the enqueue timestamp a claimed job carries |
 | `src/validate.rs` | Claim-time re-validation of a deploy job: the queue-age bound and the current-PR-state check |
 | `src/drain.rs` | The `/drain` kick and the shared-secret file |
-| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → env → quarantine the manifest → per-site override → atomic swap → chown to tenant → build → seed → health. `build:`/`seed:` run sandboxed via `ephpm exec --site` (fail-closed if unsupported). |
+| `src/deployer.rs` | The provisioning pipeline: fetch → manifest → **analyze gate** → env → quarantine the manifest → per-site override → atomic swap → chown to tenant → build → seed → health. `build:`/`seed:` run sandboxed via `ephpm exec --site` (fail-closed if unsupported). |
+| `src/analyze.rs` | The pre-serve static-analysis gate: run `ephpm analyze` over the pristine checkout, the pure exit-code→proceed/block decision, SARIF finding parsing, and the fail-closed contract |
 | `src/site_override.rs` | The per-site override ePHPm reads: validating `docroot:` and the env prepend against ePHPm's own containment rules, the `[preview_auth]` gate section, rendering the TOML, and writing it atomically |
 | `src/preview_auth.rs` | The access-gate control plane: gating policy, session-secret resolution (fail closed), wire-compatible HS256 share-token minting, and the per-site KV password derivation |
 | `src/kv.rs` | A tiny RESP2 client for bumping the share-link revocation epoch in a preview's KV keyspace on teardown (best-effort) |

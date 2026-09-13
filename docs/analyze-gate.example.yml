@@ -1,0 +1,51 @@
+# Example operator policy for switchboard's pre-serve analyze gate.
+#
+# This is a REVIEWED STARTING POINT, not a default — the gate stays OFF until an
+# operator points `switchboard --analyze-config` (SWITCHBOARD_ANALYZE_CONFIG) at
+# a file like this one AND the node's `ephpm` (`--ephpm-bin`) is recent enough to
+# carry the analyzers below.
+#
+# SECURITY — where this file lives matters:
+#   * Put it OUTSIDE any tenant docroot, somewhere the tenant cannot write
+#     (e.g. /etc/switchboard/). switchboard passes it to `ephpm analyze` with an
+#     explicit `--config`, which overrides `ephpm analyze`'s auto-discovery of a
+#     `.ephpm-analyze.yml` inside the checkout — so a malicious pull request
+#     cannot ship `enable: []` to neuter its own gate.
+#   * Every path in this file MUST be ABSOLUTE. A relative path here would
+#     resolve against the tenant's docroot, not the node.
+
+profile: none            # explicit enable only — never inherit a bundled profile
+fail_on: quarantine      # quarantine (exit 2) and deny (exit 3) both block the preview
+
+analyzers:
+  # The six NATIVE analyzers: a fast file-walk (~2.6s on a 2000-file
+  # WordPress-scale tree, cold). This is the default set — snappy previews.
+  #
+  # `opcode-scan` is deliberately NOT here. It compiles every PHP file through
+  # the embedded Zend engine (~+5–15s on a full WordPress tree), which turns
+  # *suspected* sinks into *confirmed* ones at a real latency cost. A node that
+  # wants that can OPT IN by adding `opcode-scan` to both `enable` and
+  # `required` — see the README.
+  enable: [writable-exec, obfuscation-scan, secrets-scan, composer-scripts, dangerous-sinks, wp-vuln]
+
+  # An analyzer that is `enable`d but fails to run is only fatal if it is also
+  # `required`. `wp-vuln` is intentionally left OUT of `required`: its feed is
+  # optional (see `wp_vuln_feed`), and a missing feed must skip, not gate.
+  required: [writable-exec, obfuscation-scan, secrets-scan, composer-scripts, dangerous-sinks]
+
+  # Findings on these rules deny outright regardless of score — the
+  # unambiguous "do not serve this" set.
+  deny_hard:
+    - writable-exec
+    - composer-scripts/pipe-to-shell
+    - secrets-scan/aws-access-key-id
+    - secrets-scan/private-key
+    - secrets-scan/github-token
+
+  # Optional WordPress vulnerability feed (absolute path). If the file is absent
+  # the wp-vuln analyzer skips — which is why wp-vuln is not `required`.
+  wp_vuln_feed: /var/lib/ephpm-web/wordfence-feed.json
+
+policy:
+  quarantine_score: 10
+  deny_score: 50

@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use tokio::process::Command;
 
+use crate::analyze::{self, AnalyzeBlock, AnalyzeGateResult};
 use crate::manifest::AppManifest;
 use crate::preview_auth;
 use crate::secrets::Secrets;
@@ -292,6 +293,16 @@ pub struct DeployContext<'a> {
     pub mint_share_link: bool,
     /// TTL for a minted share link. Kept short — expiry is the primary control.
     pub share_token_ttl: Duration,
+
+    // ── pre-serve static-analysis gate ─────────────────────────────────
+    /// The operator-controlled `ephpm analyze` policy file, or `None` when the
+    /// gate is disabled. Passed to `ephpm analyze --config` explicitly so a
+    /// malicious PR's own `.ephpm-analyze.yml` cannot neuter the gate. See
+    /// [`crate::analyze`].
+    pub analyze_config: Option<&'a Path>,
+    /// Wall-clock timeout for one `ephpm analyze` run. A run that exceeds it is
+    /// killed and the preview is blocked (fail closed).
+    pub analyze_timeout: Duration,
 }
 
 /// Result of a successful deployment.
@@ -314,13 +325,22 @@ pub struct DeployResult {
     /// `--share-link`). Carries only the bearer token in its query string; the
     /// signing secret never appears here.
     pub share_url: Option<String>,
+    /// `Some` when the pre-serve analyze gate **blocked** this preview: the
+    /// preview was NOT published (the atomic swap never happened) and this
+    /// carries the verdict and top findings for the PR comment and deployment
+    /// status. `None` for a normally published preview. See [`crate::analyze`].
+    pub analyze_block: Option<AnalyzeBlock>,
 }
 
 /// Deploy a preview.
 ///
 /// Pipeline order:
 /// 1. Fetch the PR head (`refs/pull/<n>/head` from the base repo) at its SHA.
-/// 2. Detect the framework and load the `ephpm.yaml` manifest (or synthesize).
+/// 2. Detect the framework and load the `ephpm.yaml` manifest (or synthesize),
+///    then run the pre-serve analyze gate over the pristine checkout and
+///    **block** (return a `DeployResult` carrying an `analyze_block`, publishing
+///    nothing) on a bad verdict. The gate is disabled unless `--analyze-config`
+///    is set. See [`crate::analyze`].
 /// 3. Materialize `env:` — resolve `${secret.NAME}` from switchboard's own
 ///    secret store and write it where the app can read it (`.env` for
 ///    build/seed shell steps, the PHP prepend for the app).
@@ -448,6 +468,59 @@ pub async fn deploy_preview(
         seed_steps = manifest.seed.len(),
         "loaded app manifest"
     );
+
+    // (2b) Pre-serve static-analysis gate (fail closed). Screen the PRISTINE
+    // checkout — the untrusted pull-request code — with `ephpm analyze` and
+    // refuse to publish on a bad verdict.
+    //
+    // Placed HERE, before everything below, on purpose:
+    //   * before `materialize_env` (step 3) writes the resolved `.env`/prepend,
+    //     so the analyzer never scans switchboard's OWN injected secrets (which
+    //     `secrets-scan` would otherwise flag on every gated deploy);
+    //   * before `build:`/`seed:` (steps 7–8) execute any of it, so a
+    //     `composer-scripts` finding blocks the code before its scripts run;
+    //   * before the atomic swap (step 6), which is the point the vhost becomes
+    //     routable — so a block means the site is never served, and on a
+    //     redeploy the previous (known-good) container stays live untouched.
+    //
+    // Because nothing external is provisioned yet (no override, no swap, no
+    // per-site DB), a block needs no teardown — it just removes the staging tree,
+    // the one artifact the ordinary deploy-failure path also leaves for the next
+    // deploy to clean. The gate is a no-op (`Skipped`) when `--analyze-config`
+    // is unset.
+    match analyze::run_gate(
+        ctx.ephpm_bin,
+        ctx.analyze_config,
+        ctx.analyze_timeout,
+        &tmp_dir,
+        &hostname,
+    )
+    .await
+    {
+        AnalyzeGateResult::Skipped | AnalyzeGateResult::Passed => {}
+        AnalyzeGateResult::Blocked(block) => {
+            // Roll back the only half-provisioned state (the staging checkout).
+            // The swap never happened, so `site_dir`, the override file and the
+            // per-site database were never touched.
+            tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+            tracing::warn!(
+                %hostname,
+                verdict = %block.verdict,
+                total_findings = block.total_findings,
+                "preview blocked by the analyze gate — not publishing"
+            );
+            return Ok(DeployResult {
+                hostname,
+                framework,
+                duration: start.elapsed(),
+                php_version: Some(manifest.php),
+                healthy: false,
+                gated,
+                share_url: None,
+                analyze_block: Some(block),
+            });
+        }
+    }
 
     // (3) Materialize env: resolve secrets and write env for the app to read.
     // Reference the FINAL (post-swap) prepend path in the sidecar. This runs
@@ -640,6 +713,9 @@ pub async fn deploy_preview(
         healthy,
         gated,
         share_url,
+        // Reaching here means the gate passed or was disabled — a published
+        // preview, never a block.
+        analyze_block: None,
     })
 }
 
@@ -2127,6 +2203,8 @@ mod tests {
             preview_session_secret_ref: "env:EPHPM_PREVIEW_SESSION_SECRET",
             mint_share_link: false,
             share_token_ttl: Duration::from_secs(86_400),
+            analyze_config: None,
+            analyze_timeout: Duration::from_secs(180),
         };
         assert!(!wait_healthy("https://example.invalid", "/", &ctx).await);
     }
@@ -2156,6 +2234,8 @@ mod tests {
             preview_session_secret_ref: "env:EPHPM_PREVIEW_SESSION_SECRET",
             mint_share_link: false,
             share_token_ttl: Duration::from_secs(86_400),
+            analyze_config: None,
+            analyze_timeout: Duration::from_secs(180),
         }
     }
 

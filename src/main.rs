@@ -17,6 +17,7 @@
 //! The legacy webhook receiver is still compiled in but defaults to **off**
 //! (`--webhook-server-enabled`).
 
+mod analyze;
 mod config;
 mod deployer;
 mod drain;
@@ -173,6 +174,27 @@ async fn main() -> anyhow::Result<()> {
         secret_ref = %config.preview_session_secret_ref,
         "preview access gate: private repos are always gated"
     );
+
+    // Pre-serve static-analysis gate. Off unless --analyze-config is set; say so
+    // once, at WARN when off (a preview cluster publishing untrusted PR code with
+    // no screening is worth one line an operator will notice), at INFO when on.
+    if config.analyze_gate_enabled() {
+        let cfg = config
+            .analyze_config
+            .as_deref()
+            .expect("analyze_gate_enabled() implies a config path");
+        info!(
+            analyze_config = %cfg.display(),
+            timeout_secs = config.analyze_timeout_secs,
+            "pre-serve analyze gate enabled — a preview is blocked on a bad `ephpm analyze` verdict"
+        );
+    } else {
+        tracing::warn!(
+            "pre-serve analyze gate is NOT configured (--analyze-config unset) — previews \
+             are published without static-analysis screening. Set --analyze-config \
+             (SWITCHBOARD_ANALYZE_CONFIG) to an operator policy file to enable it"
+        );
+    }
 
     // Build the drain kicker before anything else runs: a missing token file
     // should fail at startup, not silently warn every two seconds forever.
@@ -477,14 +499,18 @@ async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result
         preview_session_secret_ref: &state.config.preview_session_secret_ref,
         mint_share_link: state.config.share_link,
         share_token_ttl: state.config.share_token_ttl(),
+        analyze_config: state.config.analyze_config.as_deref(),
+        analyze_timeout: state.config.analyze_timeout(),
     };
     let result = deployer::deploy_preview(req, &ctx).await?;
 
-    // Reporting is best-effort: the preview is live either way, and a GitHub
-    // outage must not mark a good deploy as failed. Every node reconciles the
-    // same preview and reports, but the comment is deduplicated by its hidden
-    // marker: `post_preview_comment` finds an existing switchboard comment and
-    // updates it in place, so N nodes converge on one comment.
+    // Reporting is best-effort: the preview is live either way (or, when blocked,
+    // was never published), and a GitHub outage must not change the on-disk
+    // outcome. Every node reconciles the same preview and reports, but the
+    // comment is deduplicated by its hidden marker: `post_preview_comment` finds
+    // an existing switchboard comment and updates it in place, so N nodes
+    // converge on one comment. When the analyze gate blocked, the comment and the
+    // deployment status both render the block (see `github`).
     if let Some(client) = github_client(state, req).await {
         if let Err(e) = client.post_preview_comment(req, &result).await {
             tracing::error!(%e, "failed to post PR comment");
@@ -492,6 +518,20 @@ async fn handle_deploy(state: &AppState, req: &PreviewRequest) -> anyhow::Result
         if let Err(e) = client.create_deployment_status(req, &result).await {
             tracing::error!(%e, "failed to set deployment status");
         }
+    }
+
+    // A blocked preview was NOT published — the atomic swap never happened, so
+    // nothing external was provisioned to roll back (deploy_preview already
+    // removed its staging tree). Surface it as a failed job so it lands in
+    // `claimed/` for inspection rather than being cleared as a success. The PR
+    // comment and deployment status were posted above.
+    if let Some(block) = &result.analyze_block {
+        anyhow::bail!(
+            "preview blocked by the pre-serve analyze gate (verdict={}, {} finding(s)): {}",
+            block.verdict,
+            block.total_findings,
+            block.reason
+        );
     }
     Ok(())
 }
