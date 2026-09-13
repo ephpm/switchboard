@@ -373,14 +373,24 @@ fn format_block_comment(result: &DeployResult, block: &crate::analyze::AnalyzeBl
         let shown = block.findings.len().min(MAX_COMMENT_FINDINGS);
         body.push_str("\n| Rule | Location | Message |\n|---|---|---|\n");
         for f in block.findings.iter().take(MAX_COMMENT_FINDINGS) {
+            // Every field here is attacker-controlled: `f.file` is a filename
+            // *inside the PR* (ePHPm's SARIF emits the artifact URI without
+            // percent-encoding, so newlines, pipes and backticks — all legal in a
+            // Linux/git filename — flow through verbatim), and `f.rule_id` /
+            // `f.message` originate from the same untrusted report. Rendered raw
+            // they could break the table row or close their code span and inject
+            // markdown (a heading/link spoof) into switchboard's trusted-identity
+            // sticky comment. `file` and `rule_id` sit inside code spans, so they
+            // go through `sanitize_code` (also neutralizes backticks); `message`
+            // is a plain cell.
+            let rule = sanitize_code(&f.rule_id);
             let location = match f.line {
-                Some(line) => format!("`{}:{line}`", f.file),
-                None => format!("`{}`", f.file),
+                // The line is our own `u64`, never attacker text.
+                Some(line) => format!("`{}:{line}`", sanitize_code(&f.file)),
+                None => format!("`{}`", sanitize_code(&f.file)),
             };
             body.push_str(&format!(
-                "| `{}` | {} | {} |\n",
-                f.rule_id,
-                location,
+                "| `{rule}` | {location} | {} |\n",
                 sanitize_cell(&f.message),
             ));
         }
@@ -399,10 +409,27 @@ fn format_block_comment(result: &DeployResult, block: &crate::analyze::AnalyzeBl
     body
 }
 
-/// Make a finding message safe for a single Markdown table cell: collapse the
-/// newlines and pipes that would otherwise break the row.
+/// Make an untrusted string safe for a single Markdown **table cell**: collapse
+/// the newlines and carriage returns that would break the row, escape the pipe
+/// that would open a new column, and neutralize the backtick so an odd number of
+/// them cannot toggle a code span open across the rest of the comment.
 fn sanitize_cell(s: &str) -> String {
-    s.replace(['\n', '\r'], " ").replace('|', "\\|")
+    s.replace(['\n', '\r'], " ")
+        .replace('|', "\\|")
+        .replace('`', "'")
+}
+
+/// Make an untrusted string safe to interpolate **inside a backtick code span**
+/// in a table cell (`` `<here>` ``). On top of [`sanitize_cell`]'s row/column
+/// protection it must ensure the value carries no backtick of its own — a single
+/// one would close the span early and let everything after it render as active
+/// markdown (heading/link spoofing under switchboard's trusted identity). The
+/// backtick is replaced with an apostrophe so the rendered span stays visually
+/// faithful.
+fn sanitize_code(s: &str) -> String {
+    // Reuse the cell rules — they already replace the backtick, plus handle the
+    // newline/pipe that would break the row a code span sits in.
+    sanitize_cell(s)
 }
 
 /// The access-guidance block appended to a **gated** preview's comment.
@@ -713,10 +740,85 @@ mod tests {
         assert!(comment.contains("No per-finding detail"), "{comment}");
     }
 
-    /// A message with pipes/newlines must not break the Markdown table row.
+    /// A message with pipes/newlines/backticks must not break the row or toggle
+    /// a code span.
     #[test]
     fn finding_message_is_sanitized_for_a_table_cell() {
         assert_eq!(sanitize_cell("a | b\nc"), "a \\| b c");
+        // A backtick would otherwise open a code span spanning the rest of the
+        // comment; it is neutralized to an apostrophe.
+        assert_eq!(sanitize_cell("`code`"), "'code'");
+        assert!(!sanitize_cell("a`b").contains('`'));
+        assert!(!sanitize_code("a`b").contains('`'));
+    }
+
+    /// **Regression: comment rendering is injection-safe.** A pull request can
+    /// name a file with newlines, pipes, backticks and markdown (all legal in a
+    /// git/Linux filename, and ePHPm's SARIF passes the URI through unencoded).
+    /// The `file` and `rule_id` fields are rendered inside backtick code spans, so
+    /// a raw backtick would close the span and turn the attacker's markdown into
+    /// active markup inside switchboard's trusted-identity sticky comment. Assert
+    /// the rendered block: one table row per finding (no stray newline), no
+    /// unescaped backtick that could close a span, and no active injected markup.
+    #[test]
+    fn blocked_comment_neutralizes_a_malicious_filename() {
+        use crate::analyze::{AnalyzeBlock, Finding};
+        // Assemble the hostile filename at runtime so no literal sequence trips
+        // tooling: a real newline, a pipe, a backtick, a spoof heading and link.
+        let evil_file = format!(
+            "x{nl}## Approved {link}{nl}.php",
+            nl = '\n',
+            link = "[merge](http://evil.example)"
+        );
+        let evil_rule = format!("rule{bt}## pwned", bt = '`');
+        let block = AnalyzeBlock {
+            verdict: "deny".into(),
+            reason: "reached the deny threshold".into(),
+            findings: vec![Finding {
+                rule_id: evil_rule,
+                file: evil_file,
+                line: Some(3),
+                message: "eval on request data".into(),
+            }],
+            total_findings: 1,
+        };
+        let comment = format_deploy_comment(&blocked_result(block));
+
+        // (a) The findings table is exactly one data row: the header row, its
+        // `|---|` separator, and one finding row — the injected newline must not
+        // have split the finding across lines.
+        let finding_rows = comment
+            .lines()
+            .filter(|l| l.starts_with("| ") && !l.contains("---") && !l.contains("| Rule |"))
+            .count();
+        assert_eq!(
+            finding_rows, 1,
+            "the malicious filename must not break the single finding row:\n{comment}"
+        );
+
+        // (b) Every backtick in the output is balanced into complete code spans —
+        // an attacker backtick can never leave a span hanging open. Since our
+        // template only ever emits backticks in matched pairs, an even count
+        // proves no injected one survived.
+        assert_eq!(
+            comment.matches('`').count() % 2,
+            0,
+            "unbalanced backticks would leave a code span open:\n{comment}"
+        );
+
+        // (c) The injected markdown does not appear as active markup: the spoof
+        // link/heading text may appear as inert characters, but not on its own
+        // line as a real heading, and the code-span content is escaped.
+        assert!(
+            !comment.contains("\n## Approved"),
+            "a spoofed heading must not start its own line:\n{comment}"
+        );
+        // The rule_id's backtick was neutralized, so `## pwned` cannot escape its
+        // code span.
+        assert!(
+            !comment.contains("`rule`## pwned"),
+            "the rule_id backtick must not close its span:\n{comment}"
+        );
     }
 
     #[test]
