@@ -659,9 +659,26 @@ async fn run_analyze(
 /// a document that does not parse yields no findings and a zero total, and the
 /// block still stands on its exit code. Returns `(findings, total)` where
 /// `findings` is capped at [`MAX_STORED_FINDINGS`] and `total` is the full count.
+///
+/// # Tolerating junk before the JSON
+///
+/// We do not trust the producer's stdout hygiene: `ephpm analyze --format sarif`
+/// has been seen prepending its own tracing lines (ANSI-coloured `INFO …`) to the
+/// SARIF on stdout, so the captured bytes look like `…log lines…\n{ "$schema": …`.
+/// Parsing that verbatim fails on the leading bytes and loses every finding (the
+/// block is still correct — it comes from the exit code — but the PR comment
+/// degrades to "no parseable report"). So we skip to the first `{` and parse from
+/// there. If there is no `{` at all, there is nothing to parse and we keep the
+/// graceful empty result. This is finding-detail extraction only: a real SARIF
+/// object always begins with `{`, and the worst case for genuinely malformed JSON
+/// after the brace is still the empty fallback, never a panic.
 #[must_use]
 pub fn parse_sarif_findings(sarif: &str) -> (Vec<Finding>, usize) {
-    let Ok(root) = serde_json::from_str::<Value>(sarif) else {
+    // Skip anything before the first `{` (stray log lines, ANSI escapes, a BOM).
+    let Some(start) = sarif.find('{') else {
+        return (Vec::new(), 0);
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&sarif[start..]) else {
         return (Vec::new(), 0);
     };
     let mut findings = Vec::new();
@@ -924,6 +941,58 @@ mod tests {
         assert_eq!(parse_sarif_findings(""), (Vec::new(), 0));
         // Well-formed JSON with no runs is simply zero findings, not an error.
         assert_eq!(parse_sarif_findings("{}"), (Vec::new(), 0));
+    }
+
+    /// **Regression (live E2E defect).** `ephpm analyze --format sarif` was seen
+    /// prepending ANSI-coloured tracing lines to the SARIF on stdout, so the
+    /// captured bytes are log noise followed by the JSON. Parsing must skip to the
+    /// first `{` and still extract every finding — otherwise the block comment
+    /// degrades to "0 findings / no parseable report" even though the deny is
+    /// correct.
+    #[test]
+    fn leading_log_noise_before_the_json_is_tolerated() {
+        // Assemble the ESC bytes at runtime so no literal escape sequence lands
+        // in the source. `\x1b[2m … \x1b[0m` is what `tracing`'s ANSI layer emits.
+        let esc = '\u{1b}';
+        let log_prefix = format!(
+            "{esc}[2m2026-09-13T21:00:00Z{esc}[0m  INFO analyzer skipped \
+             analyzer=wp-vuln reason=feed-absent\n\
+             {esc}[2m2026-09-13T21:00:01Z{esc}[0m  INFO analyze complete\n"
+        );
+        let sarif_json = r#"{
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+                "results": [{
+                    "ruleId": "dangerous-sinks/eval",
+                    "message": { "text": "use of eval() on request data" },
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": { "uri": "wp-content/themes/x/functions.php" },
+                            "region": { "startLine": 42 }
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+        let stdout = format!("{log_prefix}{sarif_json}");
+
+        let (findings, total) = parse_sarif_findings(&stdout);
+        assert_eq!(total, 1, "the leading log lines must not lose the finding");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "dangerous-sinks/eval");
+        assert_eq!(findings[0].file, "wp-content/themes/x/functions.php");
+        assert_eq!(findings[0].line, Some(42));
+    }
+
+    /// Junk with no `{` at all keeps the graceful empty result (no panic) — the
+    /// block still stands on its exit code, the comment just has no detail.
+    #[test]
+    fn log_noise_with_no_json_object_is_the_graceful_empty_path() {
+        let esc = '\u{1b}';
+        let only_logs =
+            format!("{esc}[2m2026-09-13T21:00:00Z{esc}[0m  ERROR analyzer crashed before output\n");
+        assert_eq!(parse_sarif_findings(&only_logs), (Vec::new(), 0));
     }
 
     // ── cluster-shared verdict dedup (pure logic) ──────────────────────
