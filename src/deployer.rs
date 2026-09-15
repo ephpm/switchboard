@@ -248,6 +248,12 @@ pub struct DeployContext<'a> {
     pub site_overrides_dir: Option<&'a Path>,
     /// Composer command (or path).
     pub composer: &'a str,
+    /// Route Composer invocations through the embedded `ephpm composer`
+    /// (vivacity) fast installer. When `true`, a `build:`/`seed:` command whose
+    /// leading token is `composer` is rewritten to `ephpm composer`, and the
+    /// implicit `composer install` runs as `ephpm composer install …`. See
+    /// [`route_composer_command`] for the exact (recursion-safe) rewrite.
+    pub use_ephpm_composer: bool,
     /// The `ephpm` binary that runs `build:` / `seed:` steps inside the tenant
     /// sandbox (`ephpm exec --site`). A build/seed refuses to run if this binary
     /// does not support `exec` — it is never bypassed to run steps as root.
@@ -685,7 +691,15 @@ pub async fn deploy_preview(
     // (7) Run build: commands now that the code lives at `sites_dir/<key>` — the
     // vhost `ephpm exec --site` sandboxes. Runs at the container root (where
     // `composer.json` lives), not the document root.
-    run_build(&manifest, &site_dir, ctx.composer, sandbox, &hostname).await;
+    run_build(
+        &manifest,
+        &site_dir,
+        ctx.composer,
+        ctx.use_ephpm_composer,
+        sandbox,
+        &hostname,
+    )
+    .await;
 
     // (8) Run seed: commands now that the site is live and its per-site DB can
     // be created on first access.
@@ -693,6 +707,7 @@ pub async fn deploy_preview(
     run_seed(
         &manifest,
         &site_dir,
+        ctx.use_ephpm_composer,
         sandbox,
         &preview_url,
         &hostname,
@@ -1251,6 +1266,45 @@ async fn ensure_sandboxed_exec(ephpm_bin: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Route a tenant `build:`/`seed:` command's leading `composer` invocation
+/// through the embedded `ephpm composer` (vivacity) fast installer, when
+/// `enabled`.
+///
+/// Only a **genuine leading `composer` token** is rewritten:
+/// `composer install --no-dev` → `ephpm composer install --no-dev`. Any command
+/// whose first whitespace-delimited word is not exactly `composer` is returned
+/// verbatim — `my-composer …`, `php composer.phar …`, `echo composer`, or a
+/// `composer` appearing only inside a later argument all pass through untouched.
+/// Leading whitespace is preserved. When `enabled` is `false` the command is
+/// always returned unchanged.
+///
+/// # Recursion safety
+///
+/// This rewrites only switchboard's **own** constructed command string; it never
+/// installs or shadows a `composer` on `PATH`. `ephpm composer`'s out-of-scope
+/// fallback shells out with `Command::new("composer")` — a `PATH` search that
+/// ignores shell aliases — which therefore resolves to the host's **real** PHP
+/// composer, not back into this rewrite. A command already starting with
+/// `ephpm` (e.g. a re-entered `ephpm composer install`) has leading token
+/// `ephpm`, not `composer`, so it is left alone. The host must keep a real PHP
+/// `composer` on `PATH` for the fallback.
+fn route_composer_command(cmd: &str, enabled: bool) -> String {
+    if !enabled {
+        return cmd.to_owned();
+    }
+    let trimmed = cmd.trim_start();
+    let lead_ws = &cmd[..cmd.len() - trimmed.len()];
+    let (first, rest) = match trimmed.find(char::is_whitespace) {
+        Some(i) => (&trimmed[..i], &trimmed[i..]),
+        None => (trimmed, ""),
+    };
+    if first == "composer" {
+        format!("{lead_ws}ephpm composer{rest}")
+    } else {
+        cmd.to_owned()
+    }
+}
+
 /// Run the manifest's `build:` commands in order, each sandboxed via
 /// `ephpm exec --site`. If the manifest declares no build steps, fall back to an
 /// implicit `composer install` when a `composer.json` exists (POC
@@ -1259,19 +1313,32 @@ async fn ensure_sandboxed_exec(ephpm_bin: &Path) -> anyhow::Result<()> {
 /// Every step runs at the **container root** (`site_dir`) — where
 /// `composer.json` and the project files live — not the document root, as the
 /// pre-sandbox path did (it ran `sh -c` with `current_dir(checkout)`).
+///
+/// When `use_ephpm_composer` is set, each step's leading `composer` token is
+/// routed through `ephpm composer` ([`route_composer_command`]) and the implicit
+/// install runs as `ephpm composer install …` instead of the single-token
+/// `--composer` binary.
 async fn run_build(
     manifest: &AppManifest,
     site_dir: &Path,
     composer: &str,
+    use_ephpm_composer: bool,
     sandbox: SandboxExec<'_>,
     hostname: &str,
 ) {
     if manifest.build.is_empty() {
         if site_dir.join("composer.json").exists() {
-            tracing::info!(%hostname, "no build steps declared — running implicit composer install (sandboxed)");
-            let cmd = format!(
-                "{} install --no-dev --no-interaction --optimize-autoloader --quiet",
+            // The installer front: the embedded `ephpm composer` (two tokens,
+            // not posix-quoted as one) when routing is on, else the configured
+            // single-token PHP composer binary.
+            let installer = if use_ephpm_composer {
+                "ephpm composer".to_owned()
+            } else {
                 posix_single_quote(composer)
+            };
+            tracing::info!(%hostname, %use_ephpm_composer, "no build steps declared — running implicit composer install (sandboxed)");
+            let cmd = format!(
+                "{installer} install --no-dev --no-interaction --optimize-autoloader --quiet"
             );
             let status = sandbox
                 .command(site_dir, &cmd)
@@ -1290,10 +1357,11 @@ async fn run_build(
         return;
     }
 
-    for (i, cmd) in manifest.build.iter().enumerate() {
+    for (i, raw) in manifest.build.iter().enumerate() {
+        let cmd = route_composer_command(raw, use_ephpm_composer);
         tracing::info!(%hostname, step = i + 1, command = %cmd, "running build step (sandboxed)");
         let status = sandbox
-            .command(site_dir, cmd)
+            .command(site_dir, &cmd)
             .env("COMPOSER_NO_INTERACTION", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1637,16 +1705,18 @@ fn render_dotenv(env: &BTreeMap<String, String>) -> String {
 async fn run_seed(
     manifest: &AppManifest,
     site_dir: &Path,
+    use_ephpm_composer: bool,
     sandbox: SandboxExec<'_>,
     preview_url: &str,
     hostname: &str,
     pr_number: u64,
 ) {
     let workdir = site_dir.join(&manifest.docroot);
-    for (i, cmd) in manifest.seed.iter().enumerate() {
+    for (i, raw) in manifest.seed.iter().enumerate() {
+        let cmd = route_composer_command(raw, use_ephpm_composer);
         tracing::info!(%hostname, step = i + 1, command = %cmd, "running seed step (sandboxed)");
         let status = sandbox
-            .command(&workdir, cmd)
+            .command(&workdir, &cmd)
             .env("PREVIEW_URL", preview_url)
             .env("PREVIEW_HOST", hostname)
             .env("PR", pr_number.to_string())
@@ -2225,6 +2295,7 @@ mod tests {
             sites_domain_suffix: Some(".preview.ephpm.dev"),
             site_overrides_dir: None,
             composer: "composer",
+            use_ephpm_composer: false,
             ephpm_bin: Path::new("ephpm"),
             ephpm_config: Path::new("/etc/ephpm/ephpm.toml"),
             secrets: &secrets,
@@ -2259,6 +2330,7 @@ mod tests {
             sites_domain_suffix: Some(".preview.ephpm.dev"),
             site_overrides_dir: overrides,
             composer: "composer",
+            use_ephpm_composer: false,
             ephpm_bin: Path::new("ephpm"),
             ephpm_config: Path::new("/etc/ephpm/ephpm.toml"),
             secrets,
@@ -2618,6 +2690,95 @@ mod tests {
         assert_eq!(posix_single_quote("/a'b"), "'/a'\\''b'");
         let argv = sandbox().argv(Path::new("/a'b"), "true");
         assert_eq!(argv[8], "cd '/a'\\''b' && true");
+    }
+
+    // ── routing Composer through embedded `ephpm composer` (vivacity) ────
+
+    /// Case 1: with routing on, a build step's leading `composer` becomes
+    /// `ephpm composer`, arguments preserved.
+    #[test]
+    fn routing_rewrites_a_leading_composer_token() {
+        assert_eq!(
+            route_composer_command("composer install --no-dev", true),
+            "ephpm composer install --no-dev"
+        );
+        // Bare `composer` with no arguments.
+        assert_eq!(route_composer_command("composer", true), "ephpm composer");
+        // Leading whitespace is preserved (still a genuine leading token).
+        assert_eq!(
+            route_composer_command("  composer update", true),
+            "  ephpm composer update"
+        );
+    }
+
+    /// Case 1 (end-to-end argv): the routed step, once wrapped by the sandbox,
+    /// actually executes `ephpm composer install …` inside `ephpm exec … sh -c`.
+    #[test]
+    fn routed_build_step_executes_ephpm_composer_in_the_sandbox() {
+        let routed = route_composer_command("composer install --no-dev", true);
+        let argv = sandbox().argv(Path::new("/var/www/sites/app-pr-1"), &routed);
+        assert_eq!(
+            argv.last().unwrap(),
+            "cd '/var/www/sites/app-pr-1' && ephpm composer install --no-dev"
+        );
+        // The program is still the ephpm binary (never a bare composer/sh).
+        let cmd = sandbox().command(Path::new("/var/www/sites/app-pr-1"), &routed);
+        assert_eq!(
+            cmd.as_std().get_program().to_string_lossy(),
+            "/usr/local/bin/ephpm"
+        );
+    }
+
+    /// Case 3: with routing off, the command is byte-for-byte unchanged — no
+    /// regression against today's behaviour.
+    #[test]
+    fn routing_off_leaves_the_command_untouched() {
+        assert_eq!(
+            route_composer_command("composer install --no-dev", false),
+            "composer install --no-dev"
+        );
+        let argv = sandbox().argv(
+            Path::new("/var/www/sites/app-pr-1"),
+            &route_composer_command("composer install", false),
+        );
+        assert_eq!(
+            argv.last().unwrap(),
+            "cd '/var/www/sites/app-pr-1' && composer install"
+        );
+    }
+
+    /// Case 4: `composer` as a **non-leading** token (or a look-alike leading
+    /// token) is never rewritten, even with routing on.
+    #[test]
+    fn routing_ignores_non_leading_and_lookalike_composer() {
+        // Non-leading occurrences.
+        assert_eq!(
+            route_composer_command("php artisan queue:work composer", true),
+            "php artisan queue:work composer"
+        );
+        assert_eq!(
+            route_composer_command("echo composer install", true),
+            "echo composer install"
+        );
+        // A leading word that merely contains "composer" as a substring.
+        assert_eq!(
+            route_composer_command("my-composer install", true),
+            "my-composer install"
+        );
+        assert_eq!(
+            route_composer_command("composer.phar install", true),
+            "composer.phar install"
+        );
+        assert_eq!(
+            route_composer_command("php composer.phar install", true),
+            "php composer.phar install"
+        );
+        // Already-routed command: leading token is `ephpm`, so it is left alone
+        // (no double-rewrite, no `ephpm ephpm composer`).
+        assert_eq!(
+            route_composer_command("ephpm composer install", true),
+            "ephpm composer install"
+        );
     }
 
     #[test]

@@ -100,6 +100,26 @@ pub struct Config {
     #[arg(long, default_value = "composer", env = "SWITCHBOARD_COMPOSER")]
     pub composer: String,
 
+    /// Route a preview's Composer invocations through the embedded
+    /// `ephpm composer` (vivacity) fast Rust installer instead of the PHP
+    /// `composer` named by `--composer`.
+    ///
+    /// Off by default (opt-in). When on, the leading `composer` token of every
+    /// `build:`/`seed:` command is rewritten to `ephpm composer` before it runs
+    /// in the tenant sandbox, and the implicit `composer install` (run when a
+    /// manifest declares no build steps) becomes `ephpm composer install …`.
+    /// PR authors' manifests are **not** touched — only the command switchboard
+    /// constructs and executes changes.
+    ///
+    /// Recursion-safe by construction: switchboard rewrites only its **own**
+    /// constructed command and never shadows `composer` on `PATH`, so vivacity's
+    /// out-of-scope fallback — a `PATH` search (`Command::new("composer")`) — still
+    /// resolves to the host's real PHP composer. **The host must therefore keep a
+    /// real PHP `composer` on `PATH`** (and an `ephpm` that carries the `composer`
+    /// subcommand) for the fallback to work.
+    #[arg(long, default_value_t = false, env = "SWITCHBOARD_EPHPM_COMPOSER")]
+    pub use_ephpm_composer: bool,
+
     /// The `ephpm` binary used to run manifest `build:` / `seed:` steps inside
     /// the tenant sandbox (`ephpm exec --site`).
     ///
@@ -576,6 +596,8 @@ mod tests {
         assert_eq!(c.sites_dir, PathBuf::from("/var/www/sites"));
         assert_eq!(c.preview_domain, "preview.ephpm.dev");
         assert_eq!(c.composer, "composer");
+        // Composer routing is opt-in: off unless the operator asks for it.
+        assert!(!c.use_ephpm_composer);
         // Build/seed run through `ephpm exec` — the binary defaults to PATH and
         // the config to ePHPm's own default location.
         assert_eq!(c.ephpm_bin, PathBuf::from("ephpm"));
@@ -1076,6 +1098,14 @@ mod tests {
         );
         assert_eq!(c.health_timeout_secs, 5);
         assert_eq!(c.health_interval_secs, 1);
+        // Not passed above → stays off.
+        assert!(!c.use_ephpm_composer);
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn use_ephpm_composer_flag_opts_in() {
+        let c = parse_single_node(&["--use-ephpm-composer"]);
+        assert!(c.use_ephpm_composer);
     }
 }
