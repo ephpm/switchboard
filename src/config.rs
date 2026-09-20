@@ -279,15 +279,15 @@ pub struct Config {
     /// that is lost or not-yet-gossiped strands a teardown (the preview stays
     /// served, its database and override on disk) with every health check green
     /// (switchboard#24). This pass is the level-triggered safety net: every
-    /// interval it reads the KV desired state *directly* (independent of `gen`)
-    /// and converges this node's on-disk previews to it — pruning orphans and,
-    /// with `--reconcile-deploy-missing`, enqueuing deploys it never saw.
+    /// interval it asks **GitHub** whether each on-disk preview's PR is still
+    /// open, and prunes the ones whose PR has merged or closed. It needs no KV
+    /// (the preview nodes keep ePHPm's RESP listener off) and no ePHPm-side
+    /// change — only the switchboard App credentials it already reports with.
     ///
-    /// Requires `--kv-secret-file` (the pass reads desired state over RESP) and a
-    /// resolvable API site key (`--reconcile-api-site`, else derived from
-    /// `--drain-host`); the daemon refuses to start with a non-zero interval and
-    /// neither. A sane cadence is well above the two-second drain tick — it is a
-    /// backstop, not the hot path — e.g. 30–60s.
+    /// Requires `--app-id`/`--app-key`; the daemon refuses to start with a
+    /// non-zero interval and no App credentials (the pass would query nothing).
+    /// A sane cadence is well above the two-second drain tick — it is a backstop,
+    /// not the hot path — e.g. 30–60s.
     #[arg(long, default_value_t = 0, env = "SWITCHBOARD_RECONCILE_INTERVAL_SECS")]
     pub reconcile_interval_secs: u64,
 
@@ -299,47 +299,21 @@ pub struct Config {
     #[arg(long, default_value_t = false, env = "SWITCHBOARD_RECONCILE_PRUNE")]
     pub reconcile_prune: bool,
 
-    /// Enqueue a deploy for a desired preview whose directory is absent on this
-    /// node. **Off by default**: re-provisioning runs composer and a checkout,
-    /// so recovering a missed *deploy* is a heavier, separate opt-in from
-    /// removing a stranded *teardown*. When on, the reconcile writes the exact
-    /// job document into the queue and the normal deploy path runs it.
-    #[arg(
-        long,
-        default_value_t = false,
-        env = "SWITCHBOARD_RECONCILE_DEPLOY_MISSING"
-    )]
-    pub reconcile_deploy_missing: bool,
-
     /// Comma-separated vhost directory names the reconcile must never prune —
     /// the node's infra/test sites that are not PR previews (e.g.
-    /// `switchboard,site-a,site-b`). The API's own site key is always protected
-    /// in addition to this list. A preview directory is only ever a prune
-    /// candidate when it is absent from this set *and* its own KV preview key is
-    /// gone or torn down.
+    /// `site-a,site-b,preview.ephpm.dev`). The API's own site key is always
+    /// protected in addition to this list. Belt-and-braces: a non-`<owner>-<repo>-pr-<N>`
+    /// directory never parses as a preview and so is never a prune candidate
+    /// regardless.
     #[arg(long, default_value = "", env = "SWITCHBOARD_RECONCILE_KEEP_SITES")]
     pub reconcile_keep_sites: String,
 
-    /// Upper bound on orphans pruned in a single pass — a blast-radius guard.
-    /// A misconfiguration (wrong keep-list, a flushed KV) cannot then wipe the
-    /// fleet in one tick; the excess is deferred to later passes, giving the
-    /// WARN/INFO logs time to be noticed. Floored at one.
-    #[arg(
-        long,
-        default_value_t = 8,
-        env = "SWITCHBOARD_RECONCILE_MAX_PRUNES_PER_CYCLE"
-    )]
-    pub reconcile_max_prunes_per_cycle: usize,
-
-    /// The switchboard-api vhost's canonical **site key**, whose gossip-replicated
-    /// keyspace holds the `switchboard:*` desired-state keys the reconcile reads.
-    ///
-    /// Defaults to the site key derived from `--drain-host` (the same host the
-    /// drain kick addresses), which is correct whenever the API is reached at its
-    /// own vhost. Set it explicitly only if the API's KV site key differs from
-    /// its drain host.
-    #[arg(long, env = "SWITCHBOARD_RECONCILE_API_SITE")]
-    pub reconcile_api_site: Option<String>,
+    /// The GitHub owner/org the previews belong to — the leading segment of a
+    /// preview site key `<owner>-<repo>-pr-<N>`, and the owner the reconcile
+    /// queries PR state under. Defaults to `ephpm` (the fleet's org); set it if
+    /// previews are built for a different org.
+    #[arg(long, default_value = "ephpm", env = "SWITCHBOARD_RECONCILE_OWNER")]
+    pub reconcile_owner: String,
 
     // ── pre-serve static-analysis gate ─────────────────────────────────
     /// Path to the operator-controlled `ephpm analyze` policy file (YAML), used
@@ -521,35 +495,24 @@ impl Config {
         self.reconcile_interval_secs > 0
     }
 
-    /// The switchboard-api vhost's canonical site key, whose keyspace the
-    /// reconcile reads: the explicit `--reconcile-api-site` if set, otherwise
-    /// derived from `--drain-host` with this node's suffix rule.
+    /// The switchboard-api vhost's canonical site key, derived from
+    /// `--drain-host` with this node's suffix rule — added to the reconcile
+    /// keep-list so the API's own vhost is never a prune candidate.
     ///
-    /// `Ok(None)` when neither an override nor a drain host is available.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a drain host is present but does not normalize to a
-    /// valid site key.
-    pub fn reconcile_api_site(&self) -> anyhow::Result<Option<String>> {
-        if let Some(explicit) = &self.reconcile_api_site {
-            return Ok(Some(explicit.clone()));
-        }
-        let Some(host) = &self.drain_host else {
-            return Ok(None);
-        };
+    /// `None` when no drain host is configured (single-node mode) or it does not
+    /// normalize to a valid site key; the keep-list simply omits it then (and the
+    /// `<owner>-<repo>-pr-<N>` parse rule already excludes an infra vhost anyway).
+    #[must_use]
+    pub fn drain_host_site_key(&self) -> Option<String> {
+        let host = self.drain_host.as_ref()?;
         let suffix = self.effective_sites_domain_suffix();
-        crate::site_key::site_key(host, suffix.as_deref())
-            .map(Some)
-            .with_context(|| {
-                format!("cannot derive the switchboard-api site key from --drain-host {host:?}")
-            })
+        crate::site_key::site_key(host, suffix.as_deref()).ok()
     }
 
     /// The reconcile keep-list — vhost names never pruned — from
-    /// `--reconcile-keep-sites`, with the API site key always added.
+    /// `--reconcile-keep-sites`, with the API site key added when known.
     #[must_use]
-    pub fn reconcile_keep_set(&self, api_site: &str) -> std::collections::HashSet<String> {
+    pub fn reconcile_keep_set(&self, api_site: Option<&str>) -> std::collections::HashSet<String> {
         let mut set: std::collections::HashSet<String> = self
             .reconcile_keep_sites
             .split(',')
@@ -557,7 +520,9 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
-        set.insert(api_site.to_string());
+        if let Some(api_site) = api_site {
+            set.insert(api_site.to_string());
+        }
         set
     }
 
@@ -599,22 +564,20 @@ impl Config {
             "--fork-secrets has no effect without --allow-fork-deploy — set \
              both to build forks with operator secrets, or neither"
         );
-        // The reconcile reads desired state over RESP and addresses the API's
-        // KV keyspace by site key; without a secret or a resolvable site key it
-        // is silent dead configuration, so refuse to start rather than run a
-        // pass that can do nothing.
+        // The reconcile decides prune-vs-keep by asking GitHub for each preview's
+        // PR state, so it needs the App credentials. Without them every pass would
+        // abort (mint nothing, prune nothing) — silent dead configuration, so
+        // refuse to start rather than run a pass that can do nothing.
         if self.reconcile_enabled() {
             anyhow::ensure!(
-                self.kv_secret_file.is_some(),
-                "--reconcile-interval-secs is non-zero but --kv-secret-file is unset — \
-                 the reconcile reads cluster desired state over RESP and cannot without \
-                 ePHPm's [kv] secret (set it to 0 to disable the reconcile)"
+                self.github_reporting_enabled(),
+                "--reconcile-interval-secs is non-zero but --app-id/--app-key are unset — \
+                 the reconcile queries GitHub for each preview's PR state and cannot without \
+                 the switchboard App credentials (set the interval to 0 to disable it)"
             );
             anyhow::ensure!(
-                self.reconcile_api_site()?.is_some(),
-                "--reconcile-interval-secs is non-zero but the switchboard-api site key \
-                 could not be resolved — set --reconcile-api-site, or --drain-host to \
-                 derive it from"
+                !self.reconcile_owner.trim().is_empty(),
+                "--reconcile-owner must not be empty when the reconcile is enabled"
             );
         }
         // A daemon that cannot remove a tenant's database when its PR closes is

@@ -472,27 +472,31 @@ database and `<key>.toml` override on disk, every health check green. This is th
 class of fault behind override counts drifting between nodes and orphaned
 overrides lingering as 404s.
 
-The reconcile pass is the **level-triggered** backstop. On its own interval,
-independent of `gen`, it reads the KV desired state *directly* and converges this
-node's on-disk previews to it. Pruning classifies each preview directory from its
-**own** `switchboard:preview:<label>` key (a plain `set`, immune to both the
-`gen` propagation race and the index's lost-update race), so it never trusts the
-index and never false-positives a live preview into an orphan.
+The reconcile pass is the **level-triggered** backstop, and its authority is
+**GitHub PR state** — needing no KV and no ePHPm-side change (the preview nodes
+keep ePHPm's RESP listener off). On its own interval, independent of `gen`, it
+lists every preview directory, parses each site key `<owner>-<repo>-pr-<N>` back
+to its pull request, and asks GitHub whether that PR is still open. **Open (or an
+unrecognised state) ⇒ keep; merged or closed ⇒ prune.** GitHub is more
+authoritative than the KV index (which has a lost-update window), and a preview
+that has fallen off every other signal is still correctly classified by the one
+fact that actually decides whether it should exist. Re-*deploying* a missing but
+still-open preview is deliberately left to the webhook path; this pass only
+removes what GitHub says is gone.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--reconcile-interval-secs` | `SWITCHBOARD_RECONCILE_INTERVAL_SECS` | `0` | Seconds between reconcile passes. **`0` disables it.** Requires `--kv-secret-file` and a resolvable API site key; a backstop, not the hot path, so a cadence well above the drain tick (e.g. 30–60s) is right. |
-| `--reconcile-prune` | `SWITCHBOARD_RECONCILE_PRUNE` | `false` | Actually remove orphaned previews. **Off by default**: until set, the pass is observability-only and logs each orphan it *would* prune at `WARN`. |
-| `--reconcile-deploy-missing` | `SWITCHBOARD_RECONCILE_DEPLOY_MISSING` | `false` | Enqueue a deploy for a desired preview whose directory is absent on this node (recovers a deploy a node never saw). Off by default — re-provisioning runs composer and a checkout. |
-| `--reconcile-keep-sites` | `SWITCHBOARD_RECONCILE_KEEP_SITES` | *(empty)* | Comma-separated vhost directory names never pruned — the node's infra/test sites (e.g. `switchboard,site-a,site-b`). The API's own site key is always protected in addition. |
-| `--reconcile-max-prunes-per-cycle` | `SWITCHBOARD_RECONCILE_MAX_PRUNES_PER_CYCLE` | `8` | Blast-radius guard: at most this many orphans are removed per pass, the excess deferred to later passes so a misconfiguration cannot wipe the fleet in one tick. |
-| `--reconcile-api-site` | `SWITCHBOARD_RECONCILE_API_SITE` | *(derived from `--drain-host`)* | The switchboard-api vhost's canonical site key, whose keyspace holds the `switchboard:*` desired-state keys. Set only if it differs from the drain host's site key. |
+| `--reconcile-interval-secs` | `SWITCHBOARD_RECONCILE_INTERVAL_SECS` | `0` | Seconds between reconcile passes. **`0` disables it.** Requires `--app-id`/`--app-key` (the pass queries GitHub); a backstop, not the hot path, so a cadence well above the drain tick (e.g. 30–60s) is right. |
+| `--reconcile-prune` | `SWITCHBOARD_RECONCILE_PRUNE` | `false` | Actually remove orphaned previews (PRs merged/closed). **Off by default**: until set, the pass is observability-only and logs each orphan it *would* prune at `WARN`. |
+| `--reconcile-keep-sites` | `SWITCHBOARD_RECONCILE_KEEP_SITES` | *(empty)* | Comma-separated vhost directory names never pruned — the node's infra/test sites (e.g. `site-a,site-b,preview.ephpm.dev`). The API's own site key is always protected in addition. (Belt-and-braces: a non-`<owner>-<repo>-pr-<N>` directory never parses as a preview, so it is never a prune candidate regardless.) |
+| `--reconcile-owner` | `SWITCHBOARD_RECONCILE_OWNER` | `ephpm` | The GitHub owner/org previews belong to — the leading segment of `<owner>-<repo>-pr-<N>`, and the owner PR state is queried under. |
 
 Rollout is fail-safe: enable the interval first and read the dry-run `WOULD
-prune` logs; turn on `--reconcile-prune` once they look right; add
-`--reconcile-deploy-missing` last. A KV read failure aborts the whole pass — the
-reconcile prunes **nothing** rather than act against an authority it could not
-read.
+prune` logs; turn on `--reconcile-prune` once they look right. Uncertainty always
+resolves to **keep** — a site key that does not parse as `<owner>-<repo>-pr-<N>`
+(an infra vhost, or a hashed/overflow label) is skipped, a per-PR GitHub read
+error keeps that preview, and a failure to mint the installation token aborts the
+whole pass so a total GitHub outage prunes **nothing**.
 
 ### GitHub reporting (optional)
 
