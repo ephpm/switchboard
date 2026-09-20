@@ -27,6 +27,7 @@ mod kv;
 mod manifest;
 mod preview_auth;
 mod queue;
+mod reconcile;
 mod secrets;
 mod site_key;
 mod site_override;
@@ -51,6 +52,7 @@ use deployer::PreviewRequest;
 use drain::DrainKicker;
 use job::Intent;
 use queue::{ClaimedJob, Queue};
+use reconcile::ReconcileContext;
 use secrets::Secrets;
 use validate::Verdict;
 
@@ -239,6 +241,21 @@ async fn main() -> anyhow::Result<()> {
     let webhook_server_enabled = config.webhook_server_enabled;
     let listen = config.listen.clone();
 
+    // Resolve the level-triggered reconcile's settings before `config` moves
+    // into the shared state. `validate()` has already guaranteed a KV secret and
+    // a resolvable API site key whenever the interval is non-zero.
+    let reconcile_setup = if config.reconcile_enabled() {
+        let api_site = config
+            .reconcile_api_site()?
+            .expect("validate() guarantees a reconcile API site key when enabled");
+        let keep = config.reconcile_keep_set(&api_site);
+        let interval = Duration::from_secs(config.reconcile_interval_secs.max(1));
+        Some((api_site, keep, interval))
+    } else {
+        info!("level-triggered reconcile disabled (--reconcile-interval-secs 0)");
+        None
+    };
+
     let state = Arc::new(AppState {
         config,
         secrets,
@@ -247,6 +264,39 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(kicker) = kicker {
         tokio::spawn(drain_loop(kicker, drain_interval));
+    }
+
+    if let Some((api_site, keep, interval)) = reconcile_setup {
+        // The reconcile reads desired state over RESP; without a KV secret it
+        // can do nothing, and validate() only reaches here with one configured.
+        if state.kv_secret.is_some() {
+            info!(
+                interval_s = interval.as_secs(),
+                prune = state.config.reconcile_prune,
+                deploy_missing = state.config.reconcile_deploy_missing,
+                api_site = %api_site,
+                keep = keep.len(),
+                max_prunes_per_cycle = state.config.reconcile_max_prunes_per_cycle,
+                "level-triggered reconcile enabled"
+            );
+            if !state.config.reconcile_prune {
+                tracing::warn!(
+                    "reconcile is in dry-run: orphans will be logged as WOULD-prune but \
+                     NOT removed. Set --reconcile-prune once the logs look right"
+                );
+            }
+            tokio::spawn(reconcile_loop(
+                Arc::clone(&state),
+                queue.clone(),
+                api_site,
+                keep,
+                interval,
+            ));
+        } else {
+            tracing::warn!(
+                "reconcile is enabled but no KV secret resolved — reconcile pass skipped"
+            );
+        }
     }
 
     if webhook_server_enabled {
@@ -273,6 +323,61 @@ async fn drain_loop(kicker: DrainKicker, interval: Duration) {
         match kicker.kick().await {
             Ok(()) => tracing::trace!("drain kicked"),
             Err(e) => tracing::warn!(%e, url = %kicker.url(), "drain kick failed — will retry"),
+        }
+    }
+}
+
+// ── the level-triggered reconcile ──────────────────────────────────────
+
+/// Reconcile this node's on-disk previews to the cluster's KV desired state on a
+/// timer, independent of the drain/queue path's `switchboard:gen` cursor. Every
+/// failure mode is transient (KV briefly unreachable, a single wedged site), so
+/// nothing here is fatal — a failed pass is logged and the next tick retries.
+async fn reconcile_loop(
+    state: Arc<AppState>,
+    queue: Queue,
+    api_site: String,
+    keep: std::collections::HashSet<String>,
+    interval: Duration,
+) {
+    // Guarded at the spawn site; kept here so a future refactor cannot start the
+    // loop without the secret the reconcile reads desired state with.
+    let Some(kv_secret) = state.kv_secret.clone() else {
+        tracing::warn!("reconcile loop started without a KV secret — not running");
+        return;
+    };
+
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+
+        let cfg = &state.config;
+        let suffix = cfg.effective_sites_domain_suffix();
+        let ctx = ReconcileContext {
+            sites_dir: &cfg.sites_dir,
+            sqlite_dir: cfg.sqlite_dir.as_deref(),
+            site_overrides_dir: cfg.site_overrides_dir.as_deref(),
+            vhost_temp_base: cfg.vhost_temp_base.as_deref(),
+            state_dir: &cfg.state_dir,
+            allow_incomplete: cfg.allow_incomplete_teardown,
+            kv_addr: &cfg.kv_addr,
+            kv_secret: &kv_secret,
+            api_site: &api_site,
+            preview_domain: &cfg.preview_domain,
+            sites_domain_suffix: suffix.as_deref(),
+            keep: &keep,
+            prune: cfg.reconcile_prune,
+            deploy_missing: cfg.reconcile_deploy_missing,
+            max_prunes_per_cycle: cfg.reconcile_max_prunes_per_cycle.max(1),
+            queue: &queue,
+        };
+
+        if let Err(e) = reconcile::reconcile_once(&ctx).await {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "reconcile pass failed (KV unreadable?) — nothing pruned; will retry"
+            );
         }
     }
 }

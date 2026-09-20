@@ -305,6 +305,177 @@ impl VerdictCache {
     }
 }
 
+/// A reader for switchboard-api's **cluster desired-state** keys in ePHPm's KV.
+///
+/// The webhook path publishes desired state into the switchboard-api vhost's own
+/// gossip-replicated keyspace ([`crate::reconcile`] and switchboard-api's
+/// `ClusterState`): `switchboard:index` (a JSON array of every live label) and
+/// `switchboard:preview:<label>` (the full schema-1 job document). ePHPm's
+/// `ephpm_kv_*` surface has **no SCAN**, which is the whole reason the index is
+/// hand-rolled — so enumerating desired state means reading the index, then the
+/// per-label preview keys it points at.
+///
+/// This reader is what makes the daemon's reconcile **level-triggered**. The PHP
+/// `DrainHandler` only walks the index when `switchboard:gen` has advanced past
+/// the node's `last_gen`; because `gen` is a *separate* gossip key from the
+/// content it guards, an increment that is lost or not-yet-replicated leaves a
+/// node's cursor "current" at a generation whose teardown it never materialized,
+/// and every later drain short-circuits (switchboard#24, and the
+/// gen-vs-key-content propagation race). Reading the content keys **directly**,
+/// every interval, removes that dependency: the daemon converges on the KV's
+/// actual contents regardless of the counter.
+///
+/// # Scope
+///
+/// The keys live in the switchboard-api vhost's keyspace, reached with the same
+/// `AUTH <site> <derived>` scoping [`KvRevoker`] uses — here the site is the API
+/// vhost's own canonical site key (`api_site`), derived from the daemon's
+/// `--drain-host`. The password is `HMAC-SHA256(kv_secret, api_site)`.
+///
+/// # Fail-safe
+///
+/// Every read is all-or-nothing: a transport/auth failure returns `Err`, and the
+/// reconcile treats that as "KV unavailable this cycle" and does **nothing**
+/// (never prunes on an unreadable authority). Only a definitive reply — a parsed
+/// index, a bulk value, or a genuine nil — drives a decision.
+#[derive(Debug, Clone)]
+pub struct ClusterReader {
+    addr: String,
+    kv_secret: String,
+    api_site: String,
+}
+
+/// One consistent read of the cluster desired state: the index, plus the raw
+/// preview document for every label asked about (index labels ∪ the caller's
+/// on-disk labels). A `None` document is a genuine KV nil (the key is absent —
+/// a retired preview whose TTL has elapsed), distinct from a label simply not
+/// being present in the map.
+#[derive(Debug, Clone)]
+pub struct ClusterSnapshot {
+    /// Every label listed in `switchboard:index` at read time.
+    pub index: Vec<String>,
+    /// `label -> Some(raw job JSON)` when the preview key is present,
+    /// `label -> None` when it is a genuine nil.
+    pub docs: std::collections::HashMap<String, Option<String>>,
+}
+
+impl ClusterReader {
+    /// Build a reader for the switchboard-api keyspace.
+    ///
+    /// `addr` is ePHPm's RESP listener, `kv_secret` its `[kv] secret`, and
+    /// `api_site` the API vhost's canonical site key (whose keyspace holds the
+    /// `switchboard:*` desired-state keys).
+    #[must_use]
+    pub fn new(
+        addr: impl Into<String>,
+        kv_secret: impl Into<String>,
+        api_site: impl Into<String>,
+    ) -> Self {
+        Self {
+            addr: addr.into(),
+            kv_secret: kv_secret.into(),
+            api_site: api_site.into(),
+        }
+    }
+
+    /// Read the index and every requested preview document under one connection.
+    ///
+    /// `extra_labels` are labels the caller wants documents for that may not be
+    /// in the index — the labels reconstructed from what is actually on disk, so
+    /// an orphan whose index entry was already pruned is still classified from
+    /// its own (now-nil) preview key rather than guessed at.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection, AUTH, index read, or any preview read
+    /// fails. A partial read is never returned — the caller must be able to
+    /// trust that a missing document means a genuine nil, not a dropped frame.
+    pub async fn snapshot(&self, extra_labels: &[String]) -> anyhow::Result<ClusterSnapshot> {
+        tokio::time::timeout(OP_TIMEOUT, self.snapshot_inner(extra_labels))
+            .await
+            .with_context(|| format!("KV desired-state read from {} timed out", self.addr))?
+    }
+
+    async fn snapshot_inner(&self, extra_labels: &[String]) -> anyhow::Result<ClusterSnapshot> {
+        let password = derive_site_kv_password(&self.kv_secret, &self.api_site);
+
+        let stream = TcpStream::connect(&self.addr)
+            .await
+            .with_context(|| format!("cannot connect to ePHPm KV listener at {}", self.addr))?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        write_half
+            .write_all(&encode_command(&["AUTH", &self.api_site, &password]))
+            .await
+            .context("failed to send KV AUTH")?;
+        read_reply(&mut reader)
+            .await
+            .context("KV AUTH was rejected")?;
+
+        // The index first, then the union of its labels and the caller's.
+        write_half
+            .write_all(&encode_command(&["GET", INDEX_KEY]))
+            .await
+            .context("failed to send KV GET for the index")?;
+        let index_raw = read_bulk_reply(&mut reader)
+            .await
+            .context("reading switchboard:index")?;
+        let index = parse_index(index_raw.as_deref());
+
+        let mut labels: Vec<String> = index.clone();
+        for label in extra_labels {
+            if !labels.contains(label) {
+                labels.push(label.clone());
+            }
+        }
+
+        let mut docs = std::collections::HashMap::with_capacity(labels.len());
+        for label in labels {
+            let key = format!("{PREVIEW_PREFIX}{label}");
+            write_half
+                .write_all(&encode_command(&["GET", &key]))
+                .await
+                .with_context(|| format!("failed to send KV GET for {key}"))?;
+            let value = read_bulk_reply(&mut reader)
+                .await
+                .with_context(|| format!("reading {key}"))?;
+            docs.insert(label, value);
+        }
+
+        let _ = write_half.write_all(&encode_command(&["QUIT"])).await;
+        Ok(ClusterSnapshot { index, docs })
+    }
+}
+
+/// `switchboard:index` — the JSON array of live labels.
+const INDEX_KEY: &str = "switchboard:index";
+/// Prefix of a per-label preview key: `switchboard:preview:<label>`.
+const PREVIEW_PREFIX: &str = "switchboard:preview:";
+
+/// Parse `switchboard:index` — a JSON array — into a list of string labels,
+/// mirroring `ClusterState::index()` (non-strings filtered out, nil ⇒ empty).
+///
+/// A malformed or non-array value is treated as an empty index rather than an
+/// error: the index is a best-effort hint for the *add* direction, and the prune
+/// direction never trusts it (it classifies each on-disk site from that site's
+/// own preview key). An empty index therefore withdraws nothing.
+fn parse_index(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .filter_map(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Encode a command as a RESP2 array of bulk strings — the dialect ePHPm's KV
 /// server parses (`*<n>\r\n` then `$<len>\r\n<arg>\r\n` per argument).
 fn encode_command(args: &[&str]) -> Vec<u8> {
@@ -618,6 +789,98 @@ mod tests {
                 "no preview site key may equal the verdict namespace"
             );
         }
+    }
+
+    // ── the cluster desired-state reader ────────────────────────────────
+
+    #[test]
+    fn parse_index_reads_a_json_array_of_strings() {
+        assert_eq!(
+            parse_index(Some(r#"["a","b","c"]"#)),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // Non-strings are filtered (mirrors ClusterState::index()).
+        assert_eq!(parse_index(Some(r#"["a",1,null,"b"]"#)), vec!["a", "b"]);
+        // A nil, a non-array, or malformed JSON is an empty index — the prune
+        // path never trusts the index, so "empty" withdraws nothing.
+        assert!(parse_index(None).is_empty());
+        assert!(parse_index(Some("null")).is_empty());
+        assert!(parse_index(Some("{}")).is_empty());
+        assert!(parse_index(Some("{not json")).is_empty());
+    }
+
+    /// Build one RESP bulk-string frame (`$<len>\r\n<payload>\r\n`).
+    fn bulk(payload: &str) -> Vec<u8> {
+        format!("${}\r\n{payload}\r\n", payload.len()).into_bytes()
+    }
+
+    /// **The end-to-end desired-state read.** A mock RESP server replies `+OK` to
+    /// AUTH, the index as a bulk array, then one reply per preview key in request
+    /// order (index labels ∪ the caller's extra labels). Assert the snapshot
+    /// classifies a present doc, a genuine nil, and an extra (on-disk-only) label.
+    #[tokio::test]
+    async fn snapshot_reads_index_and_previews_under_one_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut out = Vec::new();
+            out.extend_from_slice(b"+OK\r\n"); // AUTH
+            out.extend_from_slice(&bulk(r#"["live","torn"]"#)); // GET index
+            out.extend_from_slice(&bulk(r#"{"intent":"deploy"}"#)); // preview live
+            out.extend_from_slice(b"$-1\r\n"); // preview torn — nil
+            out.extend_from_slice(&bulk(r#"{"intent":"deploy"}"#)); // preview ghost (extra)
+            sock.write_all(&out).await.unwrap();
+            let mut buf = Vec::new();
+            sock.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        let reader = ClusterReader::new(addr, "master-secret", "switchboard");
+        let snap = reader
+            .snapshot(&["ghost".to_string()])
+            .await
+            .expect("a well-formed desired-state read must succeed");
+
+        assert_eq!(snap.index, vec!["live".to_string(), "torn".to_string()]);
+        assert_eq!(
+            snap.docs.get("live"),
+            Some(&Some(r#"{"intent":"deploy"}"#.to_string()))
+        );
+        assert_eq!(
+            snap.docs.get("torn"),
+            Some(&None),
+            "a nil is a genuine miss"
+        );
+        assert_eq!(
+            snap.docs.get("ghost"),
+            Some(&Some(r#"{"intent":"deploy"}"#.to_string())),
+            "an on-disk-only label is still fetched"
+        );
+
+        let received = server.await.unwrap();
+        assert!(received.contains("AUTH"), "must AUTH: {received:?}");
+        assert!(
+            received.contains("switchboard"),
+            "AUTH must name the API site: {received:?}"
+        );
+        assert!(
+            received.contains("switchboard:index"),
+            "must read the index: {received:?}"
+        );
+        assert!(
+            received.contains("switchboard:preview:ghost"),
+            "must read the extra label's preview key: {received:?}"
+        );
+    }
+
+    /// A read against a dead listener is an `Err`, which the reconcile treats as
+    /// "KV unavailable" and prunes nothing.
+    #[tokio::test]
+    async fn snapshot_on_a_dead_addr_errors() {
+        let reader = ClusterReader::new("127.0.0.1:1", "s", "switchboard");
+        assert!(reader.snapshot(&[]).await.is_err());
     }
 
     /// Every preview's verdict lives in the **one** switchboard-owned namespace,

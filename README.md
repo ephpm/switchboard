@@ -461,6 +461,39 @@ The one-time fleet setup this pairs with — the GitHub OAuth App, the global
 **and** switchboard environments — is ePHPm node config, not switchboard's; it is
 described in [`docs/preview-access-gate.md`](docs/preview-access-gate.md).
 
+### Reconcile (level-triggered convergence)
+
+The drain/queue path is **edge-triggered** on the `switchboard:gen` counter: a
+node only re-walks desired state when the counter advances past its own cursor.
+Because `gen` is a *separate* gossip key from the content it guards, an increment
+that is lost or not-yet-replicated leaves a node "current" at a generation whose
+teardown it never materialized — so the torn-down preview stays served, its
+database and `<key>.toml` override on disk, every health check green. This is the
+class of fault behind override counts drifting between nodes and orphaned
+overrides lingering as 404s.
+
+The reconcile pass is the **level-triggered** backstop. On its own interval,
+independent of `gen`, it reads the KV desired state *directly* and converges this
+node's on-disk previews to it. Pruning classifies each preview directory from its
+**own** `switchboard:preview:<label>` key (a plain `set`, immune to both the
+`gen` propagation race and the index's lost-update race), so it never trusts the
+index and never false-positives a live preview into an orphan.
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--reconcile-interval-secs` | `SWITCHBOARD_RECONCILE_INTERVAL_SECS` | `0` | Seconds between reconcile passes. **`0` disables it.** Requires `--kv-secret-file` and a resolvable API site key; a backstop, not the hot path, so a cadence well above the drain tick (e.g. 30–60s) is right. |
+| `--reconcile-prune` | `SWITCHBOARD_RECONCILE_PRUNE` | `false` | Actually remove orphaned previews. **Off by default**: until set, the pass is observability-only and logs each orphan it *would* prune at `WARN`. |
+| `--reconcile-deploy-missing` | `SWITCHBOARD_RECONCILE_DEPLOY_MISSING` | `false` | Enqueue a deploy for a desired preview whose directory is absent on this node (recovers a deploy a node never saw). Off by default — re-provisioning runs composer and a checkout. |
+| `--reconcile-keep-sites` | `SWITCHBOARD_RECONCILE_KEEP_SITES` | *(empty)* | Comma-separated vhost directory names never pruned — the node's infra/test sites (e.g. `switchboard,site-a,site-b`). The API's own site key is always protected in addition. |
+| `--reconcile-max-prunes-per-cycle` | `SWITCHBOARD_RECONCILE_MAX_PRUNES_PER_CYCLE` | `8` | Blast-radius guard: at most this many orphans are removed per pass, the excess deferred to later passes so a misconfiguration cannot wipe the fleet in one tick. |
+| `--reconcile-api-site` | `SWITCHBOARD_RECONCILE_API_SITE` | *(derived from `--drain-host`)* | The switchboard-api vhost's canonical site key, whose keyspace holds the `switchboard:*` desired-state keys. Set only if it differs from the drain host's site key. |
+
+Rollout is fail-safe: enable the interval first and read the dry-run `WOULD
+prune` logs; turn on `--reconcile-prune` once they look right; add
+`--reconcile-deploy-missing` last. A KV read failure aborts the whole pass — the
+reconcile prunes **nothing** rather than act against an authority it could not
+read.
+
 ### GitHub reporting (optional)
 
 | Flag | Env | Default | Meaning |
