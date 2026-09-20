@@ -1,79 +1,63 @@
-//! Level-triggered convergence of this node's on-disk previews to the cluster's
-//! desired state.
+//! Level-triggered convergence of this node's on-disk previews to **GitHub PR
+//! state** — the authoritative source of whether a preview is still wanted.
 //!
-//! # The bug this closes
+//! # Why not the KV index / the drain cursor
 //!
-//! Preview fan-out is edge-triggered. switchboard-api publishes desired state
-//! into gossip-replicated KV and bumps a `switchboard:gen` counter; each node's
-//! PHP `DrainHandler` only walks `switchboard:index` when `gen` has advanced
-//! past its own `last_gen`, and once it records itself current at a generation
-//! it never re-walks. That makes correctness depend on the counter, and the
-//! counter is a *separate* gossip key from the content it guards:
+//! Preview fan-out is edge-triggered on the `switchboard:gen` counter: a node
+//! only re-walks desired state when the counter advances, so a lost or
+//! not-yet-replicated increment strands a teardown (the preview stays served,
+//! its database and `<key>.toml` override on disk, every health check green —
+//! switchboard#24). The first cut of this reconcile (v0.2.0) read desired state
+//! from the KV index over RESP. But the preview nodes keep ePHPm's KV RESP
+//! listener **off** (there is no `[kv.redis_compat]` listener and no `[kv]`
+//! secret), so that reader was inert there.
 //!
-//! * a `gen` increment that is lost or not-yet-replicated leaves a node's cursor
-//!   "current" at a generation whose teardown it never materialized — so every
-//!   later drain short-circuits and the torn-down preview stays served, with its
-//!   tenant database and docroot override on disk, every health check green
-//!   (switchboard#24, and the gen-vs-key-content propagation race);
-//! * the index itself is a read-modify-write with an acknowledged lost-update
-//!   window, so a label can transiently vanish from it.
+//! This version removes the KV dependency entirely and uses the one authority
+//! that needs no ePHPm-side change and is *more* authoritative than the KV index
+//! (which has an acknowledged lost-update window): **the pull request's state on
+//! GitHub**. The daemon already holds the switchboard App credentials it mints
+//! installation tokens with for reporting; this reuses that path.
 //!
-//! Both are the same class of fault: an edge trigger that misses a state it
-//! never observed an *event* for. The symptom on the live cluster is override
-//! `.toml` counts drifting between nodes and orphaned overrides for torn-down
-//! previews lingering as 404s.
+//! # What a pass does (prune-only)
 //!
-//! # The fix: reconcile the level, not the edge
+//! For every preview directory under `sites_dir`:
 //!
-//! This module runs on its own interval, independent of `gen`, and converges the
-//! node's actual on-disk state to what the KV *currently says*:
+//! * parse its canonical site key `<owner>-<repo>-pr-<N>` back to `(repo, N)`
+//!   ([`parse_preview_site_key`]);
+//! * ask GitHub what PR `owner/repo#N` is **now**;
+//! * **open (or an unrecognised state) ⇒ keep; merged or closed ⇒ prune** with
+//!   the same KEEP-guarded, exact-path [`crate::teardown::teardown_preview`] the
+//!   webhook teardown uses (site dir, `<key>.db*`, `<key>.toml`,
+//!   `/tmp/ephpm-vhosts/<key>-<hash>`, preserving `*.single-db-bak`).
 //!
-//! * **Prune.** For every preview directory under `sites_dir`, it reads that
-//!   site's **own** `switchboard:preview:<label>` key ([`crate::kv::ClusterReader`]).
-//!   A key that is present with `intent: deploy` is live and kept; a key that is
-//!   a genuine nil (retired — its TTL elapsed) or carries `intent: teardown` is
-//!   an orphan and is removed with the same KEEP-guarded, exact-path
-//!   [`crate::teardown::teardown_preview`] the webhook teardown path uses. The
-//!   per-site key is a plain `set` (only teardown ever gives it a TTL), so it is
-//!   immune to *both* the `gen` propagation race and the index lost-update race —
-//!   pruning never trusts the index.
-//! * **Add.** For every label the index lists whose preview key says `deploy`
-//!   but whose directory is absent, it enqueues the exact job document into the
-//!   node's queue, so the existing claim → coalesce → validate → deploy path
-//!   provisions it. This recovers a deploy a node simply never saw.
+//! Re-*deploying* a missing but still-open preview is deliberately **not** done
+//! here — that stays on the existing webhook path. This module only removes what
+//! GitHub says is gone.
 //!
-//! # Why this is safe under concurrent drains
+//! # Fail-safe, in every direction
 //!
-//! Two nodes reconciling the same desired state converge rather than fight:
-//! teardown and enqueue are both idempotent (teardown tolerates already-absent
-//! artifacts; a materialized job carries a fresh per-node filename and is
-//! coalesced). The gen counter is kept as the PHP fast-path's optimization hint;
-//! nothing here depends on it.
+//! Uncertainty always resolves to **keep**:
 //!
-//! # Fail-safe posture
+//! * a site key that does not parse as `<owner>-<repo>-pr-<N>` (a hashed/overflow
+//!   label, or an infra vhost) is skipped — never a prune candidate;
+//! * a per-PR GitHub error (rate limit, transient 5xx, a repo/PR that 404s) skips
+//!   *that* entry;
+//! * a failure to mint the installation token aborts the **whole** pass, so a
+//!   total GitHub outage prunes nothing;
+//! * an infra/non-preview keep-list still applies on top (the API vhost is added
+//!   automatically), though the parse rule already excludes those dirs.
 //!
-//! * A KV read failure aborts the whole cycle — the reconcile does **nothing**
-//!   rather than prune against an unreadable authority.
-//! * Infra/non-preview vhosts (`switchboard`, `site-a`, …) are protected by an
-//!   explicit keep-list plus the API's own site key.
-//! * Pruning is opt-in (`--reconcile-prune`); until it is set the reconcile logs
-//!   what it *would* remove at WARN, which alone would have surfaced the original
-//!   incident that was only found by hand-diffing three nodes.
-//! * A per-cycle prune cap bounds the blast radius of a misconfiguration to a few
-//!   removals per interval, leaving the loud logs time to be noticed.
+//! Pruning is opt-in (`--reconcile-prune`); until it is set the pass logs each
+//! orphan it *would* remove at WARN and removes nothing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
-use crate::job::{Intent, Job};
-use crate::kv::ClusterReader;
-use crate::queue::Queue;
 use crate::site_key;
 use crate::teardown::{self, Preview, TeardownContext};
+use crate::validate::{PullRequestState, pr_state_verdict};
 
-/// Everything one reconcile pass needs. Mirrors the teardown/deploy context the
-/// job path already assembles from [`crate::config::Config`], plus the reconcile
-/// policy knobs.
+/// Everything one reconcile pass needs.
 pub struct ReconcileContext<'a> {
     // ── where the artifacts live (same as `TeardownContext`) ────────────
     pub sites_dir: &'a Path,
@@ -82,58 +66,51 @@ pub struct ReconcileContext<'a> {
     pub vhost_temp_base: Option<&'a Path>,
     pub state_dir: &'a Path,
     pub allow_incomplete: bool,
-
-    // ── KV desired-state source ─────────────────────────────────────────
-    /// ePHPm's RESP listener (`[kv.redis_compat] listen`).
+    /// ePHPm's `[kv] secret`, only for teardown's best-effort share-link
+    /// revocation. `None` (the preview cluster's case — no `[kv]` secret) skips
+    /// it cleanly; the reconcile itself never reads KV.
+    pub kv_secret: Option<&'a str>,
     pub kv_addr: &'a str,
-    /// ePHPm's `[kv] secret`. Required — the reconcile reads desired state over
-    /// RESP, so a node without it cannot reconcile and the loop is not started.
-    pub kv_secret: &'a str,
-    /// The switchboard-api vhost's canonical site key, whose keyspace holds the
-    /// `switchboard:*` desired-state keys.
-    pub api_site: &'a str,
 
-    // ── host → site-key derivation (same rule as the deploy path) ────────
+    // ── GitHub PR-state authority ───────────────────────────────────────
+    /// switchboard App id (`--app-id`).
+    pub app_id: u64,
+    /// switchboard App private key (`--app-key`).
+    pub app_key: &'a Path,
+    /// The GitHub owner/org previews belong to (the leading label segment). All
+    /// preview site keys are `<owner>-<repo>-pr-<N>`.
+    pub owner: &'a str,
+
+    // ── host → label derivation (same rule as the deploy path) ──────────
     pub preview_domain: &'a str,
     pub sites_domain_suffix: Option<&'a str>,
 
     // ── policy ──────────────────────────────────────────────────────────
-    /// Vhost directory names never touched by pruning (infra/test sites). The
-    /// API site key is always added to this set by the caller.
-    pub keep: &'a HashSet<String>,
-    /// Actually remove orphans. When `false` the reconcile is observability-only:
-    /// it logs each orphan it *would* prune at WARN and removes nothing.
+    /// Vhost directory names never pruned (infra/test sites). The parse rule
+    /// already excludes non-`<owner>-<repo>-pr-<N>` dirs; this is belt-and-braces.
+    pub keep: &'a std::collections::HashSet<String>,
+    /// Actually remove orphans. When `false` the pass logs WOULD-prune and
+    /// removes nothing.
     pub prune: bool,
-    /// Enqueue deploys for desired previews whose directory is absent.
-    pub deploy_missing: bool,
-    /// Upper bound on prunes performed in a single pass (blast-radius guard).
-    pub max_prunes_per_cycle: usize,
-
-    /// The node's job queue (for the add direction).
-    pub queue: &'a Queue,
 }
 
-/// What one reconcile pass observed and did. Returned for logging and tests.
+/// What one reconcile pass observed and did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
-    /// Preview directories found under `sites_dir` (excluding keep-list and
-    /// staging `.tmp` dirs).
+    /// Preview directories found (excluding keep-list and `.tmp` staging dirs).
     pub on_disk: usize,
-    /// Directories whose own preview key says `deploy` — live, kept.
-    pub live: usize,
+    /// Directories whose PR is still open (or an unrecognised state) — kept.
+    pub kept_open: usize,
     /// Orphans removed (0 when `--reconcile-prune` is unset).
     pub pruned: usize,
     /// Orphans that would be removed but for `--reconcile-prune` being unset.
     pub would_prune: usize,
     /// Orphans whose removal returned an error.
     pub prune_failed: usize,
-    /// Orphans left for a later pass because the per-cycle cap was hit.
-    pub prune_deferred: usize,
-    /// Deploys enqueued for desired-but-absent previews.
-    pub deployed: usize,
-    /// Desired-but-absent previews skipped because a job for them is already
-    /// queued or in flight.
-    pub deploy_skipped: usize,
+    /// Directories whose site key did not parse as `<owner>-<repo>-pr-<N>` — kept.
+    pub skipped_unparseable: usize,
+    /// Directories whose PR state could not be read from GitHub — kept.
+    pub skipped_api_error: usize,
 }
 
 /// A single orphan to remove: its site key (names every ePHPm artifact) and its
@@ -144,96 +121,170 @@ struct PrunePlan {
     label: String,
 }
 
-/// The decisions a pass reached, separated from executing them so the logic is
-/// unit-testable without a filesystem or a KV server.
+/// A per-preview GitHub lookup outcome. `Error` is a read that failed (rate
+/// limit, transient 5xx, a 404) — treated as "keep", never a prune.
+#[derive(Debug, Clone)]
+enum PrLookup {
+    State(PullRequestState),
+    Error,
+}
+
+/// The decisions a pass reached, plus the counts for the report — separated from
+/// executing them so the logic is unit-testable without a filesystem or GitHub.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Plan {
+struct PlanResult {
     prune: Vec<PrunePlan>,
-    deploy: Vec<String>,
+    kept_open: usize,
+    skipped_unparseable: usize,
+    skipped_api_error: usize,
 }
 
 /// Run one reconcile pass.
 ///
 /// # Errors
 ///
-/// Returns an error only if the KV desired-state read fails — the caller logs it
-/// and waits for the next interval. Individual prune failures are counted in the
-/// [`ReconcileReport`], not surfaced as an error, so one wedged site does not
-/// stop the rest converging.
+/// Returns an error only if the installation token could not be minted (a total
+/// GitHub-auth failure) — the caller logs it and waits for the next interval, and
+/// nothing is pruned. Per-PR read failures and per-site prune failures are
+/// counted in the [`ReconcileReport`], not surfaced as an error.
 pub async fn reconcile_once(ctx: &ReconcileContext<'_>) -> anyhow::Result<ReconcileReport> {
-    let suffix = ctx.sites_domain_suffix;
-    let domain = ctx.preview_domain;
-
-    // (1) What is actually on disk.
     let on_disk = list_preview_dirs(ctx.sites_dir, ctx.keep)?;
-
-    // (2) The labels those directories reconstruct to, so the snapshot can
-    // classify an orphan whose index entry was already pruned from its own key.
-    let mut disk_labels: Vec<String> = Vec::with_capacity(on_disk.len());
-    for site in &on_disk {
-        let label = label_for_site_key(site, suffix, domain);
-        if !disk_labels.contains(&label) {
-            disk_labels.push(label);
-        }
+    if on_disk.is_empty() {
+        return Ok(ReconcileReport::default());
     }
 
-    // (3) One consistent read of desired state. A failure aborts the pass — we
-    // never prune against an authority we could not read.
-    let reader = ClusterReader::new(ctx.kv_addr, ctx.kv_secret, ctx.api_site);
-    let snapshot = reader.snapshot(&disk_labels).await?;
+    // Ask GitHub about every parseable preview. A token-mint failure aborts here
+    // (Err) so a total outage prunes nothing; a per-PR failure becomes `Error`.
+    let lookups = fetch_lookups(ctx, &on_disk).await?;
 
-    // (4) Decide.
     let plan = build_plan(
         &on_disk,
-        &snapshot.index,
-        &snapshot.docs,
-        suffix,
-        domain,
-        ctx.deploy_missing,
+        ctx.owner,
+        ctx.sites_domain_suffix,
+        ctx.preview_domain,
+        &lookups,
     );
 
-    // (5) Execute.
     let mut report = ReconcileReport {
         on_disk: on_disk.len(),
-        live: on_disk.len().saturating_sub(plan.prune.len()),
+        kept_open: plan.kept_open,
+        skipped_unparseable: plan.skipped_unparseable,
+        skipped_api_error: plan.skipped_api_error,
         ..ReconcileReport::default()
     };
     execute_prune(ctx, &plan, &mut report).await;
-    execute_deploy(ctx, &plan, &snapshot.docs, &mut report);
 
     tracing::info!(
         on_disk = report.on_disk,
-        live = report.live,
+        kept_open = report.kept_open,
         pruned = report.pruned,
         would_prune = report.would_prune,
         prune_failed = report.prune_failed,
-        prune_deferred = report.prune_deferred,
-        deployed = report.deployed,
-        deploy_skipped = report.deploy_skipped,
+        skipped_unparseable = report.skipped_unparseable,
+        skipped_api_error = report.skipped_api_error,
         prune_enabled = ctx.prune,
-        deploy_missing_enabled = ctx.deploy_missing,
         "reconcile pass complete"
     );
     Ok(report)
 }
 
-/// Remove (or, in dry-run, report) each planned orphan.
-async fn execute_prune(ctx: &ReconcileContext<'_>, plan: &Plan, report: &mut ReconcileReport) {
-    for target in &plan.prune {
-        if report.pruned + report.prune_failed >= ctx.max_prunes_per_cycle {
-            // Bound the blast radius: the rest wait for the next pass, so a
-            // misconfiguration cannot wipe the fleet in one tick and the WARN
-            // logs above have time to be noticed.
-            report.prune_deferred += 1;
-            continue;
-        }
+/// Ask GitHub for the PR state of every parseable preview under one installation
+/// token.
+///
+/// Returns a map from site key to its lookup outcome. Only parseable sites are
+/// queried; unparseable ones are handled by [`build_plan`]. A failure to mint the
+/// token is an error (aborts the pass); a per-PR read failure is recorded as
+/// [`PrLookup::Error`] (kept).
+async fn fetch_lookups(
+    ctx: &ReconcileContext<'_>,
+    on_disk: &[String],
+) -> anyhow::Result<HashMap<String, PrLookup>> {
+    use anyhow::Context as _;
 
+    let parsed: Vec<(String, String, u64)> = on_disk
+        .iter()
+        .filter_map(|site| {
+            parse_preview_site_key(site, ctx.owner).map(|(repo, pr)| (site.clone(), repo, pr))
+        })
+        .collect();
+
+    if parsed.is_empty() {
+        // Nothing to ask GitHub about — don't mint a token for no reason.
+        return Ok(HashMap::new());
+    }
+
+    // One installation token for the whole pass (rate-limit-friendly: a handful
+    // of reads well under any limit).
+    let token = crate::installation_token_for_owner(ctx.app_id, ctx.app_key, ctx.owner)
+        .await
+        .context("reconcile: could not mint a GitHub installation token — pruning nothing")?;
+    let client = crate::github::GitHubClient::new(token);
+
+    let mut map = HashMap::with_capacity(parsed.len());
+    for (site, repo, pr) in parsed {
+        let lookup = match client.pull_request_state(ctx.owner, &repo, pr).await {
+            Ok(state) => PrLookup::State(state),
+            Err(e) => {
+                tracing::warn!(
+                    site_key = %site,
+                    repo = %format!("{}/{repo}", ctx.owner),
+                    pr,
+                    error = %format!("{e:#}"),
+                    "reconcile: could not read PR state — keeping this preview (fail-safe)"
+                );
+                PrLookup::Error
+            }
+        };
+        map.insert(site, lookup);
+    }
+    Ok(map)
+}
+
+/// Decide what to prune. Pure — no IO — so it can be tested against hand-built
+/// lookup maps.
+fn build_plan(
+    on_disk: &[String],
+    owner: &str,
+    suffix: Option<&str>,
+    preview_domain: &str,
+    lookups: &HashMap<String, PrLookup>,
+) -> PlanResult {
+    let mut plan = PlanResult::default();
+
+    for site in on_disk {
+        let Some((_repo, _pr)) = parse_preview_site_key(site, owner) else {
+            // A hashed/overflow label or an infra vhost — never a prune candidate.
+            plan.skipped_unparseable += 1;
+            continue;
+        };
+        match lookups.get(site) {
+            Some(PrLookup::State(state)) if pr_state_verdict(state).is_discard() => {
+                // Merged or closed ⇒ the preview is gone.
+                plan.prune.push(PrunePlan {
+                    site_key: site.clone(),
+                    label: label_for_site_key(site, suffix, preview_domain),
+                });
+            }
+            Some(PrLookup::State(_)) => plan.kept_open += 1, // open / unrecognised ⇒ keep
+            Some(PrLookup::Error) | None => plan.skipped_api_error += 1, // unreadable ⇒ keep
+        }
+    }
+
+    plan
+}
+
+/// Remove (or, in dry-run, report) each planned orphan.
+async fn execute_prune(
+    ctx: &ReconcileContext<'_>,
+    plan: &PlanResult,
+    report: &mut ReconcileReport,
+) {
+    for target in &plan.prune {
         if !ctx.prune {
             report.would_prune += 1;
             tracing::warn!(
                 site_key = %target.site_key,
-                label = %target.label,
-                "reconcile: orphan preview on disk with no live desired state — \
+                "reconcile: orphan preview on disk whose PR is merged/closed — \
                  WOULD prune (set --reconcile-prune to remove it)"
             );
             continue;
@@ -246,7 +297,7 @@ async fn execute_prune(ctx: &ReconcileContext<'_>, plan: &Plan, report: &mut Rec
             vhost_temp_base: ctx.vhost_temp_base,
             state_dir: ctx.state_dir,
             allow_incomplete: ctx.allow_incomplete,
-            kv_secret: Some(ctx.kv_secret),
+            kv_secret: ctx.kv_secret,
             kv_addr: ctx.kv_addr,
         };
         let preview = Preview {
@@ -258,7 +309,7 @@ async fn execute_prune(ctx: &ReconcileContext<'_>, plan: &Plan, report: &mut Rec
                 report.pruned += 1;
                 tracing::info!(
                     site_key = %target.site_key,
-                    "reconcile: pruned an orphan preview (no live desired state)"
+                    "reconcile: pruned an orphan preview (PR merged/closed)"
                 );
             }
             Err(e) => {
@@ -273,153 +324,41 @@ async fn execute_prune(ctx: &ReconcileContext<'_>, plan: &Plan, report: &mut Rec
     }
 }
 
-/// Enqueue a deploy for each planned add whose job is not already queued.
-fn execute_deploy(
-    ctx: &ReconcileContext<'_>,
-    plan: &Plan,
-    docs: &HashMap<String, Option<String>>,
-    report: &mut ReconcileReport,
-) {
-    for label in &plan.deploy {
-        // A job for an absent-but-desired preview is only worth writing if one
-        // is not already in flight — the daemon's coalescing would collapse a
-        // duplicate anyway, but not writing it keeps a slow deploy from being
-        // restarted every interval.
-        match ctx.queue.has_job_for_label(label) {
-            Ok(true) => {
-                report.deploy_skipped += 1;
-                continue;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(
-                    %label,
-                    error = %format!("{e:#}"),
-                    "reconcile: could not check the queue for an existing job — enqueuing anyway"
-                );
-            }
-        }
-
-        let Some(Some(raw)) = docs.get(label) else {
-            // Classified deploy above, so the document was present; this only
-            // trips on a race where it vanished between read and here.
-            continue;
-        };
-        match ctx.queue.enqueue(raw.as_bytes()) {
-            Ok(name) => {
-                report.deployed += 1;
-                tracing::info!(
-                    %label,
-                    job = %name,
-                    "reconcile: enqueued a deploy for a desired preview missing from disk"
-                );
-            }
-            Err(e) => tracing::error!(
-                %label,
-                error = %format!("{e:#}"),
-                "reconcile: failed to enqueue a missing deploy"
-            ),
-        }
-    }
-}
-
-/// Decide what to prune and what to deploy. Pure — no IO — so it can be tested
-/// against hand-built desired-state maps.
-fn build_plan(
-    on_disk: &[String],
-    index: &[String],
-    docs: &HashMap<String, Option<String>>,
-    suffix: Option<&str>,
-    preview_domain: &str,
-    deploy_missing: bool,
-) -> Plan {
-    let mut plan = Plan::default();
-
-    // Prune: classify each on-disk site from its OWN preview key. The index is
-    // deliberately not consulted here — a per-site key is immune to the index's
-    // lost-update race, so this is the authority that cannot false-positive a
-    // live preview into an orphan.
-    for site in on_disk {
-        let label = label_for_site_key(site, suffix, preview_domain);
-        if matches!(classify(docs.get(&label)), Desired::Live) {
-            continue;
-        }
-        plan.prune.push(PrunePlan {
-            site_key: site.clone(),
-            label,
-        });
-    }
-
-    if deploy_missing {
-        let present: HashSet<&str> = on_disk.iter().map(String::as_str).collect();
-        for label in index {
-            if !matches!(classify(docs.get(label)), Desired::Live) {
-                continue;
-            }
-            // The directory name a deploy for this label would create.
-            let Ok(site) = site_key_for_label(label, suffix, preview_domain) else {
-                continue;
-            };
-            if !present.contains(site.as_str()) && !plan.deploy.contains(label) {
-                plan.deploy.push(label.clone());
-            }
-        }
-    }
-
-    plan
-}
-
-/// Is a preview's desired state a live deploy, or is it gone?
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Desired {
-    /// Present with `intent: deploy` — should be on disk.
-    Live,
-    /// A genuine nil (retired, TTL elapsed), an `intent: teardown`, or an
-    /// unparseable document — none of which is a live preview.
-    Gone,
-}
-
-/// Classify a preview document read from KV.
+/// Parse a canonical preview site key `<owner>-<repo>-pr-<N>` into `(repo, N)`.
 ///
-/// `raw` is the map entry: `None` = the label was not in the snapshot (treated
-/// as gone), `Some(None)` = a genuine KV nil, `Some(Some(json))` = a document.
-/// An unparseable document is `Gone`: desired state the daemon cannot understand
-/// is not something it will keep a preview alive for.
-fn classify(raw: Option<&Option<String>>) -> Desired {
-    let Some(Some(json)) = raw else {
-        return Desired::Gone;
-    };
-    match Job::parse(json.as_bytes()).and_then(|job| job.intent()) {
-        Ok(Intent::Deploy) => Desired::Live,
-        _ => Desired::Gone,
+/// Returns `None` for anything that is not a clean preview label for `owner`: an
+/// infra vhost (no `<owner>-` prefix), or a hashed/overflow label
+/// (`<base>-<6hex>`, whose tail after the last `-pr-` is not all digits). Both
+/// are fail-safe — the caller keeps them.
+///
+/// `<repo>` may itself contain hyphens (`php-sdk`, `switchboard-api`), so the
+/// split is on the **last** `-pr-<digits>`, matching how the label is built
+/// (`<owner>-<repo>-pr-<N>`); a repo that itself contains `-pr-` still resolves
+/// because the trailing number anchors the last one.
+fn parse_preview_site_key(key: &str, owner: &str) -> Option<(String, u64)> {
+    const SEP: &str = "-pr-";
+    let prefix = format!("{owner}-");
+    let rest = key.strip_prefix(&prefix)?;
+    let idx = rest.rfind(SEP)?;
+    let repo = &rest[..idx];
+    if repo.is_empty() {
+        return None;
     }
+    let num = &rest[idx + SEP.len()..];
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pr: u64 = num.parse().ok()?;
+    Some((repo.to_string(), pr))
 }
 
-/// The canonical site key (directory name) a deploy for `label` creates —
-/// `site_key(<label>.<preview_domain>)`, the exact forward rule the deploy path
-/// uses ([`crate::site_key`]).
+/// Reconstruct the preview *label* from an on-disk site key — the inverse of the
+/// deploy's `site_key(<label>.<preview_domain>)`.
 ///
-/// # Errors
-///
-/// Propagates [`crate::site_key::site_key`]'s error when the host does not
-/// normalize to a valid key.
-fn site_key_for_label(
-    label: &str,
-    suffix: Option<&str>,
-    preview_domain: &str,
-) -> anyhow::Result<String> {
-    let host = format!("{label}.{}", preview_domain.trim_matches('.'));
-    site_key::site_key(&host, suffix)
-}
-
-/// Reconstruct the preview *label* from an on-disk site key — the inverse of
-/// [`site_key_for_label`].
-///
-/// With a suffix configured the key *is* the label (the deploy stripped the
-/// suffix); without one the key is the full FQDN, so the label is the key with
-/// `.<preview_domain>` removed. The label only ever names the API's
-/// `applied/<label>` marker and the KV preview key, both of which fail safe if
-/// the reconstruction is off (a nil lookup, a no-op marker removal).
+/// With a suffix configured the key *is* the label; without one the key is the
+/// full FQDN, so the label is the key with `.<preview_domain>` removed. The label
+/// only ever names the API's `applied/<label>` marker, which fails safe if the
+/// reconstruction is off (a no-op marker removal).
 fn label_for_site_key(site_key: &str, suffix: Option<&str>, preview_domain: &str) -> String {
     if suffix.is_some() {
         return site_key.to_string();
@@ -440,7 +379,10 @@ fn label_for_site_key(site_key: &str, suffix: Option<&str>, preview_domain: &str
 /// # Errors
 ///
 /// Returns an error if `sites_dir` exists but cannot be listed.
-fn list_preview_dirs(sites_dir: &Path, keep: &HashSet<String>) -> anyhow::Result<Vec<String>> {
+fn list_preview_dirs(
+    sites_dir: &Path,
+    keep: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<String>> {
     use anyhow::Context as _;
 
     let entries = match std::fs::read_dir(sites_dir) {
@@ -453,17 +395,14 @@ fn list_preview_dirs(sites_dir: &Path, keep: &HashSet<String>) -> anyhow::Result
 
     let mut out = Vec::new();
     for entry in entries.flatten() {
-        // Follow symlinks: `file_type()` on the dirent does not, and a preview
-        // dir is a plain directory anyway, but a symlinked docroot must still
-        // count as present.
+        // Follow symlinks: a symlinked docroot must still count as present.
         let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
         if !is_dir {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.ends_with(".tmp") {
-            // A staging directory owned by a deploy mid-swap — not a preview.
-            continue;
+            continue; // a deploy-in-flight staging dir, not a preview
         }
         if !site_key::is_valid_site_key(&name) {
             continue;
@@ -480,150 +419,155 @@ fn list_preview_dirs(sites_dir: &Path, keep: &HashSet<String>) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::sample_json;
+    use crate::queue::Queue;
+    use std::collections::HashSet;
 
     const DOMAIN: &str = "preview.ephpm.dev";
     const SUFFIX: Option<&str> = Some(".preview.ephpm.dev");
+    const OWNER: &str = "ephpm";
 
-    /// A `Some(Some(deploy job))` document for a label.
-    fn deploy_doc(label: &str) -> Option<String> {
-        Some(sample_json(label, "deploy"))
-    }
-
-    fn docs(pairs: &[(&str, Option<String>)]) -> HashMap<String, Option<String>> {
+    fn lookups(pairs: &[(&str, PrLookup)]) -> HashMap<String, PrLookup> {
         pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), v.clone()))
             .collect()
     }
 
+    // ── the site-key parser ─────────────────────────────────────────────
+
     #[test]
-    fn classify_reads_the_intent() {
-        assert_eq!(classify(Some(&deploy_doc("a"))), Desired::Live);
+    fn parses_clean_preview_keys_including_hyphenated_repos() {
         assert_eq!(
-            classify(Some(&Some(sample_json("a", "teardown")))),
-            Desired::Gone
+            parse_preview_site_key("ephpm-lab-pr-8", OWNER),
+            Some(("lab".to_string(), 8))
         );
-        // A genuine nil (retired) and a totally absent label both read as gone.
-        assert_eq!(classify(Some(&None)), Desired::Gone);
-        assert_eq!(classify(None), Desired::Gone);
-        // Unparseable desired state is not something to keep a preview alive for.
+        // Repos with hyphens: the split is the LAST `-pr-<digits>`.
         assert_eq!(
-            classify(Some(&Some("{not json".to_string()))),
-            Desired::Gone
+            parse_preview_site_key("ephpm-php-sdk-pr-67", OWNER),
+            Some(("php-sdk".to_string(), 67))
+        );
+        assert_eq!(
+            parse_preview_site_key("ephpm-switchboard-api-pr-5", OWNER),
+            Some(("switchboard-api".to_string(), 5))
+        );
+        // The org repo doubles the owner segment.
+        assert_eq!(
+            parse_preview_site_key("ephpm-ephpm-pr-488", OWNER),
+            Some(("ephpm".to_string(), 488))
+        );
+        // A repo that itself contains `-pr-` still resolves on the trailing number.
+        assert_eq!(
+            parse_preview_site_key("ephpm-my-pr-tool-pr-5", OWNER),
+            Some(("my-pr-tool".to_string(), 5))
         );
     }
 
     #[test]
-    fn site_key_and_label_are_inverses_with_a_suffix() {
-        // On the live cluster (suffix configured) the key is the bare label.
-        let key = site_key_for_label("ephpm-wp-pr-8", SUFFIX, DOMAIN).unwrap();
-        assert_eq!(key, "ephpm-wp-pr-8");
-        assert_eq!(label_for_site_key(&key, SUFFIX, DOMAIN), "ephpm-wp-pr-8");
+    fn refuses_non_preview_and_hashed_keys() {
+        // Infra vhosts have no `<owner>-` prefix.
+        assert_eq!(parse_preview_site_key("switchboard", OWNER), None);
+        assert_eq!(parse_preview_site_key("site-a", OWNER), None);
+        assert_eq!(parse_preview_site_key("preview.ephpm.dev", OWNER), None);
+        // A hashed/overflow label ends in `-<6hex>`, not `-pr-<digits>`.
+        assert_eq!(
+            parse_preview_site_key("ephpm-somelongrepo-pr-12-a1b2c3", OWNER),
+            None
+        );
+        // No number, empty repo, or non-digit tail.
+        assert_eq!(parse_preview_site_key("ephpm-lab-pr-", OWNER), None);
+        assert_eq!(parse_preview_site_key("ephpm--pr-5", OWNER), None);
+        assert_eq!(parse_preview_site_key("ephpm-lab-pr-x", OWNER), None);
+        // A different owner is not ours.
+        assert_eq!(parse_preview_site_key("other-lab-pr-8", OWNER), None);
     }
 
-    #[test]
-    fn site_key_and_label_are_inverses_without_a_suffix() {
-        // A node with no suffix names the directory by the full FQDN.
-        let key = site_key_for_label("ephpm-wp-pr-8", None, DOMAIN).unwrap();
-        assert_eq!(key, "ephpm-wp-pr-8.preview.ephpm.dev");
-        assert_eq!(label_for_site_key(&key, None, DOMAIN), "ephpm-wp-pr-8");
-    }
+    // ── the prune decision ──────────────────────────────────────────────
 
     #[test]
-    fn a_live_deploy_is_kept_and_an_orphan_is_pruned() {
-        let on_disk = vec!["live-pr-1".to_string(), "orphan-pr-2".to_string()];
-        let docs = docs(&[
-            ("live-pr-1", deploy_doc("live-pr-1")),
-            // orphan's key is a genuine nil (retired).
-            ("orphan-pr-2", None),
+    fn merged_and_closed_prune_open_and_unknown_keep() {
+        let on_disk = vec![
+            "ephpm-lab-pr-1".to_string(), // open  -> keep
+            "ephpm-lab-pr-2".to_string(), // merged -> prune
+            "ephpm-lab-pr-3".to_string(), // closed -> prune
+            "ephpm-lab-pr-4".to_string(), // unknown -> keep
+        ];
+        let l = lookups(&[
+            ("ephpm-lab-pr-1", PrLookup::State(PullRequestState::Open)),
+            ("ephpm-lab-pr-2", PrLookup::State(PullRequestState::Merged)),
+            ("ephpm-lab-pr-3", PrLookup::State(PullRequestState::Closed)),
+            (
+                "ephpm-lab-pr-4",
+                PrLookup::State(PullRequestState::Unknown("locked".into())),
+            ),
         ]);
-        let plan = build_plan(&on_disk, &[], &docs, SUFFIX, DOMAIN, false);
-        assert_eq!(plan.prune.len(), 1, "only the orphan is pruned");
-        assert_eq!(plan.prune[0].site_key, "orphan-pr-2");
-        assert_eq!(plan.prune[0].label, "orphan-pr-2");
-        assert!(plan.deploy.is_empty());
+        let plan = build_plan(&on_disk, OWNER, SUFFIX, DOMAIN, &l);
+        let pruned: Vec<&str> = plan.prune.iter().map(|p| p.site_key.as_str()).collect();
+        assert_eq!(pruned, vec!["ephpm-lab-pr-2", "ephpm-lab-pr-3"]);
+        assert_eq!(plan.kept_open, 2, "open + unknown are kept");
+        assert_eq!(plan.skipped_api_error, 0);
+        assert_eq!(plan.skipped_unparseable, 0);
+        // The label is reconstructed for the marker (suffix configured => == key).
+        assert_eq!(plan.prune[0].label, "ephpm-lab-pr-2");
     }
 
     #[test]
-    fn a_teardown_intent_prunes_even_while_still_in_the_index() {
-        // The stranded-teardown case: the preview key still exists but says
-        // teardown (retired-with-TTL, not yet expired), and the label is still
-        // in the index. The node must prune it, not keep it.
-        let on_disk = vec!["torn-pr-3".to_string()];
-        let docs = docs(&[("torn-pr-3", Some(sample_json("torn-pr-3", "teardown")))]);
-        let index = vec!["torn-pr-3".to_string()];
-        let plan = build_plan(&on_disk, &index, &docs, SUFFIX, DOMAIN, true);
-        assert_eq!(plan.prune.len(), 1);
-        assert_eq!(plan.prune[0].site_key, "torn-pr-3");
-        // A teardown-intent label is never re-deployed.
-        assert!(plan.deploy.is_empty());
+    fn an_api_error_keeps_the_preview() {
+        let on_disk = vec!["ephpm-lab-pr-9".to_string()];
+        let l = lookups(&[("ephpm-lab-pr-9", PrLookup::Error)]);
+        let plan = build_plan(&on_disk, OWNER, SUFFIX, DOMAIN, &l);
+        assert!(plan.prune.is_empty(), "a read failure must never prune");
+        assert_eq!(plan.skipped_api_error, 1);
     }
 
     #[test]
-    fn an_orphan_not_in_the_index_is_still_pruned() {
-        // The lingering-override symptom: the index entry was already pruned, so
-        // the label is absent from the index AND its key is nil. Classified from
-        // its own (nil) key, it is still an orphan.
-        let on_disk = vec!["ghost-pr-4".to_string()];
-        let docs = docs(&[("ghost-pr-4", None)]);
-        let plan = build_plan(&on_disk, &[], &docs, SUFFIX, DOMAIN, true);
-        assert_eq!(plan.prune.len(), 1);
-        assert_eq!(plan.prune[0].site_key, "ghost-pr-4");
+    fn a_missing_lookup_keeps_the_preview() {
+        // Parseable but no lookup entry (e.g. it was added between listing and
+        // fetching): fail-safe to keep.
+        let on_disk = vec!["ephpm-lab-pr-9".to_string()];
+        let plan = build_plan(&on_disk, OWNER, SUFFIX, DOMAIN, &HashMap::new());
+        assert!(plan.prune.is_empty());
+        assert_eq!(plan.skipped_api_error, 1);
     }
 
     #[test]
-    fn a_live_preview_missing_from_the_index_is_not_pruned() {
-        // The index lost-update race: a live preview transiently fell out of the
-        // index. Because pruning classifies from the per-site key (not the
-        // index), it is kept — this is the false-positive the direct-key
-        // authority exists to prevent.
-        let on_disk = vec!["live-pr-5".to_string()];
-        let docs = docs(&[("live-pr-5", deploy_doc("live-pr-5"))]);
-        let plan = build_plan(&on_disk, &[], &docs, SUFFIX, DOMAIN, true);
-        assert!(
-            plan.prune.is_empty(),
-            "a live preview absent from the index must not be pruned"
+    fn an_unparseable_key_is_never_a_candidate_even_if_a_lookup_exists() {
+        // A hashed label is kept regardless of any (spurious) lookup.
+        let on_disk = vec!["ephpm-x-pr-1-a1b2c3".to_string()];
+        let l = lookups(&[(
+            "ephpm-x-pr-1-a1b2c3",
+            PrLookup::State(PullRequestState::Merged),
+        )]);
+        let plan = build_plan(&on_disk, OWNER, SUFFIX, DOMAIN, &l);
+        assert!(plan.prune.is_empty(), "a hashed label is never pruned");
+        assert_eq!(plan.skipped_unparseable, 1);
+    }
+
+    #[test]
+    fn label_reconstruction_without_a_suffix_strips_the_domain() {
+        assert_eq!(
+            label_for_site_key("ephpm-lab-pr-8.preview.ephpm.dev", None, DOMAIN),
+            "ephpm-lab-pr-8"
+        );
+        assert_eq!(
+            label_for_site_key("ephpm-lab-pr-8", SUFFIX, DOMAIN),
+            "ephpm-lab-pr-8"
         );
     }
 
-    #[test]
-    fn a_desired_preview_missing_from_disk_is_enqueued() {
-        let on_disk: Vec<String> = vec![];
-        let docs = docs(&[("wanted-pr-6", deploy_doc("wanted-pr-6"))]);
-        let index = vec!["wanted-pr-6".to_string()];
-        let plan = build_plan(&on_disk, &index, &docs, SUFFIX, DOMAIN, true);
-        assert_eq!(plan.deploy, vec!["wanted-pr-6".to_string()]);
-        assert!(plan.prune.is_empty());
-    }
-
-    #[test]
-    fn adds_are_skipped_when_deploy_missing_is_off() {
-        let on_disk: Vec<String> = vec![];
-        let docs = docs(&[("wanted-pr-6", deploy_doc("wanted-pr-6"))]);
-        let index = vec!["wanted-pr-6".to_string()];
-        let plan = build_plan(&on_disk, &index, &docs, SUFFIX, DOMAIN, false);
-        assert!(plan.deploy.is_empty(), "add direction is opt-in");
-    }
-
-    #[test]
-    fn a_present_desired_preview_is_not_re_enqueued() {
-        let on_disk = vec!["here-pr-7".to_string()];
-        let docs = docs(&[("here-pr-7", deploy_doc("here-pr-7"))]);
-        let index = vec!["here-pr-7".to_string()];
-        let plan = build_plan(&on_disk, &index, &docs, SUFFIX, DOMAIN, true);
-        assert!(plan.deploy.is_empty());
-        assert!(plan.prune.is_empty());
-    }
+    // ── directory listing ───────────────────────────────────────────────
 
     #[test]
     fn list_preview_dirs_filters_infra_staging_and_files() {
         let root = tempfile::tempdir().unwrap();
         let sites = root.path();
-        for dir in ["live-pr-1", "orphan-pr-2", "switchboard", "live-pr-1.tmp"] {
+        for dir in [
+            "ephpm-lab-pr-8",
+            "ephpm-switchboard-pr-36",
+            "switchboard",
+            "ephpm-lab-pr-8.tmp",
+        ] {
             std::fs::create_dir_all(sites.join(dir)).unwrap();
         }
-        // A stray file must never be taken for a preview directory.
         std::fs::write(sites.join("README"), "x").unwrap();
 
         let mut keep = HashSet::new();
@@ -632,7 +576,10 @@ mod tests {
         let found = list_preview_dirs(sites, &keep).unwrap();
         assert_eq!(
             found,
-            vec!["live-pr-1".to_string(), "orphan-pr-2".to_string()],
+            vec![
+                "ephpm-lab-pr-8".to_string(),
+                "ephpm-switchboard-pr-36".to_string()
+            ],
             "keep-list, .tmp staging and plain files are all excluded"
         );
     }
@@ -644,41 +591,52 @@ mod tests {
         assert!(found.is_empty());
     }
 
+    // ── execute_prune (dry-run vs real, keep-guarded) ───────────────────
+
+    /// A context whose teardown roots point at one tempdir; GitHub/KV fields are
+    /// unused by `execute_prune` (it only runs the plan).
+    fn exec_ctx<'a>(
+        sites: &'a Path,
+        state: &'a Path,
+        keep: &'a HashSet<String>,
+        prune: bool,
+    ) -> ReconcileContext<'a> {
+        ReconcileContext {
+            sites_dir: sites,
+            sqlite_dir: None,
+            site_overrides_dir: None,
+            vhost_temp_base: None,
+            state_dir: state,
+            allow_incomplete: true, // no sqlite/overrides dirs in the test
+            kv_secret: None,
+            kv_addr: "127.0.0.1:6379",
+            app_id: 1,
+            app_key: Path::new("/dev/null"),
+            owner: OWNER,
+            preview_domain: DOMAIN,
+            sites_domain_suffix: SUFFIX,
+            keep,
+            prune,
+        }
+    }
+
     #[tokio::test]
     async fn dry_run_reports_would_prune_and_removes_nothing() {
         let root = tempfile::tempdir().unwrap();
         let sites = root.path().join("sites");
         let state = root.path().join(".switchboard");
-        std::fs::create_dir_all(sites.join("orphan-pr-2")).unwrap();
+        std::fs::create_dir_all(sites.join("ephpm-lab-pr-2")).unwrap();
         std::fs::create_dir_all(&state).unwrap();
-        let queue = Queue::new(&state);
-        queue.ensure_dirs().unwrap();
+        Queue::new(&state).ensure_dirs().unwrap();
         let keep = HashSet::new();
+        let ctx = exec_ctx(&sites, &state, &keep, false);
 
-        let ctx = ReconcileContext {
-            sites_dir: &sites,
-            sqlite_dir: None,
-            site_overrides_dir: None,
-            vhost_temp_base: None,
-            state_dir: &state,
-            allow_incomplete: true,
-            kv_addr: "unused",
-            kv_secret: "s",
-            api_site: "switchboard",
-            preview_domain: DOMAIN,
-            sites_domain_suffix: SUFFIX,
-            keep: &keep,
-            prune: false,
-            deploy_missing: false,
-            max_prunes_per_cycle: 8,
-            queue: &queue,
-        };
-        let plan = Plan {
+        let plan = PlanResult {
             prune: vec![PrunePlan {
-                site_key: "orphan-pr-2".to_string(),
-                label: "orphan-pr-2".to_string(),
+                site_key: "ephpm-lab-pr-2".to_string(),
+                label: "ephpm-lab-pr-2".to_string(),
             }],
-            deploy: vec![],
+            ..PlanResult::default()
         };
         let mut report = ReconcileReport::default();
         execute_prune(&ctx, &plan, &mut report).await;
@@ -686,7 +644,7 @@ mod tests {
         assert_eq!(report.would_prune, 1);
         assert_eq!(report.pruned, 0);
         assert!(
-            sites.join("orphan-pr-2").exists(),
+            sites.join("ephpm-lab-pr-2").exists(),
             "dry-run must not remove the directory"
         );
     }
@@ -696,92 +654,39 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sites = root.path().join("sites");
         let state = root.path().join(".switchboard");
-        std::fs::create_dir_all(sites.join("orphan-pr-2")).unwrap();
+        std::fs::create_dir_all(sites.join("ephpm-lab-pr-2")).unwrap();
         std::fs::create_dir_all(&state).unwrap();
-        let queue = Queue::new(&state);
-        queue.ensure_dirs().unwrap();
+        Queue::new(&state).ensure_dirs().unwrap();
         let keep = HashSet::new();
+        let ctx = exec_ctx(&sites, &state, &keep, true);
 
-        let ctx = ReconcileContext {
-            sites_dir: &sites,
-            sqlite_dir: None,
-            site_overrides_dir: None,
-            vhost_temp_base: None,
-            state_dir: &state,
-            allow_incomplete: true, // no sqlite/overrides dirs configured in the test
-            kv_addr: "127.0.0.1:1", // revocation write fails, best-effort — must not fail teardown
-            kv_secret: "s",
-            api_site: "switchboard",
-            preview_domain: DOMAIN,
-            sites_domain_suffix: SUFFIX,
-            keep: &keep,
-            prune: true,
-            deploy_missing: false,
-            max_prunes_per_cycle: 8,
-            queue: &queue,
-        };
-        let plan = Plan {
+        let plan = PlanResult {
             prune: vec![PrunePlan {
-                site_key: "orphan-pr-2".to_string(),
-                label: "orphan-pr-2".to_string(),
+                site_key: "ephpm-lab-pr-2".to_string(),
+                label: "ephpm-lab-pr-2".to_string(),
             }],
-            deploy: vec![],
+            ..PlanResult::default()
         };
         let mut report = ReconcileReport::default();
         execute_prune(&ctx, &plan, &mut report).await;
 
-        assert_eq!(report.pruned, 1, "the orphan is removed");
-        assert!(!sites.join("orphan-pr-2").exists());
+        assert_eq!(report.pruned, 1);
+        assert!(!sites.join("ephpm-lab-pr-2").exists());
     }
 
-    #[tokio::test]
-    async fn the_per_cycle_cap_defers_the_rest() {
+    /// The keep-list is honoured end-to-end: a keep-listed dir never reaches the
+    /// plan because `list_preview_dirs` excludes it.
+    #[test]
+    fn keep_list_excludes_a_dir_from_candidacy() {
         let root = tempfile::tempdir().unwrap();
-        let sites = root.path().join("sites");
-        let state = root.path().join(".switchboard");
-        for dir in ["a-pr-1", "b-pr-2", "c-pr-3"] {
-            std::fs::create_dir_all(sites.join(dir)).unwrap();
-        }
-        std::fs::create_dir_all(&state).unwrap();
-        let queue = Queue::new(&state);
-        queue.ensure_dirs().unwrap();
-        let keep = HashSet::new();
+        let sites = root.path();
+        std::fs::create_dir_all(sites.join("site-a")).unwrap();
+        std::fs::create_dir_all(sites.join("ephpm-lab-pr-2")).unwrap();
+        let mut keep = HashSet::new();
+        keep.insert("site-a".to_string());
 
-        let ctx = ReconcileContext {
-            sites_dir: &sites,
-            sqlite_dir: None,
-            site_overrides_dir: None,
-            vhost_temp_base: None,
-            state_dir: &state,
-            allow_incomplete: true,
-            kv_addr: "127.0.0.1:1",
-            kv_secret: "s",
-            api_site: "switchboard",
-            preview_domain: DOMAIN,
-            sites_domain_suffix: SUFFIX,
-            keep: &keep,
-            prune: true,
-            deploy_missing: false,
-            max_prunes_per_cycle: 2,
-            queue: &queue,
-        };
-        let plan = Plan {
-            prune: ["a-pr-1", "b-pr-2", "c-pr-3"]
-                .iter()
-                .map(|s| PrunePlan {
-                    site_key: (*s).to_string(),
-                    label: (*s).to_string(),
-                })
-                .collect(),
-            deploy: vec![],
-        };
-        let mut report = ReconcileReport::default();
-        execute_prune(&ctx, &plan, &mut report).await;
-
-        assert_eq!(report.pruned, 2, "cap honoured");
-        assert_eq!(
-            report.prune_deferred, 1,
-            "the third waits for the next pass"
-        );
+        let found = list_preview_dirs(sites, &keep).unwrap();
+        assert!(!found.contains(&"site-a".to_string()));
+        assert!(found.contains(&"ephpm-lab-pr-2".to_string()));
     }
 }

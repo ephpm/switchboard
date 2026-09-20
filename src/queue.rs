@@ -248,92 +248,6 @@ impl Queue {
         Ok(claimed)
     }
 
-    /// Whether a job for `label` is already waiting in `queue/` or in flight in
-    /// `claimed/`.
-    ///
-    /// The reconcile's *add* direction uses this to avoid re-enqueuing a deploy
-    /// for a preview that is already being provisioned: the daemon's coalescing
-    /// would collapse the duplicates anyway, but not writing them keeps the
-    /// queue readable and a slow deploy from being restarted every interval.
-    ///
-    /// Best-effort and cheap: it parses only enough of each pending/claimed file
-    /// to read its label, and a file it cannot read or parse is simply not a
-    /// match (the caller then enqueues, which is safe — worst case a coalesced
-    /// duplicate).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only if `queue/` exists but cannot be listed.
-    pub fn has_job_for_label(&self, label: &str) -> anyhow::Result<bool> {
-        for dir in [&self.queue_dir, &self.claimed_dir] {
-            let entries = match std::fs::read_dir(dir) {
-                Ok(e) => e,
-                Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(e).with_context(|| format!("failed to read {}", dir.display()));
-                }
-            };
-            for entry in entries.flatten() {
-                if !entry.file_type().is_ok_and(|t| t.is_file()) {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if !name.ends_with(".json") {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(entry.path()) else {
-                    continue;
-                };
-                if let Ok(job) = Job::parse(&bytes) {
-                    if job.label() == label {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    /// Write a job document into `queue/` under a fresh, contract-shaped
-    /// filename (`<13-digit millis>-<16 hex>.json`), atomically.
-    ///
-    /// This is the mirror of the switchboard-api `DrainHandler`'s materialize
-    /// step, on the daemon side: the reconcile writes the exact job document it
-    /// read from cluster desired state so the existing [`Queue::claim_pending`]
-    /// → coalesce → validate → deploy path runs it, rather than the reconcile
-    /// re-implementing provisioning. A materialized job carries a fresh filename
-    /// on every node, so there is nothing to deduplicate against here (per-node
-    /// materialization of shared state, not a webhook redelivery).
-    ///
-    /// The write is atomic — a temp file in the same directory, then `rename` —
-    /// so a scanner never sees a half-written job.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the queue directory cannot be created or written.
-    pub fn enqueue(&self, job_json: &[u8]) -> anyhow::Result<String> {
-        std::fs::create_dir_all(&self.queue_dir).with_context(|| {
-            format!(
-                "failed to create queue directory {}",
-                self.queue_dir.display()
-            )
-        })?;
-
-        let name = format!("{}-{}.json", now_millis_13(), random_16_hex());
-        let final_path = self.queue_dir.join(&name);
-        let tmp_path = self.queue_dir.join(format!(".{name}.tmp"));
-
-        std::fs::write(&tmp_path, job_json)
-            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-        match std::fs::rename(&tmp_path, &final_path) {
-            Ok(()) => Ok(name),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                Err(e).with_context(|| format!("failed to publish job {}", final_path.display()))
-            }
-        }
-    }
-
     /// Remove a finished job from `claimed/`.
     ///
     /// # Errors
@@ -371,35 +285,6 @@ pub fn enqueued_at_ms(name: &str) -> Option<u64> {
         return None;
     }
     millis.parse().ok()
-}
-
-/// The current Unix time as a 13-digit millisecond string — the timestamp half
-/// of a queue filename. Fixed-width until 2286, which is what keeps a
-/// lexicographic sort of `queue/` chronological (see [`Queue::pending`]).
-fn now_millis_13() -> String {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    // 13 digits covers 1970-01-01 … 2286; `{:013}` pads the (implausible) case
-    // of a clock set before ~2001 so the field never shrinks below 13.
-    format!("{millis:013}")
-}
-
-/// 16 lowercase hex chars from 8 CSPRNG bytes — the random half of a queue
-/// filename, making a collision within a millisecond effectively impossible.
-fn random_16_hex() -> String {
-    let mut bytes = [0u8; 8];
-    // A CSPRNG failure is not fatal here: the filename only needs to be unique,
-    // not unguessable, and the millisecond prefix plus the process's own
-    // scheduling already separates concurrent writers. Fall back to the low
-    // bits of the nanosecond clock rather than aborting a reconcile.
-    if getrandom::fill(&mut bytes).is_err() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        bytes[..4].copy_from_slice(&nanos.to_le_bytes());
-    }
-    hex::encode(bytes)
 }
 
 /// A file's mtime in Unix milliseconds — the fallback enqueue time.
@@ -671,72 +556,6 @@ mod tests {
         assert!(
             enqueued <= now && now - enqueued < 60_000,
             "mtime {enqueued} should be about now ({now})"
-        );
-    }
-
-    #[test]
-    fn enqueue_writes_a_contract_shaped_claimable_job() {
-        let (_d, q) = queue();
-        let name = q
-            .enqueue(sample_json("recon-pr-1", "deploy").as_bytes())
-            .unwrap();
-
-        // The filename is the queue contract's shape, so it sorts chronologically
-        // and carries a parseable enqueue time.
-        assert!(name.ends_with(".json"));
-        assert!(
-            enqueued_at_ms(&name).is_some(),
-            "{name} must parse as an enqueue time"
-        );
-
-        // And it round-trips through the normal consume path.
-        let claimed = q.claim_pending().unwrap();
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].job.label(), "recon-pr-1");
-        assert_eq!(claimed[0].job.intent().unwrap(), crate::job::Intent::Deploy);
-    }
-
-    #[test]
-    fn enqueue_leaves_no_temp_file_behind() {
-        let (_d, q) = queue();
-        q.enqueue(sample_json("recon-pr-1", "deploy").as_bytes())
-            .unwrap();
-        // The atomic write uses a dotfile temp then renames; none must linger.
-        for entry in std::fs::read_dir(q.queue_dir()).unwrap().flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            assert!(
-                !name.ends_with(".tmp"),
-                "a staging temp file leaked: {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn has_job_for_label_sees_pending_and_claimed() {
-        let (_d, q) = queue();
-        assert!(!q.has_job_for_label("recon-pr-1").unwrap());
-
-        write_job(
-            &q,
-            "1787456737243-bbbbbbbbbbbbbbbb.json",
-            "recon-pr-1",
-            "deploy",
-        );
-        assert!(
-            q.has_job_for_label("recon-pr-1").unwrap(),
-            "a pending job for the label is seen"
-        );
-        assert!(
-            !q.has_job_for_label("other-pr-2").unwrap(),
-            "a different label is not a match"
-        );
-
-        // Once claimed (in flight) it still counts, so the reconcile does not
-        // re-enqueue a deploy that is already running.
-        q.claim("1787456737243-bbbbbbbbbbbbbbbb.json").unwrap();
-        assert!(
-            q.has_job_for_label("recon-pr-1").unwrap(),
-            "a claimed job for the label is still seen"
         );
     }
 

@@ -242,15 +242,14 @@ async fn main() -> anyhow::Result<()> {
     let listen = config.listen.clone();
 
     // Resolve the level-triggered reconcile's settings before `config` moves
-    // into the shared state. `validate()` has already guaranteed a KV secret and
-    // a resolvable API site key whenever the interval is non-zero.
+    // into the shared state. `validate()` has already guaranteed App credentials
+    // whenever the interval is non-zero — the pass queries GitHub for PR state.
     let reconcile_setup = if config.reconcile_enabled() {
-        let api_site = config
-            .reconcile_api_site()?
-            .expect("validate() guarantees a reconcile API site key when enabled");
-        let keep = config.reconcile_keep_set(&api_site);
+        // The API vhost's own site key is added to the keep-list so it is never a
+        // prune candidate (the parse rule already excludes it, but belt-and-braces).
+        let keep = config.reconcile_keep_set(config.drain_host_site_key().as_deref());
         let interval = Duration::from_secs(config.reconcile_interval_secs.max(1));
-        Some((api_site, keep, interval))
+        Some((keep, interval))
     } else {
         info!("level-triggered reconcile disabled (--reconcile-interval-secs 0)");
         None
@@ -266,37 +265,21 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(drain_loop(kicker, drain_interval));
     }
 
-    if let Some((api_site, keep, interval)) = reconcile_setup {
-        // The reconcile reads desired state over RESP; without a KV secret it
-        // can do nothing, and validate() only reaches here with one configured.
-        if state.kv_secret.is_some() {
-            info!(
-                interval_s = interval.as_secs(),
-                prune = state.config.reconcile_prune,
-                deploy_missing = state.config.reconcile_deploy_missing,
-                api_site = %api_site,
-                keep = keep.len(),
-                max_prunes_per_cycle = state.config.reconcile_max_prunes_per_cycle,
-                "level-triggered reconcile enabled"
-            );
-            if !state.config.reconcile_prune {
-                tracing::warn!(
-                    "reconcile is in dry-run: orphans will be logged as WOULD-prune but \
-                     NOT removed. Set --reconcile-prune once the logs look right"
-                );
-            }
-            tokio::spawn(reconcile_loop(
-                Arc::clone(&state),
-                queue.clone(),
-                api_site,
-                keep,
-                interval,
-            ));
-        } else {
+    if let Some((keep, interval)) = reconcile_setup {
+        info!(
+            interval_s = interval.as_secs(),
+            prune = state.config.reconcile_prune,
+            owner = %state.config.reconcile_owner,
+            keep = keep.len(),
+            "level-triggered reconcile enabled (authority: GitHub PR state)"
+        );
+        if !state.config.reconcile_prune {
             tracing::warn!(
-                "reconcile is enabled but no KV secret resolved — reconcile pass skipped"
+                "reconcile is in dry-run: orphans (merged/closed PRs) will be logged as \
+                 WOULD-prune but NOT removed. Set --reconcile-prune once the logs look right"
             );
         }
+        tokio::spawn(reconcile_loop(Arc::clone(&state), keep, interval));
     }
 
     if webhook_server_enabled {
@@ -329,21 +312,19 @@ async fn drain_loop(kicker: DrainKicker, interval: Duration) {
 
 // ── the level-triggered reconcile ──────────────────────────────────────
 
-/// Reconcile this node's on-disk previews to the cluster's KV desired state on a
-/// timer, independent of the drain/queue path's `switchboard:gen` cursor. Every
-/// failure mode is transient (KV briefly unreachable, a single wedged site), so
+/// Reconcile this node's on-disk previews to **GitHub PR state** on a timer,
+/// independent of the drain/queue path's `switchboard:gen` cursor. Every failure
+/// mode is transient (GitHub briefly unreachable, a single wedged site), so
 /// nothing here is fatal — a failed pass is logged and the next tick retries.
 async fn reconcile_loop(
     state: Arc<AppState>,
-    queue: Queue,
-    api_site: String,
     keep: std::collections::HashSet<String>,
     interval: Duration,
 ) {
-    // Guarded at the spawn site; kept here so a future refactor cannot start the
-    // loop without the secret the reconcile reads desired state with.
-    let Some(kv_secret) = state.kv_secret.clone() else {
-        tracing::warn!("reconcile loop started without a KV secret — not running");
+    // Guarded at the spawn site (validate() requires App creds when enabled);
+    // kept here so a future refactor cannot start the loop without them.
+    let (Some(app_id), Some(app_key)) = (state.config.app_id, state.config.app_key.clone()) else {
+        tracing::warn!("reconcile loop started without App credentials — not running");
         return;
     };
 
@@ -361,22 +342,21 @@ async fn reconcile_loop(
             vhost_temp_base: cfg.vhost_temp_base.as_deref(),
             state_dir: &cfg.state_dir,
             allow_incomplete: cfg.allow_incomplete_teardown,
+            kv_secret: state.kv_secret.as_deref(),
             kv_addr: &cfg.kv_addr,
-            kv_secret: &kv_secret,
-            api_site: &api_site,
+            app_id,
+            app_key: &app_key,
+            owner: &cfg.reconcile_owner,
             preview_domain: &cfg.preview_domain,
             sites_domain_suffix: suffix.as_deref(),
             keep: &keep,
             prune: cfg.reconcile_prune,
-            deploy_missing: cfg.reconcile_deploy_missing,
-            max_prunes_per_cycle: cfg.reconcile_max_prunes_per_cycle.max(1),
-            queue: &queue,
         };
 
         if let Err(e) = reconcile::reconcile_once(&ctx).await {
             tracing::warn!(
                 error = %format!("{e:#}"),
-                "reconcile pass failed (KV unreadable?) — nothing pruned; will retry"
+                "reconcile pass failed (GitHub unreachable?) — nothing pruned; will retry"
             );
         }
     }
@@ -767,7 +747,8 @@ async fn fetch_installation_token(state: &AppState, req: &PreviewRequest) -> Opt
     }
 }
 
-/// Get a short-lived installation access token from GitHub.
+/// Get a short-lived installation access token from GitHub for a known
+/// installation id.
 ///
 /// GitHub Apps authenticate by:
 /// 1. Creating a JWT signed with the app's private key
@@ -777,6 +758,35 @@ async fn get_installation_token(
     app_key: &Path,
     installation_id: u64,
 ) -> anyhow::Result<String> {
+    let jwt = app_jwt(app_id, app_key).await?;
+    exchange_jwt_for_token(&jwt, installation_id).await
+}
+
+/// Get an installation token for an **owner/org** without a pre-known
+/// installation id — the path the reconcile uses, which has only on-disk site
+/// keys and no webhook payload to read an id from.
+///
+/// Mints the App JWT once and uses it for both the installation-lookup and the
+/// token exchange (a JWT is valid for both and for ~10 minutes).
+///
+/// # Errors
+///
+/// Returns an error if the JWT cannot be minted, the org has no installation of
+/// this App, or the token exchange fails. The reconcile treats any error as a
+/// total GitHub-auth failure and prunes nothing that pass.
+async fn installation_token_for_owner(
+    app_id: u64,
+    app_key: &Path,
+    owner: &str,
+) -> anyhow::Result<String> {
+    let jwt = app_jwt(app_id, app_key).await?;
+    let installation_id = org_installation_id(&jwt, owner).await?;
+    exchange_jwt_for_token(&jwt, installation_id).await
+}
+
+/// Build and sign the App-level JWT (RS256), shelling out to `openssl` for the
+/// signature.
+async fn app_jwt(app_id: u64, app_key: &Path) -> anyhow::Result<String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
@@ -812,9 +822,34 @@ async fn get_installation_token(
     anyhow::ensure!(output.status.success(), "openssl signing failed");
 
     let signature = base64_url_encode(&output.stdout);
-    let jwt = format!("{signing_input}.{signature}");
+    Ok(format!("{signing_input}.{signature}"))
+}
 
-    // Exchange JWT for installation token.
+/// Discover the id of this App's installation on `owner` via the App JWT.
+async fn org_installation_id(jwt: &str, owner: &str) -> anyhow::Result<u64> {
+    let url = format!("https://api.github.com/orgs/{owner}/installation");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {jwt}"))
+        .header("User-Agent", "switchboard")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?;
+
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "failed to resolve the App installation on {owner}: {}",
+        resp.status()
+    );
+
+    let body: serde_json::Value = resp.json().await?;
+    body["id"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("installation response for {owner} missing 'id'"))
+}
+
+/// Exchange an App JWT for a short-lived installation access token.
+async fn exchange_jwt_for_token(jwt: &str, installation_id: u64) -> anyhow::Result<String> {
     let url = format!("https://api.github.com/app/installations/{installation_id}/access_tokens");
     let resp = reqwest::Client::new()
         .post(&url)
