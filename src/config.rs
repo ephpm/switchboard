@@ -271,6 +271,76 @@ pub struct Config {
     #[arg(long, default_value = "127.0.0.1:6379", env = "SWITCHBOARD_KV_ADDR")]
     pub kv_addr: String,
 
+    // ── level-triggered reconcile ──────────────────────────────────────
+    /// Seconds between **reconcile** passes. **Zero disables it** (the default).
+    ///
+    /// The drain/queue path is edge-triggered on `switchboard:gen`: a node only
+    /// re-walks desired state when the counter advances, so a `gen` increment
+    /// that is lost or not-yet-gossiped strands a teardown (the preview stays
+    /// served, its database and override on disk) with every health check green
+    /// (switchboard#24). This pass is the level-triggered safety net: every
+    /// interval it reads the KV desired state *directly* (independent of `gen`)
+    /// and converges this node's on-disk previews to it — pruning orphans and,
+    /// with `--reconcile-deploy-missing`, enqueuing deploys it never saw.
+    ///
+    /// Requires `--kv-secret-file` (the pass reads desired state over RESP) and a
+    /// resolvable API site key (`--reconcile-api-site`, else derived from
+    /// `--drain-host`); the daemon refuses to start with a non-zero interval and
+    /// neither. A sane cadence is well above the two-second drain tick — it is a
+    /// backstop, not the hot path — e.g. 30–60s.
+    #[arg(long, default_value_t = 0, env = "SWITCHBOARD_RECONCILE_INTERVAL_SECS")]
+    pub reconcile_interval_secs: u64,
+
+    /// Actually remove orphaned previews the reconcile finds. **Off by default**:
+    /// until it is set the pass is observability-only, logging each orphan it
+    /// *would* prune at WARN (which alone surfaces the drift the original
+    /// incident was found by hand-diffing three nodes for). Turn it on once the
+    /// dry-run logs look right.
+    #[arg(long, default_value_t = false, env = "SWITCHBOARD_RECONCILE_PRUNE")]
+    pub reconcile_prune: bool,
+
+    /// Enqueue a deploy for a desired preview whose directory is absent on this
+    /// node. **Off by default**: re-provisioning runs composer and a checkout,
+    /// so recovering a missed *deploy* is a heavier, separate opt-in from
+    /// removing a stranded *teardown*. When on, the reconcile writes the exact
+    /// job document into the queue and the normal deploy path runs it.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "SWITCHBOARD_RECONCILE_DEPLOY_MISSING"
+    )]
+    pub reconcile_deploy_missing: bool,
+
+    /// Comma-separated vhost directory names the reconcile must never prune —
+    /// the node's infra/test sites that are not PR previews (e.g.
+    /// `switchboard,site-a,site-b`). The API's own site key is always protected
+    /// in addition to this list. A preview directory is only ever a prune
+    /// candidate when it is absent from this set *and* its own KV preview key is
+    /// gone or torn down.
+    #[arg(long, default_value = "", env = "SWITCHBOARD_RECONCILE_KEEP_SITES")]
+    pub reconcile_keep_sites: String,
+
+    /// Upper bound on orphans pruned in a single pass — a blast-radius guard.
+    /// A misconfiguration (wrong keep-list, a flushed KV) cannot then wipe the
+    /// fleet in one tick; the excess is deferred to later passes, giving the
+    /// WARN/INFO logs time to be noticed. Floored at one.
+    #[arg(
+        long,
+        default_value_t = 8,
+        env = "SWITCHBOARD_RECONCILE_MAX_PRUNES_PER_CYCLE"
+    )]
+    pub reconcile_max_prunes_per_cycle: usize,
+
+    /// The switchboard-api vhost's canonical **site key**, whose gossip-replicated
+    /// keyspace holds the `switchboard:*` desired-state keys the reconcile reads.
+    ///
+    /// Defaults to the site key derived from `--drain-host` (the same host the
+    /// drain kick addresses), which is correct whenever the API is reached at its
+    /// own vhost. Set it explicitly only if the API's KV site key differs from
+    /// its drain host.
+    #[arg(long, env = "SWITCHBOARD_RECONCILE_API_SITE")]
+    pub reconcile_api_site: Option<String>,
+
     // ── pre-serve static-analysis gate ─────────────────────────────────
     /// Path to the operator-controlled `ephpm analyze` policy file (YAML), used
     /// to screen a preview's checkout before it is published.
@@ -445,6 +515,52 @@ impl Config {
         }
     }
 
+    /// Whether the level-triggered reconcile pass is enabled.
+    #[must_use]
+    pub fn reconcile_enabled(&self) -> bool {
+        self.reconcile_interval_secs > 0
+    }
+
+    /// The switchboard-api vhost's canonical site key, whose keyspace the
+    /// reconcile reads: the explicit `--reconcile-api-site` if set, otherwise
+    /// derived from `--drain-host` with this node's suffix rule.
+    ///
+    /// `Ok(None)` when neither an override nor a drain host is available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a drain host is present but does not normalize to a
+    /// valid site key.
+    pub fn reconcile_api_site(&self) -> anyhow::Result<Option<String>> {
+        if let Some(explicit) = &self.reconcile_api_site {
+            return Ok(Some(explicit.clone()));
+        }
+        let Some(host) = &self.drain_host else {
+            return Ok(None);
+        };
+        let suffix = self.effective_sites_domain_suffix();
+        crate::site_key::site_key(host, suffix.as_deref())
+            .map(Some)
+            .with_context(|| {
+                format!("cannot derive the switchboard-api site key from --drain-host {host:?}")
+            })
+    }
+
+    /// The reconcile keep-list — vhost names never pruned — from
+    /// `--reconcile-keep-sites`, with the API site key always added.
+    #[must_use]
+    pub fn reconcile_keep_set(&self, api_site: &str) -> std::collections::HashSet<String> {
+        let mut set: std::collections::HashSet<String> = self
+            .reconcile_keep_sites
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        set.insert(api_site.to_string());
+        set
+    }
+
     /// Check the combinations clap cannot express.
     ///
     /// # Errors
@@ -483,6 +599,24 @@ impl Config {
             "--fork-secrets has no effect without --allow-fork-deploy — set \
              both to build forks with operator secrets, or neither"
         );
+        // The reconcile reads desired state over RESP and addresses the API's
+        // KV keyspace by site key; without a secret or a resolvable site key it
+        // is silent dead configuration, so refuse to start rather than run a
+        // pass that can do nothing.
+        if self.reconcile_enabled() {
+            anyhow::ensure!(
+                self.kv_secret_file.is_some(),
+                "--reconcile-interval-secs is non-zero but --kv-secret-file is unset — \
+                 the reconcile reads cluster desired state over RESP and cannot without \
+                 ePHPm's [kv] secret (set it to 0 to disable the reconcile)"
+            );
+            anyhow::ensure!(
+                self.reconcile_api_site()?.is_some(),
+                "--reconcile-interval-secs is non-zero but the switchboard-api site key \
+                 could not be resolved — set --reconcile-api-site, or --drain-host to \
+                 derive it from"
+            );
+        }
         // A daemon that cannot remove a tenant's database when its PR closes is
         // a data-retention problem, and the live preview cluster hit it exactly
         // this way: a hand-provisioned systemd unit passed neither path, so
